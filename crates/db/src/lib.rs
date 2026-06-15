@@ -1961,35 +1961,50 @@ pub async fn replace_address_transactions_for_transaction(
     conn: &mut PgConnection,
     transaction_id: i32,
 ) -> Result<u64, DbError> {
+    replace_address_transactions_for_block(conn, &[transaction_id]).await
+}
+
+/// Replace the AddressTransaction links for every transaction in a block in one
+/// set-based pass (mirrors the C# block-level `InsertBatchAsync`). The per-block
+/// batch is equivalent to running [`replace_address_transactions_for_transaction`]
+/// for each id in order: links are deduped per transaction and inserted ordered
+/// by `(transaction_id, ord)` — sender, gas payer, gas target, then event
+/// addresses — so the observable surrogate ids match the per-transaction order.
+pub async fn replace_address_transactions_for_block(
+    conn: &mut PgConnection,
+    transaction_ids: &[i32],
+) -> Result<u64, DbError> {
+    if transaction_ids.is_empty() {
+        return Ok(0);
+    }
+
     sqlx::query(
         r#"
         WITH candidate_address_links AS (
-            SELECT 1 AS ord, sender_id AS address_id FROM transactions WHERE id = $1
+            SELECT id AS transaction_id, sender_id AS address_id FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT 2 AS ord, gas_payer_id AS address_id FROM transactions WHERE id = $1
+            SELECT id, gas_payer_id FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT 3 AS ord, gas_target_id AS address_id FROM transactions WHERE id = $1
+            SELECT id, gas_target_id FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT 1000 + row_number() OVER (ORDER BY event_index, id) AS ord, address_id
-            FROM events
-            WHERE transaction_id = $1
+            SELECT transaction_id, address_id FROM events WHERE transaction_id = ANY($1)
         ),
-        first_address_links AS (
-            SELECT address_id, MIN(ord) AS ord
+        desired_links AS (
+            SELECT DISTINCT transaction_id, address_id
             FROM candidate_address_links
             WHERE address_id IS NOT NULL
-            GROUP BY address_id
         )
         DELETE FROM address_transactions address_tx
-        WHERE address_tx.transaction_id = $1
+        WHERE address_tx.transaction_id = ANY($1)
           AND NOT EXISTS (
               SELECT 1
-              FROM first_address_links desired
-              WHERE desired.address_id = address_tx.address_id
+              FROM desired_links desired
+              WHERE desired.transaction_id = address_tx.transaction_id
+                AND desired.address_id = address_tx.address_id
           )
         "#,
     )
-    .bind(transaction_id)
+    .bind(transaction_ids)
     .execute(&mut *conn)
     .await?;
 
@@ -1997,64 +2012,65 @@ pub async fn replace_address_transactions_for_transaction(
     // sender, gas payer, gas target, then event addresses, while duplicates are
     // removed before the batch insert. The surrogate IDs are observable in the
     // legacy DB, so Rust must preserve both the order and the pre-insert dedupe.
+    // Ordering by `(transaction_id, ord)` reproduces the per-transaction insert
+    // sequence (transaction ids are assigned in `tx_index` order within a block).
     let result = sqlx::query(
         r#"
         WITH candidate_address_links AS (
-            SELECT 1 AS ord, sender_id AS address_id FROM transactions WHERE id = $1
+            SELECT id AS transaction_id, 1 AS ord, sender_id AS address_id FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT 2 AS ord, gas_payer_id AS address_id FROM transactions WHERE id = $1
+            SELECT id, 2, gas_payer_id FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT 3 AS ord, gas_target_id AS address_id FROM transactions WHERE id = $1
+            SELECT id, 3, gas_target_id FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT 1000 + row_number() OVER (ORDER BY event_index, id) AS ord, address_id
+            SELECT transaction_id,
+                   1000 + row_number() OVER (PARTITION BY transaction_id ORDER BY event_index, id),
+                   address_id
             FROM events
-            WHERE transaction_id = $1
+            WHERE transaction_id = ANY($1)
         ),
         first_address_links AS (
-            SELECT address_id, MIN(ord) AS ord
+            SELECT transaction_id, address_id, MIN(ord) AS ord
             FROM candidate_address_links
             WHERE address_id IS NOT NULL
-            GROUP BY address_id
+            GROUP BY transaction_id, address_id
         )
         INSERT INTO address_transactions (address_id, transaction_id, timestamp_unix_seconds)
-        SELECT address_id, $1, (SELECT timestamp_unix_seconds FROM transactions WHERE id = $1)
+        SELECT first_address_links.address_id, first_address_links.transaction_id, tx.timestamp_unix_seconds
         FROM first_address_links
+        JOIN transactions tx ON tx.id = first_address_links.transaction_id
         WHERE NOT EXISTS (
             SELECT 1
             FROM address_transactions existing
             WHERE existing.address_id = first_address_links.address_id
-              AND existing.transaction_id = $1
+              AND existing.transaction_id = first_address_links.transaction_id
         )
-        ORDER BY ord
+        ORDER BY first_address_links.transaction_id, first_address_links.ord
         ON CONFLICT (address_id, transaction_id) DO NOTHING
         "#,
     )
-    .bind(transaction_id)
+    .bind(transaction_ids)
     .execute(&mut *conn)
     .await?;
 
     // Keep the denormalized first transaction timestamp in sync with
     // the AddressTransaction links. C# updates this before duplicate checks,
-    // so Rust must also run it even when no new link row is inserted.
+    // so Rust must also run it even when no new link row is inserted. The
+    // per-address minimum over the block equals the sequential per-transaction
+    // minimums.
     sqlx::query(
         r#"
         WITH candidate_address_links AS (
-            SELECT sender_id AS address_id, timestamp_unix_seconds
-            FROM transactions
-            WHERE id = $1
+            SELECT sender_id AS address_id, timestamp_unix_seconds FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT gas_payer_id AS address_id, timestamp_unix_seconds
-            FROM transactions
-            WHERE id = $1
+            SELECT gas_payer_id, timestamp_unix_seconds FROM transactions WHERE id = ANY($1)
             UNION ALL
-            SELECT gas_target_id AS address_id, timestamp_unix_seconds
-            FROM transactions
-            WHERE id = $1
+            SELECT gas_target_id, timestamp_unix_seconds FROM transactions WHERE id = ANY($1)
             UNION ALL
             SELECT event.address_id, tx.timestamp_unix_seconds
             FROM events event
             JOIN transactions tx ON tx.id = event.transaction_id
-            WHERE event.transaction_id = $1
+            WHERE event.transaction_id = ANY($1)
         ),
         first_address_links AS (
             SELECT address_id, MIN(timestamp_unix_seconds) AS first_tx_unix_seconds
@@ -2072,7 +2088,7 @@ pub async fn replace_address_transactions_for_transaction(
           )
         "#,
     )
-    .bind(transaction_id)
+    .bind(transaction_ids)
     .execute(&mut *conn)
     .await?;
 
