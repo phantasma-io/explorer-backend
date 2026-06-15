@@ -11,16 +11,16 @@ use explorer_db::{
     ContractMethodHistoryFilter, ContractMethodHistoryOrderBy, ContractOrderBy, DbError,
     EventFilter, EventKindOrderBy, EventOrderBy, EventPage, HistoryPriceFilter,
     HistoryPriceOrderBy, NftFilter, NftOrderBy, OracleFilter, OracleOrderBy, OrganizationFilter,
-    OrganizationOrderBy, OrganizationRow, PlatformFilter, PlatformOrderBy, RejectedTransactionRow,
-    SeriesFilter, SeriesOrderBy, SortDirection, TokenFilter, TokenOrderBy, TransactionFilter,
-    TransactionOrderBy, TransactionPage, ValidatorKindOrderBy, block_detail, chain_ids_by_name,
-    check_health, circulating_soul_supply, count_chains, count_contract_method_histories,
-    count_event_kinds, count_history_prices, count_oracles, count_platforms, count_validator_kinds,
-    list_addresses, list_blocks, list_chains, list_contract_method_histories, list_contracts,
-    list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
-    list_events_by_address, list_events_by_transaction_ids, list_events_global,
-    list_history_prices, list_nfts, list_oracles, list_organizations, list_platforms,
-    list_rejected_transaction_candidates, list_series, list_signatures,
+    OrganizationOrderBy, OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy,
+    RejectedTransactionRow, SeriesFilter, SeriesOrderBy, SortDirection, TokenFilter, TokenOrderBy,
+    TransactionFilter, TransactionOrderBy, TransactionPage, ValidatorKindOrderBy, block_detail,
+    chain_ids_by_name, check_health, circulating_soul_supply, count_chains,
+    count_contract_method_histories, count_event_kinds, count_history_prices, count_oracles,
+    count_platforms, count_validator_kinds, list_addresses, list_blocks, list_chains,
+    list_contract_method_histories, list_contracts, list_event_kinds, list_event_kinds_with_events,
+    list_event_tokens_by_symbols, list_events_by_address, list_events_by_transaction_ids,
+    list_events_global, list_history_prices, list_nfts, list_oracles, list_organizations,
+    list_platforms, list_rejected_transaction_candidates, list_series, list_signatures,
     list_soul_masters_monthlies, list_staking_dailies, list_tokens, list_transaction_occurrences,
     list_transactions_by_block_ids, list_transactions_for_address_timeline,
     list_transactions_for_filtered_address, list_transactions_global, list_validator_kinds,
@@ -37,7 +37,8 @@ use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
@@ -51,12 +52,21 @@ mod support;
 pub(crate) use handlers::*;
 pub(crate) use support::*;
 
+/// Cache key for the overview counters: (chain name, include-legacy flag).
+type OverviewCacheKey = (String, i32);
+
+/// Time-to-live for cached overview counters. The dashboard counts come from
+/// full-table aggregates that take several seconds; serving them from a short
+/// cache keeps the endpoint responsive at the cost of slight staleness.
+const OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct ApiState {
     service_name: String,
     started_at: DateTime<Utc>,
     pool: PgPool,
     chain: ChainName,
+    overview_cache: Arc<Mutex<HashMap<OverviewCacheKey, (Instant, OverviewCounts)>>>,
 }
 
 impl ApiState {
@@ -66,6 +76,7 @@ impl ApiState {
             started_at: Utc::now(),
             pool,
             chain,
+            overview_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

@@ -902,13 +902,35 @@ pub(crate) async fn overview_stats(
         ));
     }
     let chain_id = resolve_chain_id_by_name(&state.pool, &chain).await.ok();
-    let counts = overview_counts(
-        &state.pool,
-        chain.as_str(),
-        chain_id,
-        include_legacy_transactions,
-    )
-    .await?;
+    let cache_key = (chain.clone(), include_legacy_transactions);
+    let cached = {
+        let guard = state
+            .overview_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .get(&cache_key)
+            .filter(|(stored_at, _)| stored_at.elapsed() < OVERVIEW_CACHE_TTL)
+            .map(|(_, counts)| counts.clone())
+    };
+    let counts = match cached {
+        Some(counts) => counts,
+        None => {
+            let counts = overview_counts(
+                &state.pool,
+                chain.as_str(),
+                chain_id,
+                include_legacy_transactions,
+            )
+            .await?;
+            state
+                .overview_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(cache_key, (Instant::now(), counts.clone()));
+            counts
+        }
+    };
     let nfts_total = if include_burned == 1 {
         counts.nfts_burned_total + counts.nfts_unburned_total
     } else {
