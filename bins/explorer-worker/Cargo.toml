@@ -1,0 +1,21 @@
+[package]
+name = "explorer-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+explorer-config.workspace = true
+explorer-db.workspace = true
+explorer-domain.workspace = true
+explorer-ingestion.workspace = true
+explorer-rpc.workspace = true
+explorer-runtime.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

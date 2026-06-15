@@ -19,3 +19,26 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+/.env
+.env.*
+# but do track the committed template
+!/.env.example
+/.sqlx/
+*.log
+/logs/
+
+# Personal config copies (copy config/example-*.toml -> config/local-*.toml)
+/config/local-*.toml
+
+# Local runtime/backup/scratch artifacts (never commit)
+*.bak
+*.tmp
+*.orig
+*.rej
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,31 @@
+# Example configuration for the explorer-api service.
+#
+# Copy this file to config/local-api.toml (gitignored) and adjust the values for
+# your environment, or point the service at it with EXPLORER_CONFIG_FILE.
+# Every value below can also be overridden by the matching EXPLORER_* environment
+# variable (env takes precedence over the file).
+
+[database]
+# EXPLORER_DATABASE_URL
+url = "postgres://postgres@localhost/explorer"
+# EXPLORER_DATABASE_MAX_CONNECTIONS
+max_connections = 16
+# EXPLORER_DATABASE_ACQUIRE_TIMEOUT_SECONDS
+acquire_timeout_seconds = 10
+
+[http]
+# EXPLORER_BIND_ADDR. Use localhost for local development. Inside a container,
+# bind to 0.0.0.0 so the published port is reachable from the host.
+bind_addr = "localhost:9000"
+
+[chain]
+# EXPLORER_NEXUS is an RPC/worker label, not a database namespace.
+nexus = "mainnet"
+# EXPLORER_CHAIN selects the chain rows to serve (the DB has `main` and
+# `main-generation-1`).
+chain = "main"
+
+[logging]
+# EXPLORER_LOG_CONSOLE / EXPLORER_LOG_FILE
+console = true
+file = "logs/api.log"

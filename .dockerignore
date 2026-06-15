@@ -1,0 +1,14 @@
+# The Docker build context is the repo root (see docker/compose/docker-compose.yml).
+# Keep heavy/local/secret artifacts out of the build context and image layers.
+target/
+logs/
+*.log
+.git/
+.github/
+.env
+.env.*
+.sqlx/
+config/local-*.toml
+**/*.rs.bk
+**/mutants.out*/
+.DS_Store

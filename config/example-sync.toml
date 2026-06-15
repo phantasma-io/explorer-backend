@@ -1,0 +1,43 @@
+# Example configuration for the explorer-worker (sync) service.
+#
+# Copy this file to config/local-sync.toml (gitignored) and adjust the values for
+# your environment, or point the service at it with EXPLORER_CONFIG_FILE.
+# Every value below can also be overridden by the matching EXPLORER_* environment
+# variable (env takes precedence over the file).
+
+[database]
+# EXPLORER_DATABASE_URL — the worker writes here; point it at the database you
+# intend to write to.
+url = "postgres://postgres@localhost/explorer"
+max_connections = 16
+acquire_timeout_seconds = 30
+
+[rpc]
+# EXPLORER_RPC_ENDPOINTS — one or more node JSON-RPC URLs (round-robin).
+endpoints = ["http://localhost:5172/rpc"]
+# EXPLORER_RPC_TIMEOUT_SECONDS
+timeout_seconds = 30
+# EXPLORER_RPC_MAX_RESPONSE_BYTES (256 MiB)
+max_response_bytes = 268435456
+
+[chain]
+nexus = "mainnet"
+chain = "main"
+
+[worker]
+# sync_mode: "sequential" (deterministic, one block at a time), "normal"
+# (concurrent fetch + parallel project, cursor still advances in height order),
+# or "relief" (one-block fetch/project windows for difficult ranges).
+sync_mode = "normal"
+fetch_batch_size = 100
+fetch_concurrency = 4
+project_concurrency = 4
+poll_seconds = 1
+queue_capacity = 500
+# Optional throttling for heavy chain sections (milliseconds).
+inter_block_delay_ms = 0
+batch_delay_ms = 0
+
+[logging]
+console = true
+file = "logs/sync-worker.log"

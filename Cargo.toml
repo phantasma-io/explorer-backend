@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "bins/explorer-api",
+    "bins/explorer-migrate",
+    "bins/explorer-parity",
+    "bins/explorer-worker",
+    "crates/config",
+    "crates/db",
+    "crates/domain",
+    "crates/http-api",
+    "crates/ingestion",
+    "crates/runtime",
+    "crates/rpc",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Phantasma Explorer contributors"]
+edition = "2024"
+rust-version = "1.91"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/phantasma-io/explorer-backend"
+description = "Rust backend for the Phantasma blockchain explorer (ingestion worker, HTTP API, and Postgres schema)."
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+phantasma-sdk = "1.1.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["chrono", "json", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.9"
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "request-id", "timeout", "trace", "util"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+utoipa = { version = "5.5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum", "vendored"] }
+url = "2.5"
+uuid = { version = "1.18", features = ["serde", "v7"] }
+
+explorer-config = { path = "crates/config" }
+explorer-db = { path = "crates/db" }
+explorer-domain = { path = "crates/domain" }
+explorer-http-api = { path = "crates/http-api" }
+explorer-ingestion = { path = "crates/ingestion" }
+explorer-rpc = { path = "crates/rpc" }
+explorer-runtime = { path = "crates/runtime" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+unwrap_used = "deny"

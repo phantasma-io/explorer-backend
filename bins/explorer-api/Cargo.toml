@@ -1,0 +1,20 @@
+[package]
+name = "explorer-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+explorer-config.workspace = true
+explorer-db.workspace = true
+explorer-http-api.workspace = true
+explorer-runtime.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
