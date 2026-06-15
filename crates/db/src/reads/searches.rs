@@ -31,12 +31,25 @@ pub async fn search_existence(
     .bind(value)
     .fetch_one(pool)
     .await?;
-    let blocks = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM blocks WHERE hash = $1 OR height::text = $1)",
-    )
-    .bind(value)
-    .fetch_one(pool)
-    .await?;
+    // A block search value is either a hash or a height; they never overlap in
+    // shape (a height parses as a non-negative integer, a hash does not). Probe
+    // the matching column directly so each branch stays sargable: `hash = $1`
+    // uses the unique hash index and `height = $1` the height index. The former
+    // `hash = $1 OR height::text = $1` formulation forced a full table scan.
+    let blocks = match value.parse::<i64>() {
+        Ok(height) if height >= 0 => {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM blocks WHERE height = $1)")
+                .bind(height)
+                .fetch_one(pool)
+                .await?
+        }
+        _ => {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM blocks WHERE hash = $1)")
+                .bind(value)
+                .fetch_one(pool)
+                .await?
+        }
+    };
     let chains =
         sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM chains WHERE name = $1)")
             .bind(value)
