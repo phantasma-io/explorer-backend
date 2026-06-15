@@ -1392,19 +1392,26 @@ pub(crate) async fn load_transactions(
     let with_script = query.with_script == Some(1);
 
     let rows = if let Some(address) = address {
-        if hash.is_none()
-            && hash_partial.is_none()
-            && query.block_height.is_none()
-            && block_hash.is_none()
-            && chain_id.is_none()
-            && state_filter.is_none()
-            && q.is_none()
-            && date_greater.is_none()
-            && date_less.is_none()
-        {
-            list_transactions_for_address_timeline(&state.pool, &address, &page).await?
-        } else {
-            list_transactions_for_filtered_address(&state.pool, &address, &filter, &page).await?
+        match address_id_by_address(&state.pool, &address).await? {
+            Some(address_id) => {
+                if hash.is_none()
+                    && hash_partial.is_none()
+                    && query.block_height.is_none()
+                    && block_hash.is_none()
+                    && chain_id.is_none()
+                    && state_filter.is_none()
+                    && q.is_none()
+                    && date_greater.is_none()
+                    && date_less.is_none()
+                {
+                    list_transactions_for_address_timeline(&state.pool, address_id, &page).await?
+                } else {
+                    list_transactions_for_filtered_address(&state.pool, address_id, &filter, &page)
+                        .await?
+                }
+            }
+            // An unknown address has no transactions; skip the query.
+            None => Vec::new(),
         }
     } else {
         list_transactions_global(&state.pool, &filter, &page).await?

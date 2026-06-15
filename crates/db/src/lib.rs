@@ -1912,8 +1912,8 @@ pub async fn replace_address_transactions_for_transaction(
             WHERE address_id IS NOT NULL
             GROUP BY address_id
         )
-        INSERT INTO address_transactions (address_id, transaction_id)
-        SELECT address_id, $1
+        INSERT INTO address_transactions (address_id, transaction_id, timestamp_unix_seconds)
+        SELECT address_id, $1, (SELECT timestamp_unix_seconds FROM transactions WHERE id = $1)
         FROM first_address_links
         WHERE NOT EXISTS (
             SELECT 1

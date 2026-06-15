@@ -37,6 +37,17 @@ impl TransactionOrderBy {
             Self::BlockHeight => "block.height",
         }
     }
+
+    /// The SQL sort column for the address-scoped lists. `Date` reads the
+    /// timestamp denormalized onto `address_transactions`, so the
+    /// `(address_id, timestamp_unix_seconds, id)` index orders the page without
+    /// sorting the joined transactions of a high-activity address.
+    fn address_column(self) -> &'static str {
+        match self {
+            Self::Date => "address_tx.timestamp_unix_seconds",
+            Self::BlockHeight => "block.height",
+        }
+    }
 }
 
 /// Order + seek + limit for a transaction list page. `cursor_sort_value` (the
@@ -243,29 +254,36 @@ pub async fn list_transactions_global(
 }
 
 /// Address-only transaction timeline: pages by the address's activity rows
-/// across every chain, then joins transaction facts.
+/// across every chain (ordered by `transaction_id`), then joins transaction
+/// facts. The caller resolves the address string to its id.
 pub async fn list_transactions_for_address_timeline(
     executor: impl sqlx::PgExecutor<'_>,
-    address: &str,
+    address_id: i32,
     page: &TransactionPage,
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
+    let column = page.order_by.address_column();
+    // `block.height` ordering needs the block join inside the page CTE; the
+    // default `date` ordering reads the denormalized timestamp straight from
+    // `address_transactions` and stays on the covering index.
+    let cte_block_join = match page.order_by {
+        TransactionOrderBy::Date => "",
+        TransactionOrderBy::BlockHeight => {
+            "JOIN transactions tx ON tx.id = address_tx.transaction_id \
+             JOIN blocks block ON block.id = tx.block_id"
+        }
+    };
     let sql = format!(
         r#"
-        WITH filter_addresses AS (
-            SELECT address.id
-            FROM addresses address
-            WHERE address.address = $1
-        ),
-        address_page AS MATERIALIZED (
+        WITH address_page AS MATERIALIZED (
             SELECT
                 address_tx.id AS cursor_id,
-                address_tx.transaction_id
+                address_tx.transaction_id,
+                {column}::bigint AS cursor_sort_value
             FROM address_transactions address_tx
-            JOIN transactions tx ON tx.id = address_tx.transaction_id
-            JOIN blocks block ON block.id = tx.block_id
-            WHERE address_tx.address_id IN (SELECT id FROM filter_addresses)
+            {cte_block_join}
+            WHERE address_tx.address_id = $1
               AND (
                   $2::bigint IS NULL
                   OR {column} {op} $2
@@ -277,7 +295,7 @@ pub async fn list_transactions_for_address_timeline(
         SELECT
             tx.id,
             address_page.cursor_id,
-            {column}::bigint AS cursor_sort_value,
+            address_page.cursor_sort_value,
             tx.hash,
             block.hash AS block_hash,
             block.height AS block_height,
@@ -314,12 +332,11 @@ pub async fn list_transactions_for_address_timeline(
         LEFT JOIN addresses sender ON sender.id = tx.sender_id
         LEFT JOIN addresses gas_payer ON gas_payer.id = tx.gas_payer_id
         LEFT JOIN addresses gas_target ON gas_target.id = tx.gas_target_id
-        ORDER BY {column} {dir}, address_page.cursor_id {dir}
+        ORDER BY address_page.cursor_sort_value {dir}, address_page.cursor_id {dir}
         "#,
-        column = page.order_by.column(),
     );
     let rows = sqlx::query(&sql)
-        .bind(address)
+        .bind(address_id)
         .bind(page.cursor_sort_value)
         .bind(page.cursor_id)
         .bind(page.limit + 1)
@@ -329,17 +346,19 @@ pub async fn list_transactions_for_address_timeline(
     Ok(rows)
 }
 
-/// Filtered address timeline: scopes by address string while the other
-/// transaction filters narrow the selected activity rows.
+/// Filtered address timeline: scopes by address id (paging by `transaction_id`)
+/// while the other transaction filters narrow the selected activity rows. The
+/// caller resolves the address string to its id.
 pub async fn list_transactions_for_filtered_address(
     executor: impl sqlx::PgExecutor<'_>,
-    address: &str,
+    address_id: i32,
     filter: &TransactionFilter<'_>,
     page: &TransactionPage,
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
     let (q_height, q_like) = transaction_q_forms(filter.q);
+    let column = page.order_by.address_column();
     let sql = format!(
         r#"
         SELECT
@@ -375,7 +394,6 @@ pub async fn list_transactions_for_filtered_address(
             gas_target.address AS gas_target_address,
             gas_target.address_name AS gas_target_address_name
         FROM address_transactions address_tx
-        JOIN addresses filter_address ON filter_address.id = address_tx.address_id
         JOIN transactions tx ON tx.id = address_tx.transaction_id
         JOIN blocks block ON block.id = tx.block_id
         JOIN chains chain ON chain.id = block.chain_id
@@ -383,7 +401,7 @@ pub async fn list_transactions_for_filtered_address(
         LEFT JOIN addresses sender ON sender.id = tx.sender_id
         LEFT JOIN addresses gas_payer ON gas_payer.id = tx.gas_payer_id
         LEFT JOIN addresses gas_target ON gas_target.id = tx.gas_target_id
-        WHERE filter_address.address = $1
+        WHERE address_tx.address_id = $1
           AND ($2::text IS NULL OR tx.hash = $2)
           AND ($3::text IS NULL OR tx.hash ILIKE $3)
           AND ($4::bigint IS NULL OR block.height = $4)
@@ -405,10 +423,9 @@ pub async fn list_transactions_for_filtered_address(
         ORDER BY {column} {dir}, address_tx.id {dir}
         LIMIT $12
         "#,
-        column = page.order_by.column(),
     );
     let rows = sqlx::query(&sql)
-        .bind(address)
+        .bind(address_id)
         .bind(filter.hash)
         .bind(filter.hash_partial)
         .bind(filter.block_height)
