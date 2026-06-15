@@ -29,7 +29,12 @@ async fn main() -> anyhow::Result<()> {
         .migrations_dir
         .unwrap_or_else(explorer_db::default_migrations_dir);
     let report = explorer_db::run_migrations(&pool, &migrations_dir).await?;
-
     info!(?report, "migrations completed");
+
+    // Refresh planner statistics so a freshly restored deploy does not crawl on
+    // its first catch-up sync while waiting for autovacuum to analyze.
+    explorer_db::analyze_database(&pool).await?;
+    info!("database analyzed");
+
     Ok(())
 }

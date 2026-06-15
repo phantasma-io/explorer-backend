@@ -468,6 +468,16 @@ pub fn default_migrations_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("migrations"))
 }
 
+/// Refresh planner statistics for the whole database. `pg_restore` does not carry
+/// planner stats, so a freshly restored deploy plans the ingestion writes with
+/// default estimates until autovacuum catches up — which makes the first
+/// catch-up sync crawl. Running `ANALYZE` right after restore/migrate closes that
+/// window.
+pub async fn analyze_database(pool: &PgPool) -> Result<(), DbError> {
+    sqlx::query("ANALYZE").execute(pool).await?;
+    Ok(())
+}
+
 pub async fn resolve_chain_id(conn: &mut PgConnection, chain: &ChainName) -> Result<i32, DbError> {
     let rows = sqlx::query_scalar::<_, i32>(
         r#"
