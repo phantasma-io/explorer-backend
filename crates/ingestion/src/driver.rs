@@ -254,6 +254,10 @@ impl BlockIngestionDriver {
             )
         };
 
+        // One dimension cache per block: addresses/states/kinds/contracts are
+        // resolved once on first encounter (in transaction/event order) and
+        // reused across the block's transactions and events.
+        let mut dimension_cache = explorer_db::ProjectionDimensionCache::new();
         for (tx_index, transaction) in block.txs.iter().enumerate() {
             let transaction_projection = transaction_result_to_projection(
                 &block_record,
@@ -261,15 +265,25 @@ impl BlockIngestionDriver {
                 transaction,
                 kcal_decimals.unwrap_or_default(),
             )?;
-            let transaction_record =
-                explorer_db::upsert_transaction(conn, transaction_projection).await?;
+            let transaction_record = explorer_db::upsert_transaction_cached(
+                conn,
+                &mut dimension_cache,
+                transaction_projection,
+            )
+            .await?;
             let event_projections = transaction_events_to_projections(
                 &block_record,
                 &transaction_record,
                 tx_index,
                 transaction,
             )?;
-            explorer_db::replace_events(conn, transaction_record.id, &event_projections).await?;
+            explorer_db::replace_events_cached(
+                conn,
+                &mut dimension_cache,
+                transaction_record.id,
+                &event_projections,
+            )
+            .await?;
             explorer_db::replace_address_transactions_for_transaction(conn, transaction_record.id)
                 .await?;
         }

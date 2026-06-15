@@ -9,6 +9,16 @@ pub async fn replace_events(
     transaction_id: i32,
     events: &[EventUpsert],
 ) -> Result<(), DbError> {
+    let mut cache = ProjectionDimensionCache::new();
+    replace_events_cached(conn, &mut cache, transaction_id, events).await
+}
+
+pub async fn replace_events_cached(
+    conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
+    transaction_id: i32,
+    events: &[EventUpsert],
+) -> Result<(), DbError> {
     let existing_event_ids = sqlx::query_as::<_, (i32, i32)>(
         "SELECT event_index, id FROM events WHERE transaction_id = $1",
     )
@@ -36,8 +46,9 @@ pub async fn replace_events(
     .await?;
 
     for event in events {
-        upsert_event(
+        upsert_event_cached(
             conn,
+            cache,
             event,
             existing_event_ids.get(&event.event_index).copied(),
         )
@@ -259,20 +270,23 @@ async fn has_nft_side_effect_candidates(
     Ok(has_candidates)
 }
 
-pub(crate) async fn upsert_event(
+pub(crate) async fn upsert_event_cached(
     conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
     event: &EventUpsert,
     id: Option<i32>,
 ) -> Result<(), DbError> {
-    let event_kind_id = upsert_event_kind_id(conn, event.chain_id, &event.event_kind).await?;
+    let event_kind_id = cache
+        .event_kind_id(conn, event.chain_id, &event.event_kind)
+        .await?;
     let address = event.address.as_deref().unwrap_or("NULL");
-    let address_id = upsert_address_id(conn, event.chain_id, address).await?;
+    let address_id = cache.address_id(conn, event.chain_id, address).await?;
     let target_address_id = match event.target_address.as_deref().and_then(usable_address) {
-        Some(address) => Some(upsert_address_id(conn, event.chain_id, address).await?),
+        Some(address) => Some(cache.address_id(conn, event.chain_id, address).await?),
         None => None,
     };
     let contract = event.contract.as_deref().unwrap_or("unknown");
-    let contract_id = upsert_contract_id(conn, event.chain_id, contract).await?;
+    let contract_id = cache.contract_id(conn, event.chain_id, contract).await?;
 
     sqlx::query(
         r#"

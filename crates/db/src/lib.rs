@@ -1639,17 +1639,111 @@ pub async fn upsert_block(
     })
 }
 
+/// Per-block memoization of dimension lookups (addresses, transaction states,
+/// event kinds, contracts) for the ingestion projection. Each distinct value is
+/// resolved once via the underlying upsert and then reused, removing the
+/// redundant per-transaction/per-event resolve round-trips (and their no-op WAL
+/// writes). Resolution order is unchanged — values are still resolved on first
+/// encounter in transaction/event order — so any newly inserted dimension rows
+/// receive identical surrogate ids.
+#[derive(Default)]
+pub struct ProjectionDimensionCache {
+    addresses: HashMap<(i32, String), i32>,
+    transaction_states: HashMap<String, i32>,
+    event_kinds: HashMap<(i32, String), i32>,
+    contracts: HashMap<(i32, String), i32>,
+}
+
+impl ProjectionDimensionCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn address_id(
+        &mut self,
+        conn: &mut PgConnection,
+        chain_id: i32,
+        address: &str,
+    ) -> Result<i32, DbError> {
+        if let Some(&id) = self.addresses.get(&(chain_id, address.to_owned())) {
+            return Ok(id);
+        }
+        let id = upsert_address_id(conn, chain_id, address).await?;
+        self.addresses.insert((chain_id, address.to_owned()), id);
+        Ok(id)
+    }
+
+    async fn transaction_state_id(
+        &mut self,
+        conn: &mut PgConnection,
+        name: &str,
+    ) -> Result<i32, DbError> {
+        if let Some(&id) = self.transaction_states.get(name) {
+            return Ok(id);
+        }
+        let id = upsert_transaction_state_id(conn, name).await?;
+        self.transaction_states.insert(name.to_owned(), id);
+        Ok(id)
+    }
+
+    async fn event_kind_id(
+        &mut self,
+        conn: &mut PgConnection,
+        chain_id: i32,
+        name: &str,
+    ) -> Result<i32, DbError> {
+        if let Some(&id) = self.event_kinds.get(&(chain_id, name.to_owned())) {
+            return Ok(id);
+        }
+        let id = upsert_event_kind_id(conn, chain_id, name).await?;
+        self.event_kinds.insert((chain_id, name.to_owned()), id);
+        Ok(id)
+    }
+
+    async fn contract_id(
+        &mut self,
+        conn: &mut PgConnection,
+        chain_id: i32,
+        contract: &str,
+    ) -> Result<i32, DbError> {
+        if let Some(&id) = self.contracts.get(&(chain_id, contract.to_owned())) {
+            return Ok(id);
+        }
+        let id = upsert_contract_id(conn, chain_id, contract).await?;
+        self.contracts.insert((chain_id, contract.to_owned()), id);
+        Ok(id)
+    }
+}
+
+/// Upsert a transaction, resolving its addresses/state through a fresh dimension
+/// cache. Inside a block projection prefer [`upsert_transaction_cached`] so the
+/// cache is shared across the block's transactions and events.
 pub async fn upsert_transaction(
     conn: &mut PgConnection,
     transaction: TransactionUpsert,
 ) -> Result<TransactionRecord, DbError> {
-    let state_id = upsert_transaction_state_id(conn, &transaction.state).await?;
+    let mut cache = ProjectionDimensionCache::new();
+    upsert_transaction_cached(conn, &mut cache, transaction).await
+}
+
+/// Upsert a transaction, resolving its addresses/state through the supplied
+/// per-block dimension cache.
+pub async fn upsert_transaction_cached(
+    conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
+    transaction: TransactionUpsert,
+) -> Result<TransactionRecord, DbError> {
+    let state_id = cache.transaction_state_id(conn, &transaction.state).await?;
     let sender = transaction.sender.as_deref().unwrap_or("NULL");
     let gas_payer = transaction.gas_payer.as_deref().unwrap_or("NULL");
     let gas_target = transaction.gas_target.as_deref().unwrap_or("NULL");
-    let sender_id = upsert_address_id(conn, transaction.chain_id, sender).await?;
-    let gas_payer_id = upsert_address_id(conn, transaction.chain_id, gas_payer).await?;
-    let gas_target_id = upsert_address_id(conn, transaction.chain_id, gas_target).await?;
+    let sender_id = cache.address_id(conn, transaction.chain_id, sender).await?;
+    let gas_payer_id = cache
+        .address_id(conn, transaction.chain_id, gas_payer)
+        .await?;
+    let gas_target_id = cache
+        .address_id(conn, transaction.chain_id, gas_target)
+        .await?;
 
     let id = if let Some(id) = sqlx::query_scalar::<_, i32>(
         r#"

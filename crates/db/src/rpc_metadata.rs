@@ -1128,8 +1128,9 @@ mod tests {
         .fetch_one(&mut *transaction)
         .await?;
 
-        crate::events::upsert_event(
+        crate::events::upsert_event_cached(
             &mut transaction,
+            &mut crate::ProjectionDimensionCache::new(),
             &EventUpsert {
                 transaction_id: tx.id,
                 chain_id,
