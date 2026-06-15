@@ -8,6 +8,22 @@
 use crate::*;
 use sqlx::postgres::PgRow;
 
+/// Resolve an address string to its unique id. `addresses.address` is globally
+/// unique, so an address-scoped read can resolve the id once and bind it as an
+/// integer; matching on `address_id` lets the planner use the address indexes
+/// that a string match across a join cannot. Returns `None` for an unknown
+/// address (the caller can then skip the query and return no rows).
+pub async fn address_id_by_address(
+    executor: impl sqlx::PgExecutor<'_>,
+    address: &str,
+) -> Result<Option<i32>, DbError> {
+    let id = sqlx::query_scalar::<_, i32>("SELECT id FROM addresses WHERE address = $1")
+        .bind(address)
+        .fetch_optional(executor)
+        .await?;
+    Ok(id)
+}
+
 /// Sortable keys for the addresses list. Unlike the other resources, the ORDER
 /// BY here is a multi-column expression (the `balance` key also sorts missing
 /// balances last), so the enum yields the whole clause rather than one column.

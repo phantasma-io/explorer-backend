@@ -1512,7 +1512,20 @@ pub(crate) async fn load_events(
     };
 
     let rows = if let Some(address) = address.as_deref() {
-        list_events_by_address(&state.pool, state.chain.as_str(), address, &filter, &page).await?
+        match address_id_by_address(&state.pool, address).await? {
+            Some(address_id) => {
+                list_events_by_address(
+                    &state.pool,
+                    state.chain.as_str(),
+                    address_id,
+                    &filter,
+                    &page,
+                )
+                .await?
+            }
+            // An unknown address has no events; skip the query.
+            None => Vec::new(),
+        }
     } else {
         let chain_id = resolve_chain_id(state).await?;
         list_events_global(&state.pool, chain_id, state.chain.as_str(), &filter, &page).await?

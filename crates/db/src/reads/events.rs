@@ -153,12 +153,15 @@ pub async fn list_events_global(
     Ok(rows)
 }
 
-/// Address-scoped event list: matches the event address or its target address,
-/// across all chains by default (or the configured chain when no address).
+/// Address-scoped event list: matches the event's address or target address by
+/// id, across all chains. The caller resolves the address string to its id
+/// (see [`address_id_by_address`]) so the match can use the `event.address_id`
+/// and `event.target_address_id` indexes instead of scanning and filtering on a
+/// joined address string.
 pub async fn list_events_by_address(
     executor: impl sqlx::PgExecutor<'_>,
     chain_name: &str,
-    address: &str,
+    address_id: i32,
     filter: &EventFilter<'_>,
     page: &EventPage,
 ) -> Result<Vec<PgRow>, DbError> {
@@ -195,12 +198,12 @@ pub async fn list_events_by_address(
         LEFT JOIN addresses address ON address.id = event.address_id
         LEFT JOIN addresses target_address ON target_address.id = event.target_address_id
         LEFT JOIN contracts contract ON contract.id = event.contract_id
-        WHERE ($6::text IS NOT NULL OR chain.name = $1)
+        WHERE ($6::integer IS NOT NULL OR chain.name = $1)
           AND ($2::text IS NULL OR tx.hash = $2)
           AND ($3::bigint IS NULL OR block.height = $3)
           AND ($4::text IS NULL OR event_kind.name = $4)
           AND ($5::text IS NULL OR $5 = 'legacy')
-          AND ($6::text IS NULL OR address.address = $6 OR target_address.address = $6)
+          AND ($6::integer IS NULL OR event.address_id = $6 OR event.target_address_id = $6)
           AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
           AND ($11::integer IS NULL OR event.id = $11)
           AND ($12::text IS NULL OR tx.hash ILIKE $12 OR block.hash ILIKE $12 OR block.height = $13 OR event_kind.name ILIKE $12 OR address.address ILIKE $12 OR target_address.address ILIKE $12 OR address.address_name ILIKE $12 OR contract.hash ILIKE $12 OR contract.name ILIKE $12 OR contract.symbol ILIKE $12 OR event.token_id ILIKE $12)
@@ -220,7 +223,7 @@ pub async fn list_events_by_address(
         .bind(filter.block_height)
         .bind(filter.event_kind)
         .bind(filter.event_source)
-        .bind(address)
+        .bind(address_id)
         .bind(filter.contract)
         .bind(page.cursor_sort_value)
         .bind(page.cursor_id)
