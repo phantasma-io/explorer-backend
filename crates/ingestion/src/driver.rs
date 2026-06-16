@@ -259,6 +259,7 @@ impl BlockIngestionDriver {
         // reused across the block's transactions and events.
         let mut dimension_cache = explorer_db::ProjectionDimensionCache::new();
         let mut transaction_ids = Vec::with_capacity(block.txs.len());
+        let mut event_batches = Vec::with_capacity(block.txs.len());
         for (tx_index, transaction) in block.txs.iter().enumerate() {
             let transaction_projection = transaction_result_to_projection(
                 &block_record,
@@ -278,17 +279,13 @@ impl BlockIngestionDriver {
                 tx_index,
                 transaction,
             )?;
-            explorer_db::replace_events_cached(
-                conn,
-                &mut dimension_cache,
-                transaction_record.id,
-                &event_projections,
-            )
-            .await?;
             transaction_ids.push(transaction_record.id);
+            event_batches.push((transaction_record.id, event_projections));
         }
-        // Link all of the block's address activity in one set-based pass (the
-        // links only need the transactions and events that are now written).
+        // Write all of the block's events set-based, then apply each
+        // transaction's stateful side effects in order, then link address
+        // activity — all reading the rows just written.
+        explorer_db::project_block_events(conn, &mut dimension_cache, &event_batches).await?;
         explorer_db::replace_address_transactions_for_block(conn, &transaction_ids).await?;
         explorer_db::mark_block_addresses_dirty(conn, block_record.id, height).await?;
 

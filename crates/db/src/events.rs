@@ -54,6 +54,22 @@ pub async fn replace_events_cached(
         )
         .await?;
     }
+    apply_block_event_side_effects(conn, transaction_id, events).await?;
+
+    Ok(())
+}
+
+/// Apply the C#-parity side effects for one transaction's events (token
+/// create/supply, contract string-event linking, series lifecycle, NFT
+/// lifecycle, token_mint_extended, infusions, burn markers). These read the
+/// transaction's already-written events and depend on intra-block order, so they
+/// run per transaction in transaction order — never batched or reordered across
+/// transactions.
+pub(crate) async fn apply_block_event_side_effects(
+    conn: &mut PgConnection,
+    transaction_id: i32,
+    events: &[EventUpsert],
+) -> Result<(), DbError> {
     upsert_tokens_for_transaction(conn, transaction_id).await?;
     if events.iter().any(|event| {
         matches!(
@@ -103,6 +119,211 @@ pub async fn replace_events_cached(
     if events.iter().any(|event| event.token_id.is_some()) {
         apply_burn_markers_for_transaction(conn, transaction_id).await?;
     }
+
+    Ok(())
+}
+
+/// Write every event of a block, then apply each transaction's side effects in
+/// transaction order. Mirrors the C# block flow: events are inserted set-based,
+/// then the stateful per-transaction side effects run sequentially (they read the
+/// already-written events and depend on intra-block order).
+pub async fn project_block_events(
+    conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
+    batches: &[(i32, Vec<EventUpsert>)],
+) -> Result<(), DbError> {
+    insert_block_events(conn, cache, batches).await?;
+    for (transaction_id, events) in batches {
+        apply_block_event_side_effects(conn, *transaction_id, events).await?;
+    }
+    Ok(())
+}
+
+/// Insert the event rows for all of a block's transactions. On a fresh projection
+/// (no pre-existing rows for these transactions) the rows are written in one
+/// set-based `unnest` insert, in (transaction, event_index) order so the serial
+/// event ids match the per-transaction insert order. A re-projection (some rows
+/// already exist) falls back to the row-by-row upsert that reuses existing ids.
+pub(crate) async fn insert_block_events(
+    conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
+    batches: &[(i32, Vec<EventUpsert>)],
+) -> Result<(), DbError> {
+    let transaction_ids: Vec<i32> = batches.iter().map(|(id, _)| *id).collect();
+    if transaction_ids.is_empty() {
+        return Ok(());
+    }
+
+    let existing_event_ids = sqlx::query_as::<_, (i32, i32, i32)>(
+        "SELECT transaction_id, event_index, id FROM events WHERE transaction_id = ANY($1)",
+    )
+    .bind(&transaction_ids)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(|(transaction_id, event_index, id)| ((transaction_id, event_index), id))
+    .collect::<HashMap<_, _>>();
+
+    // Drop rows whose (transaction_id, event_index) is no longer desired.
+    let desired_transaction_ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|(transaction_id, events)| events.iter().map(move |_| *transaction_id))
+        .collect();
+    let desired_event_indexes: Vec<i32> = batches
+        .iter()
+        .flat_map(|(_, events)| events.iter().map(|event| event.event_index))
+        .collect();
+    sqlx::query(
+        r#"
+        DELETE FROM events
+        WHERE transaction_id = ANY($1)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM unnest($2::int[], $3::int[]) AS desired(transaction_id, event_index)
+              WHERE desired.transaction_id = events.transaction_id
+                AND desired.event_index = events.event_index
+          )
+        "#,
+    )
+    .bind(&transaction_ids)
+    .bind(&desired_transaction_ids)
+    .bind(&desired_event_indexes)
+    .execute(&mut *conn)
+    .await?;
+
+    if !existing_event_ids.is_empty() {
+        // Re-projection: row-by-row upsert reusing existing ids.
+        for (transaction_id, events) in batches {
+            for event in events {
+                let existing = existing_event_ids
+                    .get(&(*transaction_id, event.event_index))
+                    .copied();
+                upsert_event_cached(conn, cache, event, existing).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Fresh projection: resolve dimensions (cached, in order) and insert all rows
+    // in one pass. The id column is omitted so the serial default assigns ids in
+    // `unnest` order, which is the (transaction, event_index) order.
+    let mut timestamp = Vec::new();
+    let mut date = Vec::new();
+    let mut event_index = Vec::new();
+    let mut token_id = Vec::new();
+    let mut burned = Vec::new();
+    let mut nsfw = Vec::new();
+    let mut blacklisted = Vec::new();
+    let mut address_id = Vec::new();
+    let mut chain_id = Vec::new();
+    let mut contract_id = Vec::new();
+    let mut event_transaction_id = Vec::new();
+    let mut event_kind_id = Vec::new();
+    let mut target_address_id = Vec::new();
+    let mut payload_format = Vec::new();
+    let mut payload_json = Vec::new();
+    let mut raw_data = Vec::new();
+    for (_, events) in batches {
+        for event in events {
+            let kind_id = cache
+                .event_kind_id(conn, event.chain_id, &event.event_kind)
+                .await?;
+            let resolved_address_id = cache
+                .address_id(
+                    conn,
+                    event.chain_id,
+                    event.address.as_deref().unwrap_or("NULL"),
+                )
+                .await?;
+            let resolved_target_id = match event.target_address.as_deref().and_then(usable_address)
+            {
+                Some(address) => Some(cache.address_id(conn, event.chain_id, address).await?),
+                None => None,
+            };
+            let resolved_contract_id = cache
+                .contract_id(
+                    conn,
+                    event.chain_id,
+                    event.contract.as_deref().unwrap_or("unknown"),
+                )
+                .await?;
+            timestamp.push(event.timestamp_unix_seconds);
+            date.push(event.date_unix_seconds);
+            event_index.push(event.event_index);
+            token_id.push(event.token_id.clone());
+            burned.push(event.burned);
+            nsfw.push(event.nsfw);
+            blacklisted.push(event.blacklisted);
+            address_id.push(resolved_address_id);
+            chain_id.push(event.chain_id);
+            contract_id.push(resolved_contract_id);
+            event_transaction_id.push(event.transaction_id);
+            event_kind_id.push(kind_id);
+            target_address_id.push(resolved_target_id);
+            payload_format.push(event.payload_format.clone());
+            payload_json.push(event.payload_json.as_ref().map(|value| value.to_string()));
+            raw_data.push(event.raw_data.clone());
+        }
+    }
+    if event_index.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO events (
+            dm_unix_seconds,
+            timestamp_unix_seconds,
+            date_unix_seconds,
+            event_index,
+            token_id,
+            burned,
+            nsfw,
+            blacklisted,
+            address_id,
+            chain_id,
+            contract_id,
+            transaction_id,
+            event_kind_id,
+            target_address_id,
+            payload_format,
+            payload_json,
+            raw_data
+        )
+        SELECT
+            t.timestamp, t.timestamp, t.date, t.event_index, t.token_id, t.burned, t.nsfw,
+            t.blacklisted, t.address_id, t.chain_id, t.contract_id, t.transaction_id,
+            t.event_kind_id, t.target_address_id, t.payload_format, t.payload_json::jsonb,
+            t.raw_data
+        FROM unnest(
+            $1::bigint[], $2::bigint[], $3::int[], $4::text[], $5::bool[], $6::bool[], $7::bool[],
+            $8::int[], $9::int[], $10::int[], $11::int[], $12::int[], $13::int[], $14::text[],
+            $15::text[], $16::text[]
+        ) AS t(
+            timestamp, date, event_index, token_id, burned, nsfw, blacklisted, address_id,
+            chain_id, contract_id, transaction_id, event_kind_id, target_address_id,
+            payload_format, payload_json, raw_data
+        )
+        "#,
+    )
+    .bind(&timestamp)
+    .bind(&date)
+    .bind(&event_index)
+    .bind(&token_id)
+    .bind(&burned)
+    .bind(&nsfw)
+    .bind(&blacklisted)
+    .bind(&address_id)
+    .bind(&chain_id)
+    .bind(&contract_id)
+    .bind(&event_transaction_id)
+    .bind(&event_kind_id)
+    .bind(&target_address_id)
+    .bind(&payload_format)
+    .bind(&payload_json)
+    .bind(&raw_data)
+    .execute(&mut *conn)
+    .await?;
 
     Ok(())
 }
