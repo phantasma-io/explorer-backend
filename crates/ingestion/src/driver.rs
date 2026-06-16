@@ -269,6 +269,26 @@ impl BlockIngestionDriver {
                 kcal_decimals.unwrap_or_default(),
             )?);
         }
+        // Pre-resolve the block's transaction addresses in one batch so the per-tx
+        // dimension resolution below hits the cache instead of doing a serial
+        // round-trip per new address (the dominant per-block write cost; C# prefetches
+        // the whole block's addresses up front the same way).
+        let mut tx_addresses: Vec<String> = transaction_projections
+            .iter()
+            .flat_map(|transaction| {
+                [
+                    transaction.sender.clone(),
+                    transaction.gas_payer.clone(),
+                    transaction.gas_target.clone(),
+                ]
+            })
+            .map(|address| address.unwrap_or_else(|| "NULL".to_owned()))
+            .collect();
+        tx_addresses.sort_unstable();
+        tx_addresses.dedup();
+        dimension_cache
+            .prefetch_addresses(conn, block_record.chain_id, &tx_addresses)
+            .await?;
         // Upsert the block's transactions set-based; records come back in tx order.
         let transaction_records = explorer_db::batch_upsert_transactions(
             conn,

@@ -1670,6 +1670,54 @@ impl ProjectionDimensionCache {
         Self::default()
     }
 
+    /// Pre-resolve a batch of (distinct) addresses in one round-trip instead of a
+    /// serial `INSERT … ON CONFLICT … RETURNING` per first encounter: new addresses
+    /// are inserted set-based, then every id is loaded into the cache. Surrogate
+    /// address ids are not API-observable (everything keys by `address_id`; the API
+    /// renders the address string), so the batch insert order does not change any
+    /// observable data — it only removes per-address round-trips from block writes.
+    pub async fn prefetch_addresses(
+        &mut self,
+        conn: &mut PgConnection,
+        chain_id: i32,
+        addresses: &[String],
+    ) -> Result<(), DbError> {
+        let missing: Vec<String> = addresses
+            .iter()
+            .filter(|address| !self.addresses.contains_key(&(chain_id, (*address).clone())))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO addresses (
+                address, chain_id, name_last_updated_unix_seconds, stake_timestamp,
+                storage_available, storage_used, total_soul_amount, balance_dirty_block
+            )
+            SELECT address, $2, 0, 0, 0, 0, 0, 0
+            FROM unnest($1::text[]) AS address
+            ON CONFLICT (chain_id, address) DO NOTHING
+            "#,
+        )
+        .bind(&missing)
+        .bind(chain_id)
+        .execute(&mut *conn)
+        .await?;
+        let rows = sqlx::query_as::<_, (String, i32)>(
+            "SELECT address, id FROM addresses WHERE chain_id = $1 AND address = ANY($2)",
+        )
+        .bind(chain_id)
+        .bind(&missing)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (address, id) in rows {
+            self.addresses.insert((chain_id, address), id);
+        }
+        Ok(())
+    }
+
     async fn address_id(
         &mut self,
         conn: &mut PgConnection,
