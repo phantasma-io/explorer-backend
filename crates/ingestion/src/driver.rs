@@ -4,6 +4,9 @@
 //! `BlockIngestionDriver` struct is defined in the crate root; this module holds
 //! its inherent impl.
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Notify, watch};
 
 impl BlockIngestionDriver {
     pub fn new(
@@ -1731,15 +1734,20 @@ impl BlockIngestionDriver {
             Err(error) => warn!(%error, "startup database analyze failed; continuing"),
         }
 
+        // Maintenance (balance/stake, token supply/price, NFT/series/contract
+        // metadata, failed-tx debug) runs on its OWN tasks, concurrently with block
+        // ingestion and with each other — mirroring the C# thread-per-job model. The
+        // block loop below only projects blocks, so the tip is indexed within a poll
+        // no matter how long a maintenance job takes. Each task gates itself on the
+        // shared near-tip `lag` snapshot; balance is woken fire-and-forget after each
+        // near-tip batch (the analogue of C#'s RequestBalanceSync semaphore).
+        let lag = Arc::new(AtomicU64::new(u64::MAX));
+        let balance_kick = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut maintenance = self.spawn_maintenance_tasks(&lag, &balance_kick, &shutdown_rx);
+
         let mut ticker = interval(self.settings.poll_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut next_token_supply_sync = std::time::Instant::now();
-        let mut next_contract_rpc_metadata_sync = std::time::Instant::now();
-        let mut next_nft_rpc_metadata_sync = std::time::Instant::now();
-        let mut next_series_rpc_metadata_sync = std::time::Instant::now();
-        let mut next_failed_tx_debug_sync = std::time::Instant::now();
-        let mut next_token_price_sync = std::time::Instant::now();
-        let mut next_ttrs_offchain_sync = std::time::Instant::now();
         // Observability state: count consecutive sync failures (for error-level
         // escalation + backoff) and track whether near-tip maintenance is paused
         // (so the pause/resume is logged instead of being silently invisible).
@@ -1751,7 +1759,7 @@ impl BlockIngestionDriver {
                 _ = ticker.tick() => {}
                 _ = explorer_runtime::wait_for_shutdown_signal() => {
                     info!("worker shutdown signal received");
-                    return Ok(());
+                    break;
                 }
             }
 
@@ -1759,7 +1767,7 @@ impl BlockIngestionDriver {
                 result = self.sync_once() => result,
                 _ = explorer_runtime::wait_for_shutdown_signal() => {
                     info!("worker shutdown signal received; cancelling current sync batch");
-                    return Ok(());
+                    break;
                 }
             };
 
@@ -1779,10 +1787,12 @@ impl BlockIngestionDriver {
                     );
 
                     consecutive_sync_failures = 0;
-                    let near_tip = report
+                    let current_lag = report
                         .rpc_tip_height
-                        .saturating_sub(report.cursor_height_after)
-                        <= BALANCE_SYNC_LAG_THRESHOLD;
+                        .saturating_sub(report.cursor_height_after);
+                    // Publish the near-tip lag for the maintenance tasks' gate.
+                    lag.store(current_lag, Ordering::Relaxed);
+                    let near_tip = current_lag <= BALANCE_SYNC_LAG_THRESHOLD;
                     if near_tip {
                         if maintenance_paused {
                             info!(
@@ -1792,180 +1802,12 @@ impl BlockIngestionDriver {
                             );
                             maintenance_paused = false;
                         }
-                        if std::time::Instant::now() >= next_token_supply_sync {
-                            match self.sync_token_supplies_once().await {
-                                Ok(token_report) => info!(
-                                    "synced token supplies fetched={} updated={}",
-                                    token_report.fetched_tokens, token_report.updated_tokens
-                                ),
-                                Err(error) => warn!(%error, "token supply sync failed"),
-                            }
-                            next_token_supply_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    TOKEN_SUPPLY_SYNC_INTERVAL_SECONDS,
-                                );
-                        }
-
-                        if std::time::Instant::now() >= next_token_price_sync {
-                            match self.sync_token_prices_once().await {
-                                Ok(price_report)
-                                    if price_report.live_prices_updated > 0
-                                        || price_report.daily_rows_inserted > 0 =>
-                                {
-                                    info!(
-                                        "synced token prices live_updated={} daily_days={} daily_inserted={} daily_caught_up={}",
-                                        price_report.live_prices_updated,
-                                        price_report.daily_days_processed,
-                                        price_report.daily_rows_inserted,
-                                        price_report.daily_caught_up
-                                    )
-                                }
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "token price sync failed"),
-                            }
-                            next_token_price_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(TOKEN_PRICE_SYNC_INTERVAL_SECONDS);
-                        }
-
-                        if std::time::Instant::now() >= next_ttrs_offchain_sync {
-                            match self.sync_ttrs_offchain_nfts_once().await {
-                                Ok(ttrs_report) if ttrs_report.updated > 0 => info!(
-                                    "synced TTRS off-chain NFTs selected={} fetched={} updated={}",
-                                    ttrs_report.selected, ttrs_report.fetched, ttrs_report.updated
-                                ),
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "TTRS off-chain NFT sync failed"),
-                            }
-                            next_ttrs_offchain_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    TTRS_OFFCHAIN_SYNC_INTERVAL_SECONDS,
-                                );
-                        }
-
-                        if std::time::Instant::now() >= next_contract_rpc_metadata_sync {
-                            match self.sync_contract_upgrade_methods_once().await {
-                                Ok(upgrade_report)
-                                    if upgrade_report.inserted_methods > 0
-                                        || upgrade_report.failed_contracts > 0 =>
-                                {
-                                    info!(
-                                        "synced contract upgrade methods selected={} fetched={} inserted_methods={} linked_contracts={} failed={}",
-                                        upgrade_report.selected_upgrades,
-                                        upgrade_report.fetched_contracts,
-                                        upgrade_report.inserted_methods,
-                                        upgrade_report.linked_contracts,
-                                        upgrade_report.failed_contracts
-                                    )
-                                }
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "contract upgrade method sync failed"),
-                            }
-
-                            match self.sync_contract_rpc_metadata_once().await {
-                                Ok(contract_report)
-                                    if contract_report.updated_contracts > 0
-                                        || contract_report.failed_contracts > 0 =>
-                                {
-                                    info!(
-                                        "synced contract RPC metadata selected={} fetched={} updated={} inserted_methods={} failed={}",
-                                        contract_report.selected_contracts,
-                                        contract_report.fetched_contracts,
-                                        contract_report.updated_contracts,
-                                        contract_report.inserted_methods,
-                                        contract_report.failed_contracts
-                                    )
-                                }
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "contract RPC metadata sync failed"),
-                            }
-                            next_contract_rpc_metadata_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    CONTRACT_RPC_METADATA_SYNC_INTERVAL_SECONDS,
-                                );
-                        }
-
-                        if std::time::Instant::now() >= next_nft_rpc_metadata_sync {
-                            match self.sync_nft_rpc_metadata_once().await {
-                                Ok(nft_report) if nft_report.updated_nfts > 0 => info!(
-                                    "synced NFT RPC metadata selected={} fetched={} updated={} lag={}",
-                                    nft_report.selected_nfts,
-                                    nft_report.fetched_nfts,
-                                    nft_report.updated_nfts,
-                                    nft_report.lag
-                                ),
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "NFT RPC metadata sync failed"),
-                            }
-                            next_nft_rpc_metadata_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    NFT_RPC_METADATA_SYNC_INTERVAL_SECONDS,
-                                );
-                        }
-
-                        if std::time::Instant::now() >= next_series_rpc_metadata_sync {
-                            match self.sync_series_rpc_metadata_once().await {
-                                Ok(series_report) if series_report.updated_series > 0 => info!(
-                                    "synced series RPC metadata selected={} fetched={} updated={} lag={}",
-                                    series_report.selected_series,
-                                    series_report.fetched_series,
-                                    series_report.updated_series,
-                                    series_report.lag
-                                ),
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "series RPC metadata sync failed"),
-                            }
-                            next_series_rpc_metadata_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    SERIES_RPC_METADATA_SYNC_INTERVAL_SECONDS,
-                                );
-                        }
-
-                        if std::time::Instant::now() >= next_failed_tx_debug_sync {
-                            match self.sync_failed_transaction_debug_comments_once().await {
-                                Ok(debug_report) if debug_report.updated_transactions > 0 => info!(
-                                    "synced failed tx debug comments selected={} updated={} lag={}",
-                                    debug_report.selected_transactions,
-                                    debug_report.updated_transactions,
-                                    debug_report.lag
-                                ),
-                                Ok(_) => {}
-                                Err(error) => warn!(%error, "failed tx debug-comment sync failed"),
-                            }
-                            next_failed_tx_debug_sync = std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    FAILED_TX_DEBUG_SYNC_INTERVAL_SECONDS,
-                                );
-                        }
-
-                        match self.sync_dirty_balances_once().await {
-                            Ok(balance_report)
-                                if balance_report.updated_accounts > 0
-                                    || balance_report
-                                        .stake_snapshot_projection
-                                        .as_ref()
-                                        .is_some_and(stake_snapshot_projection_is_interesting) =>
-                            {
-                                let projection = balance_report.stake_snapshot_projection.as_ref();
-                                let projected_daily =
-                                    projection.map_or(0, |report| report.daily_upserted);
-                                let projected_monthly =
-                                    projection.map_or(0, |report| report.monthly_upserted);
-                                let skipped_reason = projection
-                                    .and_then(|report| report.skipped_reason.as_deref())
-                                    .unwrap_or("none");
-                                info!(
-                                    "synced balances accounts={} reset_dirty={} dirty_before={} lag={} stake_daily={} stake_monthly={} stake_skip={}",
-                                    balance_report.updated_accounts,
-                                    balance_report.reset_dirty_flags,
-                                    balance_report.dirty_before,
-                                    balance_report.lag,
-                                    projected_daily,
-                                    projected_monthly,
-                                    skipped_reason
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(error) => warn!(%error, "balance sync batch failed"),
+                        // Wake the balance task off the block path after a batch
+                        // that wrote blocks (and therefore dirtied addresses). The
+                        // wake is coalesced (at most one pending), mirroring C#'s
+                        // RequestBalanceSync.
+                        if report.projected_blocks > 0 {
+                            balance_kick.notify_one();
                         }
                     } else if !maintenance_paused {
                         warn!(
@@ -1992,6 +1834,364 @@ impl BlockIngestionDriver {
                         sleep(std::time::Duration::from_secs(backoff_secs)).await;
                     }
                 }
+            }
+        }
+
+        // Shutdown: tell the maintenance tasks to stop and wait for each to
+        // finish its current job (graceful, like the C# threads stopping on
+        // `_running = false`).
+        let _ = shutdown_tx.send(true);
+        while maintenance.join_next().await.is_some() {}
+        Ok(())
+    }
+
+    /// Spawn the maintenance jobs as independent tasks (the Rust analogue of the
+    /// C# thread-per-job model). Each gates itself on the shared near-tip `lag`;
+    /// balance is woken fire-and-forget by the block loop. The block loop never
+    /// awaits any of them, so block indexing stays decoupled from maintenance.
+    fn spawn_maintenance_tasks(
+        &self,
+        lag: &Arc<AtomicU64>,
+        balance_kick: &Arc<Notify>,
+        shutdown: &watch::Receiver<bool>,
+    ) -> JoinSet<()> {
+        let mut tasks = JoinSet::new();
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let kick = balance_kick.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_balance_maintenance(lag, kick, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_token_supply_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_token_price_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_ttrs_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move {
+                driver
+                    .run_contract_metadata_maintenance(lag, shutdown)
+                    .await
+            });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_nft_metadata_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_series_metadata_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_failed_tx_maintenance(lag, shutdown).await });
+        }
+        tasks
+    }
+
+    /// Balance/stake drain: runs when the block loop pokes `kick` (immediately
+    /// after a near-tip batch) or on a poll-interval fallback (to drain leftover
+    /// dirty addresses and advance daily stake snapshots while the chain is idle).
+    async fn run_balance_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        kick: Arc<Notify>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut fallback = interval(self.settings.poll_interval);
+        fallback.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = kick.notified() => {}
+                _ = fallback.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_dirty_balances_once().await {
+                Ok(balance_report)
+                    if balance_report.updated_accounts > 0
+                        || balance_report
+                            .stake_snapshot_projection
+                            .as_ref()
+                            .is_some_and(stake_snapshot_projection_is_interesting) =>
+                {
+                    let projection = balance_report.stake_snapshot_projection.as_ref();
+                    let projected_daily = projection.map_or(0, |report| report.daily_upserted);
+                    let projected_monthly = projection.map_or(0, |report| report.monthly_upserted);
+                    let skipped_reason = projection
+                        .and_then(|report| report.skipped_reason.as_deref())
+                        .unwrap_or("none");
+                    info!(
+                        "synced balances accounts={} reset_dirty={} dirty_before={} lag={} stake_daily={} stake_monthly={} stake_skip={}",
+                        balance_report.updated_accounts,
+                        balance_report.reset_dirty_flags,
+                        balance_report.dirty_before,
+                        balance_report.lag,
+                        projected_daily,
+                        projected_monthly,
+                        skipped_reason
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "balance sync batch failed"),
+            }
+        }
+    }
+
+    async fn run_token_supply_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            TOKEN_SUPPLY_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_token_supplies_once().await {
+                Ok(token_report) => info!(
+                    "synced token supplies fetched={} updated={}",
+                    token_report.fetched_tokens, token_report.updated_tokens
+                ),
+                Err(error) => warn!(%error, "token supply sync failed"),
+            }
+        }
+    }
+
+    async fn run_token_price_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            TOKEN_PRICE_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_token_prices_once().await {
+                Ok(price_report)
+                    if price_report.live_prices_updated > 0
+                        || price_report.daily_rows_inserted > 0 =>
+                {
+                    info!(
+                        "synced token prices live_updated={} daily_days={} daily_inserted={} daily_caught_up={}",
+                        price_report.live_prices_updated,
+                        price_report.daily_days_processed,
+                        price_report.daily_rows_inserted,
+                        price_report.daily_caught_up
+                    )
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "token price sync failed"),
+            }
+        }
+    }
+
+    async fn run_ttrs_maintenance(&self, lag: Arc<AtomicU64>, mut shutdown: watch::Receiver<bool>) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            TTRS_OFFCHAIN_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_ttrs_offchain_nfts_once().await {
+                Ok(ttrs_report) if ttrs_report.updated > 0 => info!(
+                    "synced TTRS off-chain NFTs selected={} fetched={} updated={}",
+                    ttrs_report.selected, ttrs_report.fetched, ttrs_report.updated
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "TTRS off-chain NFT sync failed"),
+            }
+        }
+    }
+
+    async fn run_contract_metadata_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            CONTRACT_RPC_METADATA_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_contract_upgrade_methods_once().await {
+                Ok(upgrade_report)
+                    if upgrade_report.inserted_methods > 0
+                        || upgrade_report.failed_contracts > 0 =>
+                {
+                    info!(
+                        "synced contract upgrade methods selected={} fetched={} inserted_methods={} linked_contracts={} failed={}",
+                        upgrade_report.selected_upgrades,
+                        upgrade_report.fetched_contracts,
+                        upgrade_report.inserted_methods,
+                        upgrade_report.linked_contracts,
+                        upgrade_report.failed_contracts
+                    )
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "contract upgrade method sync failed"),
+            }
+            match self.sync_contract_rpc_metadata_once().await {
+                Ok(contract_report)
+                    if contract_report.updated_contracts > 0
+                        || contract_report.failed_contracts > 0 =>
+                {
+                    info!(
+                        "synced contract RPC metadata selected={} fetched={} updated={} inserted_methods={} failed={}",
+                        contract_report.selected_contracts,
+                        contract_report.fetched_contracts,
+                        contract_report.updated_contracts,
+                        contract_report.inserted_methods,
+                        contract_report.failed_contracts
+                    )
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "contract RPC metadata sync failed"),
+            }
+        }
+    }
+
+    async fn run_nft_metadata_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            NFT_RPC_METADATA_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_nft_rpc_metadata_once().await {
+                Ok(nft_report) if nft_report.updated_nfts > 0 => info!(
+                    "synced NFT RPC metadata selected={} fetched={} updated={} lag={}",
+                    nft_report.selected_nfts,
+                    nft_report.fetched_nfts,
+                    nft_report.updated_nfts,
+                    nft_report.lag
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "NFT RPC metadata sync failed"),
+            }
+        }
+    }
+
+    async fn run_series_metadata_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            SERIES_RPC_METADATA_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_series_rpc_metadata_once().await {
+                Ok(series_report) if series_report.updated_series > 0 => info!(
+                    "synced series RPC metadata selected={} fetched={} updated={} lag={}",
+                    series_report.selected_series,
+                    series_report.fetched_series,
+                    series_report.updated_series,
+                    series_report.lag
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "series RPC metadata sync failed"),
+            }
+        }
+    }
+
+    async fn run_failed_tx_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            FAILED_TX_DEBUG_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.sync_failed_transaction_debug_comments_once().await {
+                Ok(debug_report) if debug_report.updated_transactions > 0 => info!(
+                    "synced failed tx debug comments selected={} updated={} lag={}",
+                    debug_report.selected_transactions,
+                    debug_report.updated_transactions,
+                    debug_report.lag
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "failed tx debug-comment sync failed"),
             }
         }
     }
