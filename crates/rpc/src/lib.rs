@@ -15,6 +15,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
+/// Failover rounds per RPC call (each round tries every endpoint once). Bounds the
+/// retry of transient transport blips before giving up.
+const MAX_RPC_ATTEMPTS: usize = 4;
+const RPC_RETRY_BASE_DELAY_MS: u64 = 250;
+const RPC_RETRY_MAX_DELAY_MS: u64 = 2_000;
+
+/// Whether an RPC error is worth retrying. Only transport-level failures (timeouts,
+/// connection resets, premature EOF, 5xx — the SDK maps these to `Http`) are
+/// transient; an RPC-level error (`Rpc`, e.g. "ID not found") or a decode error is
+/// permanent and retrying it only wastes time and node load.
+fn is_transient_rpc_error(error: &RpcError) -> bool {
+    matches!(error, RpcError::Sdk(PhantasmaError::Http(_)))
+}
+
 #[derive(Clone)]
 pub struct PhantasmaSdkClient {
     inner: Arc<SdkClientInner>,
@@ -77,11 +91,56 @@ impl PhantasmaSdkClient {
         })
     }
 
-    /// Runs an RPC call with round-robin start and failover: it tries each configured
-    /// endpoint at most once (starting at the next round-robin slot) and returns the
-    /// first success, so one dead endpoint does not break the call while healthy ones
-    /// remain. The last error is returned only if every endpoint fails.
+    /// Runs an RPC call with round-robin failover AND bounded retry+backoff: each
+    /// attempt tries every configured endpoint once (starting at the next round-robin
+    /// slot); if the whole round failed with a TRANSIENT error (a transport/timeout
+    /// blip) it backs off and retries, up to `MAX_RPC_ATTEMPTS` rounds. A permanent
+    /// error (an RPC-level "not found" or a decode error) stops immediately, since
+    /// retrying it only wastes time. Previously the call gave up after one round with
+    /// no retry — a single network blip failed the whole call (the C# client retried
+    /// up to 5 times with backoff). The round-robin start advances each round, so the
+    /// retries also spread across endpoints.
     async fn with_failover<T, F, Fut>(&self, rpc_call: &'static str, call: F) -> Result<T, RpcError>
+    where
+        F: Fn(SdkEndpoint) -> Fut,
+        Fut: std::future::Future<Output = Result<T, RpcError>>,
+    {
+        let mut last_error: Option<RpcError> = None;
+        for attempt in 0..MAX_RPC_ATTEMPTS {
+            if attempt > 0 {
+                let delay_ms =
+                    (RPC_RETRY_BASE_DELAY_MS << (attempt - 1)).min(RPC_RETRY_MAX_DELAY_MS);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            match self.try_endpoints_once(rpc_call, &call).await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let transient = is_transient_rpc_error(&error);
+                    last_error = Some(error);
+                    if !transient {
+                        break;
+                    }
+                    if attempt + 1 < MAX_RPC_ATTEMPTS {
+                        tracing::warn!(
+                            rpc_call,
+                            attempt = attempt + 1,
+                            "transient RPC failure across all endpoints; retrying after backoff"
+                        );
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or(RpcError::MissingRpcEndpoints))
+    }
+
+    /// One failover round: try each endpoint at most once (round-robin start) and
+    /// return the first success, so one dead endpoint does not break the call while
+    /// healthy ones remain.
+    async fn try_endpoints_once<T, F, Fut>(
+        &self,
+        rpc_call: &'static str,
+        call: &F,
+    ) -> Result<T, RpcError>
     where
         F: Fn(SdkEndpoint) -> Fut,
         Fut: std::future::Future<Output = Result<T, RpcError>>,
