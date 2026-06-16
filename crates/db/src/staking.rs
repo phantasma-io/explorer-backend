@@ -370,6 +370,33 @@ pub struct StakeForwardBuildReport {
     pub skipped_reason: Option<String>,
 }
 
+/// Count the already-projected daily snapshots inside the seed→live-window gap, used
+/// to skip the full-history rebuild scan when the gap is already filled.
+async fn count_projected_gap_dailies(
+    conn: &mut PgConnection,
+    chain_id: i32,
+    from_day: i64,
+    first_trusted_day: i64,
+) -> Result<i64, DbError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT count(*)
+        FROM staking_progress_dailies
+        WHERE chain_id = $1
+          AND source = $2
+          AND date_unix_seconds >= $3
+          AND date_unix_seconds < $4
+        "#,
+    )
+    .bind(chain_id)
+    .bind(STAKE_SNAPSHOT_PROJECTOR_SOURCE)
+    .bind(from_day)
+    .bind(first_trusted_day)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(count)
+}
+
 pub async fn project_stake_snapshots_forward(
     pool: &PgPool,
     chain_id: i32,
@@ -432,23 +459,51 @@ async fn project_stake_snapshots_forward_in_tx(
         ));
     }
 
-    // All stake events from the day after the seed day to the cursor.
+    // Load the independent live `balance-sync.v1` dailies first so the steady-state
+    // case can skip the expensive full-history event scan (the analogue of C#'s
+    // DetectSnapshotRebuildRangeAsync returning null when there is no missing tail).
+    let trusted = load_trusted_stake_snapshot_dailies(conn, chain_id).await?;
+    let Some(first_trusted_day) = trusted.keys().copied().min() else {
+        return Ok(skip(
+            boundary_day,
+            boundary_masters,
+            "no balance-sync.v1 dailies to validate against; refusing to write blind",
+        ));
+    };
+    if from_day >= first_trusted_day {
+        return Ok(skip(
+            boundary_day,
+            boundary_masters,
+            "balance-sync.v1 already covers the post-seed days; nothing to build",
+        ));
+    }
+    // Cheap precondition: the gap to fill is [from_day, first_trusted_day), which is
+    // historical and immutable once the chain has moved past it. If every gap day is
+    // already projected, there is nothing to rebuild — skip the full-history scan
+    // instead of rescanning ~all stake events on every pass.
+    let expected_gap_days = (first_trusted_day - from_day) / STAKE_SNAPSHOT_SECONDS_PER_DAY;
+    let projected_gap_days =
+        count_projected_gap_dailies(conn, chain_id, from_day, first_trusted_day).await?;
+    if projected_gap_days >= expected_gap_days {
+        return Ok(skip(
+            boundary_day,
+            boundary_masters,
+            "stake snapshot gap already projected; nothing to rebuild",
+        ));
+    }
+
+    // Gap needs (re)building: scan the stake events from the day after the seed to
+    // the cursor and build the forward curve.
     let events = load_stake_snapshot_events(conn, chain_id, from_day, cursor_timestamp).await?;
     let curve =
         build_stake_snapshot_daily_points(boundary_state, &events, from_day, target_exclusive_day)?;
 
-    // Validate the forward curve against the independent live `balance-sync.v1` dailies; refuse to
-    // write if any overlapping day disagrees or none overlap.
-    //
-    // Scope of this gate (important): the series is built forward from the stored seed and shares
-    // no derivation with `balance-sync.v1` (which snapshots live RPC account state), so agreement
-    // on the overlapping tip day(s) is a genuine end-to-end check, not a tautology. But only the
-    // OVERLAP is checked per day; earlier days written below (before `first_trusted_day`) have no
-    // `balance-sync.v1` row to compare against, so they are validated only by endpoint convergence,
-    // not per day. Two compensating errors before the trusted window (a count miscounted up on one
-    // day and back down on another) would still converge at the tip and be written with
-    // `validated = true` — it is not a per-day proof of those earlier days.
-    let trusted = load_trusted_stake_snapshot_dailies(conn, chain_id).await?;
+    // Validate the forward curve against the overlapping live `balance-sync.v1`
+    // dailies; refuse to write if any overlapping day disagrees or none overlap. The
+    // series shares no derivation with balance-sync.v1, so agreement on the
+    // overlapping tip day(s) is a genuine end-to-end check, not a tautology. Only the
+    // overlap is checked per day; earlier gap days are validated by endpoint
+    // convergence, not per day (see the original note in the project history).
     let mut validated_days = 0_usize;
     for point in &curve {
         let Some(expected) = trusted.get(&point.date_unix_seconds) else {
@@ -481,15 +536,9 @@ async fn project_stake_snapshots_forward_in_tx(
         ));
     }
 
-    // Write only the gap dailies (below the live balance-sync.v1 window) and the monthly rollup
-    // starting the month after the seed day; never touch the seed day/month.
-    let Some(first_trusted_day) = trusted.keys().copied().min() else {
-        return Ok(skip(
-            boundary_day,
-            boundary_masters,
-            "no balance-sync.v1 day after validation",
-        ));
-    };
+    // Write only the gap dailies (below the live balance-sync.v1 window) and the
+    // monthly rollup starting the month after the seed day; never touch the seed
+    // day/month.
     let daily_to_write = curve
         .into_iter()
         .filter(|point| point.date_unix_seconds < first_trusted_day)
