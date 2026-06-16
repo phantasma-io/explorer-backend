@@ -1873,7 +1873,23 @@ pub async fn upsert_transaction_cached(
 
     replace_transaction_signatures(conn, id, &transaction.signatures).await?;
 
-    Ok(TransactionRecord {
+    Ok(transaction_record_from_upsert(
+        transaction,
+        id,
+        sender_id,
+        gas_payer_id,
+        gas_target_id,
+    ))
+}
+
+fn transaction_record_from_upsert(
+    transaction: TransactionUpsert,
+    id: i32,
+    sender_id: i32,
+    gas_payer_id: i32,
+    gas_target_id: i32,
+) -> TransactionRecord {
+    TransactionRecord {
         id,
         block_id: transaction.block_id,
         chain_id: transaction.chain_id,
@@ -1897,7 +1913,195 @@ pub async fn upsert_transaction_cached(
         carbon_tx_type: transaction.carbon_tx_type,
         carbon_tx_data: transaction.carbon_tx_data,
         expiration_unix_seconds: transaction.expiration_unix_seconds,
-    })
+    }
+}
+
+/// Upsert all of a block's transactions, returning their records in input order.
+/// On a fresh projection (no rows yet for this block) the rows are inserted in
+/// one set-based `unnest` pass ordered by `tx_index` (so the serial ids match the
+/// per-transaction order, mirroring the C# reserve-ids + batch insert), then each
+/// transaction's signatures are written. A re-projection (some rows already
+/// exist) falls back to the row-by-row upsert.
+pub async fn batch_upsert_transactions(
+    conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
+    transactions: Vec<TransactionUpsert>,
+) -> Result<Vec<TransactionRecord>, DbError> {
+    if transactions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let block_id = transactions[0].block_id;
+
+    // Resolve dimensions for every transaction once, in order.
+    let mut resolved = Vec::with_capacity(transactions.len());
+    for transaction in &transactions {
+        let state_id = cache.transaction_state_id(conn, &transaction.state).await?;
+        let sender_id = cache
+            .address_id(
+                conn,
+                transaction.chain_id,
+                transaction.sender.as_deref().unwrap_or("NULL"),
+            )
+            .await?;
+        let gas_payer_id = cache
+            .address_id(
+                conn,
+                transaction.chain_id,
+                transaction.gas_payer.as_deref().unwrap_or("NULL"),
+            )
+            .await?;
+        let gas_target_id = cache
+            .address_id(
+                conn,
+                transaction.chain_id,
+                transaction.gas_target.as_deref().unwrap_or("NULL"),
+            )
+            .await?;
+        resolved.push((state_id, sender_id, gas_payer_id, gas_target_id));
+    }
+
+    let existing = sqlx::query_as::<_, (i32, i32)>(
+        "SELECT tx_index, id FROM transactions WHERE block_id = $1",
+    )
+    .bind(block_id)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .collect::<HashMap<i32, i32>>();
+
+    if !existing.is_empty() {
+        // Re-projection: row-by-row upsert (handles insert-or-update + signatures).
+        let mut records = Vec::with_capacity(transactions.len());
+        for transaction in transactions {
+            records.push(upsert_transaction_cached(conn, cache, transaction).await?);
+        }
+        return Ok(records);
+    }
+
+    // Fresh projection: one set-based insert preserving tx_index order.
+    let mut hash = Vec::with_capacity(transactions.len());
+    let mut tx_index = Vec::with_capacity(transactions.len());
+    let mut block = Vec::with_capacity(transactions.len());
+    let mut timestamp = Vec::with_capacity(transactions.len());
+    let mut payload = Vec::with_capacity(transactions.len());
+    let mut script_raw = Vec::with_capacity(transactions.len());
+    let mut result = Vec::with_capacity(transactions.len());
+    let mut fee = Vec::with_capacity(transactions.len());
+    let mut expiration = Vec::with_capacity(transactions.len());
+    let mut state_id = Vec::with_capacity(transactions.len());
+    let mut gas_price = Vec::with_capacity(transactions.len());
+    let mut gas_limit = Vec::with_capacity(transactions.len());
+    let mut sender_id = Vec::with_capacity(transactions.len());
+    let mut gas_payer_id = Vec::with_capacity(transactions.len());
+    let mut gas_target_id = Vec::with_capacity(transactions.len());
+    let mut fee_raw = Vec::with_capacity(transactions.len());
+    let mut gas_limit_raw = Vec::with_capacity(transactions.len());
+    let mut gas_price_raw = Vec::with_capacity(transactions.len());
+    let mut carbon_tx_data = Vec::with_capacity(transactions.len());
+    let mut carbon_tx_type = Vec::with_capacity(transactions.len());
+    let mut debug_comment = Vec::with_capacity(transactions.len());
+    for (transaction, (resolved_state, resolved_sender, resolved_gas_payer, resolved_gas_target)) in
+        transactions.iter().zip(resolved.iter())
+    {
+        hash.push(transaction.hash.clone());
+        tx_index.push(transaction.tx_index);
+        block.push(transaction.block_id);
+        timestamp.push(transaction.timestamp_unix_seconds);
+        payload.push(transaction.payload.clone());
+        script_raw.push(transaction.script_raw.clone());
+        result.push(transaction.result.clone());
+        fee.push(transaction.fee.clone());
+        expiration.push(transaction.expiration_unix_seconds);
+        state_id.push(*resolved_state);
+        gas_price.push(transaction.gas_price.clone());
+        gas_limit.push(transaction.gas_limit.clone());
+        sender_id.push(*resolved_sender);
+        gas_payer_id.push(*resolved_gas_payer);
+        gas_target_id.push(*resolved_gas_target);
+        fee_raw.push(transaction.fee_raw.clone());
+        gas_limit_raw.push(transaction.gas_limit_raw.clone());
+        gas_price_raw.push(transaction.gas_price_raw.clone());
+        carbon_tx_data.push(transaction.carbon_tx_data.clone());
+        carbon_tx_type.push(
+            transaction
+                .carbon_tx_type
+                .and_then(|value| i16::try_from(value).ok()),
+        );
+        debug_comment.push(transaction.debug_comment.clone());
+    }
+
+    let inserted = sqlx::query_as::<_, (i32, i32)>(
+        r#"
+        INSERT INTO transactions (
+            hash, tx_index, block_id, timestamp_unix_seconds, payload, script_raw, result, fee,
+            expiration, state_id, gas_price, gas_limit, sender_id, gas_payer_id, gas_target_id,
+            fee_raw, gas_limit_raw, gas_price_raw, carbon_tx_data, carbon_tx_type, debug_comment
+        )
+        SELECT
+            t.hash, t.tx_index, t.block_id, t.timestamp, t.payload, t.script_raw, t.result, t.fee,
+            t.expiration, t.state_id, t.gas_price, t.gas_limit, t.sender_id, t.gas_payer_id,
+            t.gas_target_id, t.fee_raw, t.gas_limit_raw, t.gas_price_raw, t.carbon_tx_data,
+            t.carbon_tx_type, t.debug_comment
+        FROM unnest(
+            $1::text[], $2::int[], $3::int[], $4::bigint[], $5::text[], $6::text[], $7::text[],
+            $8::text[], $9::bigint[], $10::int[], $11::text[], $12::text[], $13::int[], $14::int[],
+            $15::int[], $16::text[], $17::text[], $18::text[], $19::text[], $20::smallint[],
+            $21::text[]
+        ) AS t(
+            hash, tx_index, block_id, timestamp, payload, script_raw, result, fee, expiration,
+            state_id, gas_price, gas_limit, sender_id, gas_payer_id, gas_target_id, fee_raw,
+            gas_limit_raw, gas_price_raw, carbon_tx_data, carbon_tx_type, debug_comment
+        )
+        RETURNING id, tx_index
+        "#,
+    )
+    .bind(&hash)
+    .bind(&tx_index)
+    .bind(&block)
+    .bind(&timestamp)
+    .bind(&payload)
+    .bind(&script_raw)
+    .bind(&result)
+    .bind(&fee)
+    .bind(&expiration)
+    .bind(&state_id)
+    .bind(&gas_price)
+    .bind(&gas_limit)
+    .bind(&sender_id)
+    .bind(&gas_payer_id)
+    .bind(&gas_target_id)
+    .bind(&fee_raw)
+    .bind(&gas_limit_raw)
+    .bind(&gas_price_raw)
+    .bind(&carbon_tx_data)
+    .bind(&carbon_tx_type)
+    .bind(&debug_comment)
+    .fetch_all(&mut *conn)
+    .await?;
+    let id_by_tx_index = inserted
+        .into_iter()
+        .map(|(id, tx_index)| (tx_index, id))
+        .collect::<HashMap<i32, i32>>();
+
+    let mut records = Vec::with_capacity(transactions.len());
+    for (transaction, (_, resolved_sender, resolved_gas_payer, resolved_gas_target)) in
+        transactions.into_iter().zip(resolved.into_iter())
+    {
+        let id = id_by_tx_index
+            .get(&transaction.tx_index)
+            .copied()
+            .ok_or(DbError::Sqlx(sqlx::Error::RowNotFound))?;
+        replace_transaction_signatures(conn, id, &transaction.signatures).await?;
+        records.push(transaction_record_from_upsert(
+            transaction,
+            id,
+            resolved_sender,
+            resolved_gas_payer,
+            resolved_gas_target,
+        ));
+    }
+
+    Ok(records)
 }
 
 async fn replace_transaction_signatures(

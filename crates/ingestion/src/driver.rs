@@ -258,24 +258,31 @@ impl BlockIngestionDriver {
         // resolved once on first encounter (in transaction/event order) and
         // reused across the block's transactions and events.
         let mut dimension_cache = explorer_db::ProjectionDimensionCache::new();
-        let mut transaction_ids = Vec::with_capacity(block.txs.len());
-        let mut event_batches = Vec::with_capacity(block.txs.len());
+        let mut transaction_projections = Vec::with_capacity(block.txs.len());
         for (tx_index, transaction) in block.txs.iter().enumerate() {
-            let transaction_projection = transaction_result_to_projection(
+            transaction_projections.push(transaction_result_to_projection(
                 &block_record,
                 tx_index,
                 transaction,
                 kcal_decimals.unwrap_or_default(),
-            )?;
-            let transaction_record = explorer_db::upsert_transaction_cached(
-                conn,
-                &mut dimension_cache,
-                transaction_projection,
-            )
-            .await?;
+            )?);
+        }
+        // Upsert the block's transactions set-based; records come back in tx order.
+        let transaction_records = explorer_db::batch_upsert_transactions(
+            conn,
+            &mut dimension_cache,
+            transaction_projections,
+        )
+        .await?;
+
+        let mut transaction_ids = Vec::with_capacity(transaction_records.len());
+        let mut event_batches = Vec::with_capacity(transaction_records.len());
+        for ((tx_index, transaction), transaction_record) in
+            block.txs.iter().enumerate().zip(transaction_records.iter())
+        {
             let event_projections = transaction_events_to_projections(
                 &block_record,
-                &transaction_record,
+                transaction_record,
                 tx_index,
                 transaction,
             )?;
