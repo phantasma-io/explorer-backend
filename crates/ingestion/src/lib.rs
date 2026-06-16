@@ -1,4 +1,4 @@
-use explorer_config::{ChainConfig, WorkerConfig};
+use explorer_config::{ChainConfig, WorkerConfig, WorkerSyncMode};
 use explorer_db::{
     AddressAccountUpsert, AddressBalanceUpsert, BlockRecord, BlockUpsert,
     ContractRpcMetadataCandidate, ContractRpcMetadataUpsert, ContractStringEventSideEffectReport,
@@ -77,7 +77,6 @@ pub struct StartupProbe {
     pub next_planned_height: Option<u64>,
     pub fetch_batch_size: u64,
     pub fetch_concurrency: usize,
-    pub project_concurrency: usize,
     pub inter_block_delay_ms: u64,
     pub batch_delay_ms: u64,
 }
@@ -94,7 +93,8 @@ pub struct SyncBatchReport {
     pub to_height: Option<u64>,
     pub projected_blocks: u64,
     pub cursor_height_after: u64,
-    pub project_concurrency: usize,
+    /// In-flight block-fetch concurrency used for this pass (0 when idle).
+    pub fetch_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

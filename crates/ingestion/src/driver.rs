@@ -43,7 +43,6 @@ impl BlockIngestionDriver {
                 .as_ref()
                 .map(|window| window.concurrency)
                 .unwrap_or(self.settings.effective_fetch_concurrency()),
-            project_concurrency: self.project_concurrency_for_window(window.as_ref()),
             inter_block_delay_ms: duration_millis_u64(self.settings.inter_block_delay),
             batch_delay_ms: duration_millis_u64(self.settings.batch_delay),
         })
@@ -313,6 +312,9 @@ impl BlockIngestionDriver {
         let cursor_height = explorer_db::get_cursor_height(&mut conn, chain_id)
             .await?
             .unwrap_or_else(|| BlockHeight::new(0));
+        // Release the pooled connection before the (possibly long) projection
+        // pass; the pipeline acquires its own per-block transactions.
+        drop(conn);
         self.validate_zero_state_scope(cursor_height)?;
         let Some(window) = plan_fetch_window(cursor_height, rpc_tip, &self.settings)? else {
             return Ok(SyncBatchReport {
@@ -326,23 +328,35 @@ impl BlockIngestionDriver {
                 to_height: None,
                 projected_blocks: 0,
                 cursor_height_after: cursor_height.value(),
-                project_concurrency: 0,
+                fetch_concurrency: 0,
             });
         };
 
-        let project_concurrency = self.project_concurrency_for_window(Some(&window));
-        let (projected_blocks, cursor_height_after) = if project_concurrency == 1 {
-            self.project_window_sequentially(&window, cursor_height)
-                .await?
-        } else {
-            self.project_window_concurrently(&window, project_concurrency)
-                .await?
+        // Normal mode runs the fetch/process pipeline: RPC fetch overlaps DB
+        // writes (the Rust equivalent of the C# producer/consumer threads).
+        // Sequential and Relief stay strictly serial — Sequential for
+        // deterministic, reproducible ingestion and Relief for one-block,
+        // load-shedding passes over difficult ranges. In every mode blocks are
+        // written and the cursor advances in strict height order.
+        let (projected_blocks, cursor_height_after) = match self.settings.sync_mode {
+            WorkerSyncMode::Normal => {
+                self.project_window_pipelined(&window, cursor_height)
+                    .await?
+            }
+            WorkerSyncMode::Sequential | WorkerSyncMode::Relief => {
+                self.project_window_sequentially(&window, cursor_height)
+                    .await?
+            }
         };
 
         if !self.settings.batch_delay.is_zero() {
             sleep(self.settings.batch_delay).await;
         }
 
+        let fetch_concurrency = match self.settings.sync_mode {
+            WorkerSyncMode::Normal => window.concurrency,
+            WorkerSyncMode::Sequential | WorkerSyncMode::Relief => 1,
+        };
         Ok(SyncBatchReport {
             configured_nexus: self.chain.nexus.to_string(),
             chain: self.chain.chain.to_string(),
@@ -354,22 +368,8 @@ impl BlockIngestionDriver {
             to_height: Some(window.to_height.value()),
             projected_blocks,
             cursor_height_after: cursor_height_after.value(),
-            project_concurrency,
+            fetch_concurrency,
         })
-    }
-
-    fn project_concurrency_for_window(&self, window: Option<&FetchWindow>) -> usize {
-        let requested = self.settings.effective_project_concurrency();
-        window
-            .map(|window| {
-                let block_count = window
-                    .to_height
-                    .value()
-                    .saturating_sub(window.from_height.value())
-                    .saturating_add(1);
-                requested.min(block_count as usize)
-            })
-            .unwrap_or(requested)
     }
 
     fn validate_zero_state_scope(&self, cursor_height: BlockHeight) -> Result<(), IngestionError> {
@@ -428,55 +428,139 @@ impl BlockIngestionDriver {
         Ok((projected_blocks, cursor_height_after))
     }
 
-    async fn project_window_concurrently(
+    /// Fetch/process pipeline: keep up to `window.concurrency` block fetches in
+    /// flight while the writer drains them in strict height order, so RPC fetch
+    /// overlaps DB writes (the Rust analogue of the C# fetch/process threads
+    /// joined by a bounded channel). Throughput becomes `min(fetch_rate,
+    /// write_rate)` instead of the old phased `fetch_all → write_all` (which left
+    /// the RPC idle during writes and the DB idle during fetch).
+    ///
+    /// Ordering and crash recovery are preserved exactly as in the serial path:
+    /// each block is written in its own transaction and the cursor advances only
+    /// for the next contiguous height, so a crash or a mid-window fetch failure
+    /// leaves a committed, gap-free prefix. Concurrent fetch completion is
+    /// reordered through `ready` before writing, so insert order is identical to
+    /// the sequential path.
+    async fn project_window_pipelined(
         &self,
         window: &FetchWindow,
-        concurrency: usize,
+        cursor_height: BlockHeight,
     ) -> Result<(u64, BlockHeight), IngestionError> {
-        let mut tasks = JoinSet::new();
-        let mut next_height = window.from_height.value();
-        let to_height = window.to_height.value();
-        let mut fetched_blocks = BTreeMap::new();
+        let from = window.from_height.value();
+        let to = window.to_height.value();
+        let concurrency = window.concurrency.max(1);
+        // Never let fetching run more than this many blocks ahead of the writer.
+        // Bounds in-flight + buffered decoded blocks in memory and applies
+        // backpressure when the writer is slower than RPC — the Rust equivalent
+        // of the C# bounded `Channel` capacity.
+        let max_read_ahead = u64::try_from(self.settings.queue_capacity)
+            .unwrap_or(u64::MAX)
+            .max(concurrency as u64);
 
-        while next_height <= to_height || !tasks.is_empty() {
-            while next_height <= to_height && tasks.len() < concurrency {
+        let mut tasks: JoinSet<(u64, Result<SdkBlockResult, IngestionError>)> = JoinSet::new();
+        let mut ready: BTreeMap<u64, SdkBlockResult> = BTreeMap::new();
+        let mut next_to_spawn = from;
+        let mut next_to_write = from;
+        let mut projected_blocks = 0u64;
+        let mut cursor_height_after = cursor_height;
+        // First fetch error stops new fetches; the already-committed contiguous
+        // prefix stays valid and the cursor reflects it.
+        let mut fetch_error: Option<IngestionError> = None;
+
+        loop {
+            // Top up the fetch pipeline: up to `concurrency` requests in flight,
+            // capped to `max_read_ahead` blocks ahead of the writer.
+            while fetch_error.is_none()
+                && next_to_spawn <= to
+                && tasks.len() < concurrency
+                && next_to_spawn.saturating_sub(next_to_write) < max_read_ahead
+            {
                 let driver = self.clone();
-                let height = BlockHeight::new(next_height);
+                let height = BlockHeight::new(next_to_spawn);
                 tasks.spawn(async move {
-                    driver
-                        .fetch_decoded_block_for_projection(height)
-                        .await
-                        .map(|block| (height, block))
+                    (
+                        height.value(),
+                        driver.fetch_decoded_block_for_projection(height).await,
+                    )
                 });
-                next_height += 1;
+                next_to_spawn += 1;
             }
 
-            if let Some(result) = tasks.join_next().await {
-                let (height, block) = result??;
-                fetched_blocks.insert(height, block);
+            // Harvest every fetch that has already finished, without blocking, so
+            // the writer can drain them in one tight batch and the freed slots
+            // refill above. When the writer is the bottleneck (e.g. a low-latency
+            // local node) `ready` fills toward `max_read_ahead`, so writes stay
+            // batched instead of paying an await per block; when fetch is the
+            // bottleneck `ready` stays near-empty and fetch overlaps the writes.
+            while let Some(joined) = tasks.try_join_next() {
+                Self::record_fetched(&mut ready, &mut fetch_error, joined?);
+            }
+
+            // Write every block that is now contiguous from the cursor, in order.
+            // Fetch tasks keep running in the background while these writes await
+            // the DB, which is what overlaps fetch with write.
+            while let Some(block) = ready.remove(&next_to_write) {
+                let height = BlockHeight::new(next_to_write);
+                let mut transaction = self.pool.begin().await?;
+                let block_record = self
+                    .project_decoded_block(&mut transaction, height, &block)
+                    .await?;
+                cursor_height_after =
+                    explorer_db::advance_cursor(&mut transaction, block_record.chain_id, height)
+                        .await?;
+                transaction.commit().await?;
+                projected_blocks += 1;
+                next_to_write += 1;
+
+                if next_to_write <= to && !self.settings.inter_block_delay.is_zero() {
+                    sleep(self.settings.inter_block_delay).await;
+                }
+            }
+
+            if tasks.is_empty() && (fetch_error.is_some() || next_to_spawn > to) {
+                break;
+            }
+
+            // The next contiguous block is not fetched yet — block until one more
+            // in-flight fetch finishes, then loop back to spawn/harvest/write.
+            if let Some(joined) = tasks.join_next().await {
+                Self::record_fetched(&mut ready, &mut fetch_error, joined?);
             }
         }
 
-        let mut projected_blocks = 0;
-        let mut cursor_height_after =
-            BlockHeight::new(window.from_height.value().saturating_sub(1));
-        for (height, block) in fetched_blocks {
-            // Normal mode still fetches blocks concurrently, but projection and
-            // cursor advancement stay ordered. That preserves crash recovery and
-            // prevents readers from seeing committed blocks ahead of the cursor.
-            let mut transaction = self.pool.begin().await?;
-            let block_record = self
-                .project_decoded_block(&mut transaction, height, &block)
-                .await?;
-            cursor_height_after =
-                explorer_db::advance_cursor(&mut transaction, block_record.chain_id, height)
-                    .await?;
-            transaction.commit().await?;
-
-            projected_blocks += 1;
+        if let Some(error) = fetch_error {
+            // No progress at all (the next height itself failed) → surface the
+            // error so the worker loop backs off. Otherwise keep the committed
+            // prefix and let the next pass retry the failed height.
+            if projected_blocks == 0 {
+                return Err(error);
+            }
+            warn!(
+                height = next_to_write,
+                %error,
+                "block fetch stalled mid-window; kept the committed prefix, retrying the failed height next pass"
+            );
         }
 
         Ok((projected_blocks, cursor_height_after))
+    }
+
+    /// Record a completed block fetch from the pipeline: buffer a fetched block
+    /// for the writer, or remember the first fetch error so the writer stops at
+    /// the first missing (failed) height with a gap-free committed prefix below.
+    fn record_fetched(
+        ready: &mut BTreeMap<u64, SdkBlockResult>,
+        fetch_error: &mut Option<IngestionError>,
+        joined: (u64, Result<SdkBlockResult, IngestionError>),
+    ) {
+        let (height, result) = joined;
+        match result {
+            Ok(block) => {
+                ready.insert(height, block);
+            }
+            Err(error) if fetch_error.is_none() => *fetch_error = Some(error),
+            Err(_) => {}
+        }
     }
 
     pub async fn mark_all_balances_dirty_once(

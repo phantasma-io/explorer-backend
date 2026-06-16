@@ -25,15 +25,25 @@ nexus = "mainnet"
 chain = "main"
 
 [worker]
-# sync_mode: "sequential" (deterministic, one block at a time), "normal"
-# (concurrent fetch + parallel project, cursor still advances in height order),
-# or "relief" (one-block fetch/project windows for difficult ranges).
+# sync_mode: "normal" runs the fetch/process pipeline (RPC fetch overlaps DB
+# writes; the cursor still advances in strict height order) — the production
+# default. "sequential" projects one block at a time for deterministic
+# parity/debug runs. "relief" forces one-block fetch/project passes for
+# difficult, RPC-heavy ranges.
 sync_mode = "normal"
-fetch_batch_size = 100
-fetch_concurrency = 4
-project_concurrency = 4
+# Max blocks projected per sync pass. Larger amortizes the pipeline's per-pass
+# fill/drain over the catch-up; near the tip the pass is naturally small.
+fetch_batch_size = 1000
+# Concurrent in-flight block fetches (the C# backend uses 6). Raise to hide
+# remote-RPC latency, but stay within what the node tolerates.
+fetch_concurrency = 6
 poll_seconds = 1
+# Max blocks fetched ahead of the writer (backpressure + jitter buffer); bounds
+# how many decoded blocks sit in memory. The C# backend uses a 500-deep channel.
 queue_capacity = 500
+# Deprecated/no-op: projection is single-writer (strict ordering), so it is never
+# parallel; in-flight fetch concurrency is `fetch_concurrency`. Kept for compat.
+project_concurrency = 6
 # Optional throttling for heavy chain sections (milliseconds).
 inter_block_delay_ms = 0
 batch_delay_ms = 0

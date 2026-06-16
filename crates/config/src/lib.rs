@@ -188,6 +188,9 @@ struct WorkerFileConfig {
     queue_capacity: Option<usize>,
     fetch_batch_size: Option<u64>,
     fetch_concurrency: Option<usize>,
+    // Deprecated: block projection is single-writer (ordering), so projection is
+    // never parallel; in-flight fetch concurrency is `fetch_concurrency`. Still
+    // accepted so existing configs keep parsing, but it no longer has an effect.
     project_concurrency: Option<usize>,
     sync_mode: Option<String>,
     inter_block_delay_ms: Option<u64>,
@@ -330,6 +333,8 @@ pub struct WorkerConfig {
     pub queue_capacity: usize,
     pub fetch_batch_size: u64,
     pub fetch_concurrency: usize,
+    /// Deprecated and unused: projection is single-writer for strict block
+    /// ordering, so it is never parallel. Kept only so existing configs parse.
     pub project_concurrency: usize,
     pub sync_mode: WorkerSyncMode,
     pub inter_block_delay: Duration,
@@ -360,13 +365,13 @@ impl WorkerConfig {
                 "EXPLORER_WORKER_FETCH_BATCH_SIZE",
                 "worker.fetch_batch_size",
                 file.and_then(|file| file.fetch_batch_size),
-                50,
+                1000,
             )?,
             fetch_concurrency: env_or_file_or_default(
                 "EXPLORER_WORKER_FETCH_CONCURRENCY",
                 "worker.fetch_concurrency",
                 file.and_then(|file| file.fetch_concurrency),
-                4,
+                6,
             )?,
             project_concurrency: env_or_file_or_default(
                 "EXPLORER_WORKER_PROJECT_CONCURRENCY",
@@ -658,7 +663,10 @@ fn worker_sync_mode_from_env_or_file(
     }
 
     let Some(value) = file_value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(WorkerSyncMode::Sequential);
+        // Default to the overlapped fetch/process pipeline so an unconfigured
+        // worker catches up at full speed (the C# backend has no slow default).
+        // `sequential` stays available for deterministic parity/debug runs.
+        return Ok(WorkerSyncMode::Normal);
     };
 
     value

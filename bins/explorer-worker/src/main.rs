@@ -211,14 +211,14 @@ fn log_worker_config(config: &AppConfig) {
         .unwrap_or_else(|| "none".to_owned());
 
     info!(
-        "worker config chain={}/{} rpc={} mode={} fetch_batch={} fetch_concurrency={} project_concurrency={} poll={}s height_limit={}",
+        "worker config chain={}/{} rpc={} mode={} fetch_batch={} fetch_concurrency={} queue_capacity={} poll={}s height_limit={}",
         config.chain.nexus,
         config.chain.chain,
         endpoints,
         config.worker.sync_mode,
         config.worker.fetch_batch_size,
         config.worker.fetch_concurrency,
-        config.worker.project_concurrency,
+        config.worker.queue_capacity,
         config.worker.poll_interval.as_secs(),
         height_limit
     );
