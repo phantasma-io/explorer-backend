@@ -1720,6 +1720,17 @@ impl BlockIngestionDriver {
     }
 
     pub async fn run_until_shutdown(&self) -> Result<(), IngestionError> {
+        // A deploy that restores an already-migrated database and skips
+        // `explorer-migrate` carries no planner stats (pg_restore drops them), so
+        // the first catch-up sync would crawl until autovacuum analyzes. Refresh
+        // stats once at startup to close that window — the migrate path does the
+        // same after applying migrations. Non-fatal: a failed ANALYZE must not
+        // stop the worker from syncing.
+        match explorer_db::analyze_database(&self.pool).await {
+            Ok(()) => info!("database analyzed at startup"),
+            Err(error) => warn!(%error, "startup database analyze failed; continuing"),
+        }
+
         let mut ticker = interval(self.settings.poll_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut next_token_supply_sync = std::time::Instant::now();
