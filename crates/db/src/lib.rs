@@ -427,12 +427,23 @@ pub struct NftOffchainUpsert {
 }
 
 pub async fn connect(config: &DatabaseConfig) -> Result<PgPool, DbError> {
-    PgPoolOptions::new()
+    let mut options = PgPoolOptions::new()
         .max_connections(config.max_connections)
-        .acquire_timeout(config.acquire_timeout)
-        .connect(&config.url)
-        .await
-        .map_err(DbError::Sqlx)
+        .acquire_timeout(config.acquire_timeout);
+    if let Some(statement_timeout) = config.statement_timeout {
+        // Apply the per-connection statement_timeout so an abandoned slow request
+        // cannot keep burning a pooled connection after the client has given up.
+        let millis = u64::try_from(statement_timeout.as_millis()).unwrap_or(u64::MAX);
+        options = options.after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(&format!("SET statement_timeout = {millis}"))
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        });
+    }
+    options.connect(&config.url).await.map_err(DbError::Sqlx)
 }
 
 pub async fn check_health(pool: &PgPool) -> Result<DatabaseHealth, DbError> {

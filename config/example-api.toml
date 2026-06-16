@@ -8,10 +8,16 @@
 [database]
 # EXPLORER_DATABASE_URL
 url = "postgres://postgres@localhost/explorer"
-# EXPLORER_DATABASE_MAX_CONNECTIONS
-max_connections = 16
+# EXPLORER_DATABASE_MAX_CONNECTIONS. The API serves many concurrent read requests
+# (the C# backend uses a 100-connection pool); size this well above the worker's,
+# but keep worker_pool + api_pool under the Postgres server max_connections.
+max_connections = 64
 # EXPLORER_DATABASE_ACQUIRE_TIMEOUT_SECONDS
 acquire_timeout_seconds = 10
+# EXPLORER_DATABASE_STATEMENT_TIMEOUT_SECONDS. Set on the API so an abandoned slow
+# request frees its pooled connection instead of running on in Postgres. Do NOT set
+# this on the worker — its ingestion/stake/balance queries are legitimately long.
+statement_timeout_seconds = 30
 
 [http]
 # EXPLORER_BIND_ADDR. Use localhost for local development. Inside a container,

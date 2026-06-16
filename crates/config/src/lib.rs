@@ -158,6 +158,7 @@ struct DatabaseFileConfig {
     url: Option<String>,
     max_connections: Option<u32>,
     acquire_timeout_seconds: Option<u64>,
+    statement_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -227,6 +228,11 @@ pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
     pub acquire_timeout: Duration,
+    /// Per-connection `statement_timeout`. Set for the API so an abandoned slow
+    /// request (the transport timeout drops the client but Postgres keeps running
+    /// the query) frees its scarce pooled connection. Left unset for the worker,
+    /// whose ingestion/stake/balance queries are legitimately long.
+    pub statement_timeout: Option<Duration>,
 }
 
 impl DatabaseConfig {
@@ -253,6 +259,12 @@ impl DatabaseConfig {
                 file.and_then(|file| file.acquire_timeout_seconds),
                 10,
             )?),
+            statement_timeout: optional_env_or_file(
+                "EXPLORER_DATABASE_STATEMENT_TIMEOUT_SECONDS",
+                "database.statement_timeout_seconds",
+                file.and_then(|file| file.statement_timeout_seconds),
+            )?
+            .map(Duration::from_secs),
         })
     }
 }
