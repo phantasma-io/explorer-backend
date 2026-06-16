@@ -2052,6 +2052,7 @@ pub async fn batch_upsert_transactions(
             state_id, gas_price, gas_limit, sender_id, gas_payer_id, gas_target_id, fee_raw,
             gas_limit_raw, gas_price_raw, carbon_tx_data, carbon_tx_type, debug_comment
         )
+        ORDER BY t.tx_index
         RETURNING id, tx_index
         "#,
     )

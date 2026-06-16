@@ -304,6 +304,7 @@ pub(crate) async fn insert_block_events(
             chain_id, contract_id, transaction_id, event_kind_id, target_address_id,
             payload_format, payload_json, raw_data
         )
+        ORDER BY t.transaction_id, t.event_index
         "#,
     )
     .bind(&timestamp)
