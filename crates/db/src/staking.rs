@@ -370,31 +370,26 @@ pub struct StakeForwardBuildReport {
     pub skipped_reason: Option<String>,
 }
 
-/// Count the already-projected daily snapshots inside the seed→live-window gap, used
-/// to skip the full-history rebuild scan when the gap is already filled.
-async fn count_projected_gap_dailies(
+/// The latest day the forward projector has already written. Used to make the
+/// projection idempotent: skip the rebuild scan while the curve is already built
+/// through the cursor day (the historical events below it are immutable).
+async fn load_max_projected_daily_day(
     conn: &mut PgConnection,
     chain_id: i32,
-    from_day: i64,
-    first_trusted_day: i64,
-) -> Result<i64, DbError> {
-    let count = sqlx::query_scalar::<_, i64>(
+) -> Result<Option<i64>, DbError> {
+    let day = sqlx::query_scalar::<_, Option<i64>>(
         r#"
-        SELECT count(*)
+        SELECT max(date_unix_seconds)
         FROM staking_progress_dailies
         WHERE chain_id = $1
           AND source = $2
-          AND date_unix_seconds >= $3
-          AND date_unix_seconds < $4
         "#,
     )
     .bind(chain_id)
     .bind(STAKE_SNAPSHOT_PROJECTOR_SOURCE)
-    .bind(from_day)
-    .bind(first_trusted_day)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(count)
+    Ok(day)
 }
 
 pub async fn project_stake_snapshots_forward(
@@ -408,11 +403,14 @@ pub async fn project_stake_snapshots_forward(
 }
 
 /// Builds the Soul-Masters daily+monthly series forward from the stored stake seed
-/// (`stake_boundary_*`) across the stake events up to the projected tip: the per-address seed state
-/// is read from `stake_boundary_*`, then `build_stake_snapshot_daily_points` advances it day by
-/// day. Idempotent (safe every tick) and validated against the independent `balance-sync.v1` tip
-/// dailies. The seed day and its month are never overwritten (the monthly rollup starts at the
-/// month after the seed day).
+/// (`stake_boundary_*`) across the on-chain stake events up to the projected tip and
+/// writes it — the forward build is the SOLE source of the post-boundary curve (no
+/// second writer, no cross-validation). The per-address seed state is read from
+/// `stake_boundary_*`, then `build_stake_snapshot_daily_points` advances it day by day
+/// to the cursor block's day. Idempotent: the events below the cursor are immutable,
+/// so once the curve is built through the cursor day there is nothing to redo until a
+/// new block advances the day. The seed day and its month are never overwritten (the
+/// monthly rollup starts at the month after the seed day).
 async fn project_stake_snapshots_forward_in_tx(
     conn: &mut PgConnection,
     chain_id: i32,
@@ -444,12 +442,11 @@ async fn project_stake_snapshots_forward_in_tx(
             "chain has no projected block timestamp",
         ));
     };
-    // Build through (and including) the cursor's own day. That tip day is the only day the live
-    // `balance-sync.v1` writer is guaranteed to have on a first sync, so it is the overlap the
-    // validation gate needs; the write filter below still leaves that trusted tip day to
-    // balance-sync.v1 and only persists the days before it.
+    // Anchor the curve to blockchain time: build through (and including) the cursor
+    // block's own day, the clock the on-chain stake events live on.
     let target_exclusive_day =
         stake_snapshot_day_start(cursor_timestamp) + STAKE_SNAPSHOT_SECONDS_PER_DAY;
+    let cursor_day = target_exclusive_day - STAKE_SNAPSHOT_SECONDS_PER_DAY;
     let from_day = boundary_day + STAKE_SNAPSHOT_SECONDS_PER_DAY;
     if from_day >= target_exclusive_day {
         return Ok(skip(
@@ -458,98 +455,31 @@ async fn project_stake_snapshots_forward_in_tx(
             "boundary is already at the tip; nothing to build",
         ));
     }
-
-    // Load the independent live `balance-sync.v1` dailies first so the steady-state
-    // case can skip the expensive full-history event scan (the analogue of C#'s
-    // DetectSnapshotRebuildRangeAsync returning null when there is no missing tail).
-    let trusted = load_trusted_stake_snapshot_dailies(conn, chain_id).await?;
-    let Some(first_trusted_day) = trusted.keys().copied().min() else {
+    // Idempotence: if the curve is already built through the cursor day, the events
+    // below it cannot have changed, so skip the full-history scan until a new block
+    // advances the day.
+    if let Some(last_built_day) = load_max_projected_daily_day(conn, chain_id).await?
+        && last_built_day >= cursor_day
+    {
         return Ok(skip(
             boundary_day,
             boundary_masters,
-            "no balance-sync.v1 dailies to validate against; refusing to write blind",
-        ));
-    };
-    if from_day >= first_trusted_day {
-        return Ok(skip(
-            boundary_day,
-            boundary_masters,
-            "balance-sync.v1 already covers the post-seed days; nothing to build",
-        ));
-    }
-    // Cheap precondition: the gap to fill is [from_day, first_trusted_day), which is
-    // historical and immutable once the chain has moved past it. If every gap day is
-    // already projected, there is nothing to rebuild — skip the full-history scan
-    // instead of rescanning ~all stake events on every pass.
-    let expected_gap_days = (first_trusted_day - from_day) / STAKE_SNAPSHOT_SECONDS_PER_DAY;
-    let projected_gap_days =
-        count_projected_gap_dailies(conn, chain_id, from_day, first_trusted_day).await?;
-    if projected_gap_days >= expected_gap_days {
-        return Ok(skip(
-            boundary_day,
-            boundary_masters,
-            "stake snapshot gap already projected; nothing to rebuild",
+            "curve already built through the tip; nothing to rebuild",
         ));
     }
 
-    // Gap needs (re)building: scan the stake events from the day after the seed to
-    // the cursor and build the forward curve.
+    // Replay the stake events from the day after the seed to the cursor and write the
+    // whole forward curve. The build from the frozen seed + the complete on-chain stake
+    // events IS the source of truth.
     let events = load_stake_snapshot_events(conn, chain_id, from_day, cursor_timestamp).await?;
     let curve =
         build_stake_snapshot_daily_points(boundary_state, &events, from_day, target_exclusive_day)?;
-
-    // Validate the forward curve against the overlapping live `balance-sync.v1`
-    // dailies; refuse to write if any overlapping day disagrees or none overlap. The
-    // series shares no derivation with balance-sync.v1, so agreement on the
-    // overlapping tip day(s) is a genuine end-to-end check, not a tautology. Only the
-    // overlap is checked per day; earlier gap days are validated by endpoint
-    // convergence, not per day (see the original note in the project history).
-    let mut validated_days = 0_usize;
-    for point in &curve {
-        let Some(expected) = trusted.get(&point.date_unix_seconds) else {
-            continue;
-        };
-        if point.masters_count != expected.masters_count
-            || point.stakers_count != expected.stakers_count
-            || point.staked_soul_raw != expected.staked_soul_raw
-        {
-            return Ok(skip(
-                boundary_day,
-                boundary_masters,
-                &format!(
-                    "forward curve disagrees with balance-sync.v1 at day {}: masters {}/{}, stakers {}/{}; refusing to write",
-                    point.date_unix_seconds,
-                    point.masters_count,
-                    expected.masters_count,
-                    point.stakers_count,
-                    expected.stakers_count,
-                ),
-            ));
-        }
-        validated_days += 1;
-    }
-    if validated_days == 0 {
-        return Ok(skip(
-            boundary_day,
-            boundary_masters,
-            "no balance-sync.v1 dailies overlap the built range; refusing to write blind",
-        ));
-    }
-
-    // Write only the gap dailies (below the live balance-sync.v1 window) and the
-    // monthly rollup starting the month after the seed day; never touch the seed
-    // day/month.
-    let daily_to_write = curve
-        .into_iter()
-        .filter(|point| point.date_unix_seconds < first_trusted_day)
-        .collect::<Vec<_>>();
-    let daily_upserted =
-        upsert_stake_snapshot_daily_points(conn, chain_id, &daily_to_write).await?;
+    let daily_upserted = upsert_stake_snapshot_daily_points(conn, chain_id, &curve).await?;
     let monthly_upserted = upsert_stake_snapshot_monthlies_from_daily(
         conn,
         chain_id,
         stake_snapshot_next_month_start(boundary_day),
-        first_trusted_day,
+        target_exclusive_day,
     )
     .await?;
 
@@ -562,49 +492,6 @@ async fn project_stake_snapshots_forward_in_tx(
         monthly_upserted,
         skipped_reason: None,
     })
-}
-
-/// A trustworthy daily snapshot used to validate the projected series. These come from the live
-/// `balance-sync.v1` writer (real-time DAO membership + on-chain stake), which is independent of
-/// the projector, so an exact match proves the projected series is correct.
-struct TrustedStakeSnapshotDaily {
-    masters_count: i32,
-    stakers_count: i32,
-    staked_soul_raw: String,
-}
-
-async fn load_trusted_stake_snapshot_dailies(
-    conn: &mut PgConnection,
-    chain_id: i32,
-) -> Result<HashMap<i64, TrustedStakeSnapshotDaily>, DbError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT date_unix_seconds, staked_soul_raw, stakers_count, masters_count
-        FROM staking_progress_dailies
-        WHERE chain_id = $1
-          AND source = 'balance-sync.v1'
-        "#,
-    )
-    .bind(chain_id)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    let mut map = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let date_unix_seconds: i64 = row.get("date_unix_seconds");
-        let staked_soul_raw: String = row
-            .get::<Option<String>, _>("staked_soul_raw")
-            .unwrap_or_default();
-        map.insert(
-            date_unix_seconds,
-            TrustedStakeSnapshotDaily {
-                masters_count: row.get("masters_count"),
-                stakers_count: row.get("stakers_count"),
-                staked_soul_raw,
-            },
-        );
-    }
-    Ok(map)
 }
 
 async fn load_stake_snapshot_cursor_timestamp(
@@ -1185,19 +1072,24 @@ async fn upsert_stake_snapshot_monthlies_from_daily(
                 INTERVAL '1 month'
             ) AS month_start
         ),
-        closed_months AS (
+        -- Roll up every month up to and including the cursor's own (possibly partial)
+        -- month. The current month takes the latest available daily as its value so the
+        -- monthly series tracks the tip instead of lagging a whole month behind (the
+        -- live `balance-sync.v1` writer used to fill the current month; the projector
+        -- owns it now).
+        in_range_months AS (
             SELECT *
             FROM months
-            WHERE month_end_day_unix_seconds < $3
+            WHERE month_unix_seconds < $3
         ),
         snapshot_rows AS (
             SELECT
                 month.month_unix_seconds,
                 daily.masters_count,
-                (month.month_end_day_unix_seconds + 86399)::bigint AS captured_at_unix_seconds
-            FROM closed_months month
+                (daily.date_unix_seconds + 86399)::bigint AS captured_at_unix_seconds
+            FROM in_range_months month
             JOIN LATERAL (
-                SELECT masters_count
+                SELECT masters_count, date_unix_seconds
                 FROM staking_progress_dailies daily
                 WHERE daily.chain_id = $1
                   AND daily.date_unix_seconds <= month.month_end_day_unix_seconds
