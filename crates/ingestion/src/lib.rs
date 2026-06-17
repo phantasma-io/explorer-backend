@@ -33,6 +33,7 @@ const SPECIAL_RESOLUTION_REFETCH_ATTEMPTS: usize = 25;
 const SPECIAL_RESOLUTION_REFETCH_DELAY_MS: u64 = 50;
 const BALANCE_SYNC_LAG_THRESHOLD: u64 = 50;
 const BALANCE_SYNC_CHUNK_SIZE: usize = 100;
+const STAKE_PROJECTION_INTERVAL_SECONDS: u64 = 30;
 const TOKEN_SUPPLY_SYNC_INTERVAL_SECONDS: u64 = 60;
 const CONTRACT_RPC_METADATA_SYNC_INTERVAL_SECONDS: u64 = 300;
 const CONTRACT_RPC_METADATA_STALE_SECONDS: i64 = 30 * 60;
@@ -109,7 +110,6 @@ pub struct BalanceSyncReport {
     pub updated_accounts: usize,
     pub reset_dirty_flags: u64,
     pub skipped_catchup: bool,
-    pub stake_snapshot_projection: Option<explorer_db::StakeForwardBuildReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -315,10 +315,6 @@ pub enum IngestionError {
 mod driver;
 mod prices;
 mod ttrs;
-
-fn stake_snapshot_projection_is_interesting(report: &explorer_db::StakeForwardBuildReport) -> bool {
-    report.daily_upserted > 0 || report.monthly_upserted > 0 || report.skipped_reason.is_some()
-}
 
 fn block_result_to_projection(
     chain: &ChainName,

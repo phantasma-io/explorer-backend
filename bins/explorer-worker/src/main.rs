@@ -251,14 +251,8 @@ fn log_sync_batch(report: &SyncBatchReport) {
 }
 
 fn log_balance_sync_batch(report: &BalanceSyncReport) {
-    let projection = report.stake_snapshot_projection.as_ref();
-    let projected_daily = projection.map_or(0, |report| report.daily_upserted);
-    let projected_monthly = projection.map_or(0, |report| report.monthly_upserted);
-    let skipped_reason = projection
-        .and_then(|report| report.skipped_reason.as_deref())
-        .unwrap_or("none");
     info!(
-        "synced balances accounts={} selected={} reset_dirty={} dirty_before={} cursor={} tip={} lag={} skipped_catchup={} stake_daily={} stake_monthly={} stake_skip={}",
+        "synced balances accounts={} selected={} reset_dirty={} dirty_before={} cursor={} tip={} lag={} skipped_catchup={}",
         report.updated_accounts,
         report.selected_addresses,
         report.reset_dirty_flags,
@@ -267,9 +261,6 @@ fn log_balance_sync_batch(report: &BalanceSyncReport) {
         report.rpc_tip_height,
         report.lag,
         report.skipped_catchup,
-        projected_daily,
-        projected_monthly,
-        skipped_reason
     );
 }
 

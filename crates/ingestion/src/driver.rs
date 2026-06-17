@@ -816,6 +816,15 @@ impl BlockIngestionDriver {
         Ok(explorer_db::project_stake_snapshots_forward(&self.pool, chain_id).await?)
     }
 
+    async fn project_stake_snapshots_once(
+        &self,
+    ) -> Result<explorer_db::StakeForwardBuildReport, IngestionError> {
+        let mut conn = self.pool.acquire().await?;
+        let chain_id = explorer_db::resolve_chain_id(&mut conn, &self.chain.chain).await?;
+        drop(conn);
+        self.project_stake_snapshots_for_chain(chain_id).await
+    }
+
     /// One-time bootstrap of the per-address staking snapshot seed (see
     /// `explorer_db::capture_stake_boundary_slice`). Run once on a fully populated database.
     pub async fn capture_stake_boundary_slice_once(
@@ -850,7 +859,6 @@ impl BlockIngestionDriver {
                 updated_accounts: 0,
                 reset_dirty_flags: 0,
                 skipped_catchup: dirty_before > 0,
-                stake_snapshot_projection: None,
             });
         }
         if dirty_before == 0 {
@@ -865,7 +873,6 @@ impl BlockIngestionDriver {
                 updated_accounts: 0,
                 reset_dirty_flags: 0,
                 skipped_catchup: false,
-                stake_snapshot_projection: None,
             });
         }
 
@@ -887,20 +894,13 @@ impl BlockIngestionDriver {
             .iter()
             .map(|address| address.id)
             .collect::<Vec<_>>();
+        // Refresh live DAO membership only. The Soul-Masters curve is owned solely by
+        // the forward projector (project_stake_snapshots_for_chain below); balance sync
+        // no longer writes a `balance-sync.v1` snapshot.
         explorer_db::reconcile_stake_memberships(&mut transaction, &updated_address_ids).await?;
-        if !updated_address_ids.is_empty() {
-            explorer_db::upsert_current_stake_snapshots(
-                &mut transaction,
-                chain_id,
-                chrono::Utc::now().timestamp(),
-            )
-            .await?;
-        }
         let reset_dirty_flags =
             explorer_db::reset_dirty_balance_flags(&mut transaction, &updated_accounts).await?;
         transaction.commit().await?;
-        let stake_snapshot_projection =
-            Some(self.project_stake_snapshots_for_chain(chain_id).await?);
 
         Ok(BalanceSyncReport {
             configured_nexus: self.chain.nexus.to_string(),
@@ -913,7 +913,6 @@ impl BlockIngestionDriver {
             updated_accounts: updated_accounts.len(),
             reset_dirty_flags,
             skipped_catchup: false,
-            stake_snapshot_projection,
         })
     }
 
@@ -1887,6 +1886,13 @@ impl BlockIngestionDriver {
             let driver = self.clone();
             let lag = lag.clone();
             let shutdown = shutdown.clone();
+            tasks
+                .spawn(async move { driver.run_stake_projection_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
             tasks.spawn(async move { driver.run_token_supply_maintenance(lag, shutdown).await });
         }
         {
@@ -1953,32 +1959,47 @@ impl BlockIngestionDriver {
                 continue;
             }
             match self.sync_dirty_balances_once().await {
-                Ok(balance_report)
-                    if balance_report.updated_accounts > 0
-                        || balance_report
-                            .stake_snapshot_projection
-                            .as_ref()
-                            .is_some_and(stake_snapshot_projection_is_interesting) =>
-                {
-                    let projection = balance_report.stake_snapshot_projection.as_ref();
-                    let projected_daily = projection.map_or(0, |report| report.daily_upserted);
-                    let projected_monthly = projection.map_or(0, |report| report.monthly_upserted);
-                    let skipped_reason = projection
-                        .and_then(|report| report.skipped_reason.as_deref())
-                        .unwrap_or("none");
-                    info!(
-                        "synced balances accounts={} reset_dirty={} dirty_before={} lag={} stake_daily={} stake_monthly={} stake_skip={}",
-                        balance_report.updated_accounts,
-                        balance_report.reset_dirty_flags,
-                        balance_report.dirty_before,
-                        balance_report.lag,
-                        projected_daily,
-                        projected_monthly,
-                        skipped_reason
-                    );
-                }
+                Ok(balance_report) if balance_report.updated_accounts > 0 => info!(
+                    "synced balances accounts={} reset_dirty={} dirty_before={} lag={}",
+                    balance_report.updated_accounts,
+                    balance_report.reset_dirty_flags,
+                    balance_report.dirty_before,
+                    balance_report.lag,
+                ),
                 Ok(_) => {}
                 Err(error) => warn!(%error, "balance sync batch failed"),
+            }
+        }
+    }
+
+    /// Build the Soul-Masters curve forward on its own cadence, fully decoupled from
+    /// balance sync. Idempotent: most ticks no-op cheaply via the projector's
+    /// max-projected-day gate; a tick rebuilds the curve only when a new block has
+    /// advanced the cursor's day. Near-tip gated like the other maintenance families.
+    async fn run_stake_projection_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            STAKE_PROJECTION_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            match self.project_stake_snapshots_once().await {
+                Ok(report) if report.daily_upserted > 0 || report.monthly_upserted > 0 => info!(
+                    "built soul-masters curve daily={} monthly={} boundary_masters={}",
+                    report.daily_upserted, report.monthly_upserted, report.boundary_masters_count
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "stake projection failed"),
             }
         }
     }
