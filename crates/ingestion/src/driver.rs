@@ -1772,6 +1772,9 @@ impl BlockIngestionDriver {
         // (so the pause/resume is logged instead of being silently invisible).
         let mut consecutive_sync_failures: u32 = 0;
         let mut maintenance_paused = false;
+        // Suppress the per-poll "synced range=none blocks=0" spam once at the tip:
+        // announce reaching the tip once, then stay quiet until new blocks arrive.
+        let mut caught_up_logged = false;
 
         loop {
             tokio::select! {
@@ -1792,18 +1795,29 @@ impl BlockIngestionDriver {
 
             match sync_result {
                 Ok(report) => {
-                    let range = match (report.from_height, report.to_height) {
-                        (Some(from), Some(to)) => format!("{from}..{to}"),
-                        _ => "none".to_owned(),
-                    };
-                    info!(
-                        "synced range={} blocks={} cursor={}..{} tip={}",
-                        range,
-                        report.projected_blocks,
-                        report.cursor_height_before,
-                        report.cursor_height_after,
-                        report.rpc_tip_height
-                    );
+                    // Log only when something happened: a batch that wrote blocks, or a
+                    // pass that is still behind the tip. Once caught up, say so once and
+                    // then stay silent instead of logging every idle poll.
+                    if report.projected_blocks > 0
+                        || report.cursor_height_after < report.rpc_tip_height
+                    {
+                        let range = match (report.from_height, report.to_height) {
+                            (Some(from), Some(to)) => format!("{from}..{to}"),
+                            _ => "none".to_owned(),
+                        };
+                        info!(
+                            "synced range={} blocks={} cursor={}..{} tip={}",
+                            range,
+                            report.projected_blocks,
+                            report.cursor_height_before,
+                            report.cursor_height_after,
+                            report.rpc_tip_height
+                        );
+                        caught_up_logged = false;
+                    } else if !caught_up_logged {
+                        info!("caught up to tip {}", report.rpc_tip_height);
+                        caught_up_logged = true;
+                    }
 
                     consecutive_sync_failures = 0;
                     let current_lag = report
