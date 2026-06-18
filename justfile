@@ -45,6 +45,11 @@ api-local:
     ./target/release/explorer-api --config config/local-api.toml
 
 [group('run')]
+api-local-build:
+    cargo build --release -p explorer-api
+    just api-local
+
+[group('run')]
 worker:
     cargo run --bin explorer-worker -- --sync-once
 
