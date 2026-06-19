@@ -93,13 +93,13 @@ Both write compact logs to the console and append them to a file under `logs/`
 
 ### Worker sync modes
 
-The worker defaults to `EXPLORER_WORKER_SYNC_MODE=sequential`, projecting one block
-at a time in deterministic insert order. `normal` fetches blocks concurrently and
-projects them in parallel for higher throughput while still advancing the cursor
+The worker defaults to `EXPLORER_WORKER_SYNC_MODE=normal`, which fetches blocks
+concurrently and projects them for higher throughput while still advancing the cursor
 strictly in height order (so crash recovery and reader-visible cursor semantics stay
-deterministic). `relief` forces one-block fetch/project windows for difficult ranges.
-`EXPLORER_WORKER_INTER_BLOCK_DELAY_MS` and `EXPLORER_WORKER_BATCH_DELAY_MS` add
-explicit throttling for heavy chain sections.
+deterministic). `sequential` projects one block at a time in deterministic insert
+order, for parity/debug runs. `relief` forces one-block fetch/project windows for
+difficult ranges. `EXPLORER_WORKER_INTER_BLOCK_DELAY_MS` and
+`EXPLORER_WORKER_BATCH_DELAY_MS` add explicit throttling for heavy chain sections.
 
 ### Near-tip maintenance
 
@@ -124,21 +124,37 @@ It digests `blocks`, `transactions`, `events`, and `address_transactions` for th
 height range. Use `just parity-block-range-strict-ids ...` to additionally verify
 insertion-order ID parity.
 
-## Docker
+## Deployment (Docker)
 
 `docker/compose/docker-compose.yml` builds and runs the `api` and `worker` services
-against an existing Postgres on the external Docker network `postgresql-network`
-(this backend runs against an existing database; it does not bootstrap one):
+against an existing Postgres on the external Docker network `postgresql-network`. The
+backend connects to an existing database and indexes forward from the state already in
+it; it does not bootstrap a database or reconstruct history from genesis.
 
-```bash
-cp .env.example .env   # then edit: database URL, RPC endpoint, ports
-docker compose -f docker/compose/docker-compose.yml up --build
-```
+1. Ensure Postgres is running and reachable on the `postgresql-network` Docker network
+   (create it if needed: `docker network create postgresql-network`).
+2. Create the target database and load the prepared database dump provided for the
+   deployment into it; the worker indexes forward from that baseline.
+3. Configure the stack: `cp .env.example .env`, then set the database URL, RPC
+   endpoint(s), and published ports. The API must bind `0.0.0.0` inside the container
+   for the published port to be reachable (`.env.example` sets
+   `EXPLORER_BIND_ADDR=0.0.0.0:9000`; the code default `localhost` is container-local).
+4. Apply database migrations (idempotent):
 
-The API must bind to `0.0.0.0` inside the container for the published port to be
-reachable from the host; `.env.example` sets `EXPLORER_BIND_ADDR=0.0.0.0:9000` for
-this reason (the code default `localhost` is container-local only). Migrations are
-applied separately with the `docker/migrate/Dockerfile` image or `just rs-migrate`.
+   ```bash
+   docker build -f docker/migrate/Dockerfile -t explorer-backend-rust-migrate .
+   docker run --rm --network postgresql-network --env-file .env explorer-backend-rust-migrate
+   ```
+
+5. Start the API and worker:
+
+   ```bash
+   docker compose -f docker/compose/docker-compose.yml up -d --build
+   ```
+
+6. Verify: the API answers (`curl http://<host>:<API_PORT>/api/v1/chains`) and the
+   worker log reports `caught up to tip <height>` once it has indexed forward to the
+   chain tip.
 
 ## SDK Dependency
 
