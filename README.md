@@ -143,8 +143,16 @@ it; it does not bootstrap a database or reconstruct history from genesis.
 
 1. Ensure Postgres is running and reachable on the `postgresql-network` Docker network
    (create it if needed: `docker network create postgresql-network`).
-2. Create the target database and load the prepared database dump provided for the
-   deployment into it; the worker indexes forward from that baseline.
+2. Create the target database and restore the prepared gen2 zero-state dump into it
+   (the same dump for every network — use a separate DB per network, see "Networks"):
+
+   ```bash
+   createdb explorer_<network>
+   pg_restore -d explorer_<network> -j 4 <prepared-dump>.bak
+   ```
+
+   The worker indexes forward from that baseline; the first migration requires this
+   restored schema and fails on an empty database.
 3. Configure the stack: `cp .env.example .env`, then set the database URL, RPC
    endpoint(s), and published ports. The API must bind `0.0.0.0` inside the container
    for the published port to be reachable (`.env.example` sets
@@ -166,9 +174,32 @@ it; it does not bootstrap a database or reconstruct history from genesis.
    worker log reports `caught up to tip <height>` once it has indexed forward to the
    chain tip.
 
+### Networks (mainnet / devnet / testnet)
+
+All Phantasma networks share the same gen2 zero-state base (`main` block 6,422,526):
+they restore the **same** prepared dump and diverge only above the boundary. Deploy a
+non-mainnet instance into its **own separate database** (never the mainnet one) and set
+the network in `.env`:
+
+| Network | `EXPLORER_NEXUS` | `EXPLORER_RPC_ENDPOINTS` |
+| --- | --- | --- |
+| mainnet | `mainnet` | `https://pharpc1.phantasma.info/rpc` |
+| devnet  | `testnet` | `https://devnet.phantasma.info/rpc` |
+| testnet | `testnet` | `https://testnet.phantasma.info/rpc` |
+
+`EXPLORER_CHAIN=main` on every network. Notes:
+- The worker refuses to start if the configured RPC's block at the DB cursor does not
+  match the stored block — a guard against pairing a devnet DB with a mainnet RPC (or
+  vice-versa). Always pair the right DB with the right RPC.
+- RPC endpoint URLs must include the `/rpc` path.
+- Do not run the worker's `--stake-boundary-slice-capture-once` on devnet/testnet (it
+  is mainnet-specific; the Soul-Masters curve simply stays empty otherwise).
+- Rate limiting is on by default; per-IP limits apply only when `trusted_proxies` is
+  set (behind a reverse proxy). See `[rate_limiting]` in `config/example-api.toml`.
+
 ## SDK Dependency
 
-The workspace uses published `phantasma-sdk = "1.1.3"`.
+The workspace uses published `phantasma-sdk = "1.2.0"`.
 
 ## License
 
