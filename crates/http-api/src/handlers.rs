@@ -916,19 +916,38 @@ pub(crate) async fn overview_stats(
     let counts = match cached {
         Some(counts) => counts,
         None => {
-            let counts = overview_counts(
-                &state.pool,
-                chain.as_str(),
-                chain_id,
-                include_legacy_transactions,
-            )
-            .await?;
-            state
-                .overview_cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(cache_key, (Instant::now(), counts.clone()));
-            counts
+            // Single-flight: hold the flight lock so only one request runs the
+            // expensive full-table count on a cold/expired cache; concurrent callers
+            // wait here, then re-read the now-fresh cache instead of all recomputing.
+            let _flight = state.overview_flight.lock().await;
+            let fresh = {
+                let guard = state
+                    .overview_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard
+                    .get(&cache_key)
+                    .filter(|(stored_at, _)| stored_at.elapsed() < OVERVIEW_CACHE_TTL)
+                    .map(|(_, counts)| counts.clone())
+            };
+            match fresh {
+                Some(counts) => counts,
+                None => {
+                    let counts = overview_counts(
+                        &state.pool,
+                        chain.as_str(),
+                        chain_id,
+                        include_legacy_transactions,
+                    )
+                    .await?;
+                    state
+                        .overview_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(cache_key, (Instant::now(), counts.clone()));
+                    counts
+                }
+            }
         }
     };
     let nfts_total = if include_burned == 1 {

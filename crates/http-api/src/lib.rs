@@ -72,6 +72,9 @@ pub struct ApiState {
     pool: PgPool,
     chain: ChainName,
     overview_cache: Arc<Mutex<HashMap<OverviewCacheKey, (Instant, OverviewCounts)>>>,
+    /// Serializes the expensive overview recompute so a cold/expired cache triggers a
+    /// single full-table count, not one per concurrent caller (single-flight).
+    overview_flight: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ApiState {
@@ -82,6 +85,7 @@ impl ApiState {
             pool,
             chain,
             overview_cache: Arc::new(Mutex::new(HashMap::new())),
+            overview_flight: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
