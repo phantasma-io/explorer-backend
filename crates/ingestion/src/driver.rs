@@ -395,16 +395,18 @@ impl BlockIngestionDriver {
         })
     }
 
+    // Zero-state protection (network-agnostic by design). The gen2 base — `main`
+    // heights at or below the boundary — is the shared, immutable foundation for
+    // EVERY network: mainnet, devnet, and testnet all restore the same zero-state
+    // dump and only diverge ABOVE the boundary, each growing its own gen3 history.
+    // The guard is therefore anchored on the boundary HEIGHT, not on the nexus
+    // name: a `main` sync must never start below the boundary (that would
+    // re-derive/overwrite the protected gen2 range). The nexus is deliberately NOT
+    // gated here — devnet/testnet are legitimate forward-sync targets above the
+    // same boundary, so locking to nexus == "mainnet" would block valid deployments
+    // while adding no real protection (the boundary check below is the safeguard).
     fn validate_zero_state_scope(&self, cursor_height: BlockHeight) -> Result<(), IngestionError> {
         let cursor = cursor_height.value();
-        if self.chain.nexus.as_str() != "mainnet" {
-            return Err(IngestionError::ProtectedZeroStateNexusMismatch {
-                configured_nexus: self.chain.nexus.to_string(),
-                chain: self.chain.chain.to_string(),
-                cursor_height: cursor,
-            });
-        }
-
         if self.chain.chain.as_str() == "main" && cursor < MAIN_ZERO_STATE_BOUNDARY_HEIGHT {
             return Err(IngestionError::ProtectedZeroStateCursorBelowBoundary {
                 chain: self.chain.chain.to_string(),

@@ -285,14 +285,6 @@ pub enum IngestionError {
         event_kind: String,
     },
     #[error(
-        "refusing to sync chain {chain:?} from configured nexus {configured_nexus:?}; cursor is already at {cursor_height}"
-    )]
-    ProtectedZeroStateNexusMismatch {
-        configured_nexus: String,
-        chain: String,
-        cursor_height: u64,
-    },
-    #[error(
         "refusing to sync chain {chain:?}: cursor {cursor_height} is below the configured start height {boundary_height}"
     )]
     ProtectedZeroStateCursorBelowBoundary {
