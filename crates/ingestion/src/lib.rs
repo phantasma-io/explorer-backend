@@ -300,6 +300,16 @@ pub enum IngestionError {
         height: u64,
         boundary_height: u64,
     },
+    #[error(
+        "node block at height {height} (hash {node_hash}) does not match the stored block hash {db_hash} for chain {chain:?}/nexus {configured_nexus:?}; the configured RPC likely points at a different network — refusing to sync"
+    )]
+    NodeChainMismatch {
+        height: u64,
+        db_hash: String,
+        node_hash: String,
+        chain: String,
+        configured_nexus: String,
+    },
 }
 
 // The BlockIngestionDriver orchestrator's (large) inherent impl lives in its own

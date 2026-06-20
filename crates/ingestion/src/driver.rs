@@ -31,6 +31,8 @@ impl BlockIngestionDriver {
             .await?
             .unwrap_or_else(|| BlockHeight::new(0));
         self.validate_zero_state_scope(cursor_height)?;
+        self.guard_node_matches_db(&mut conn, chain_id, cursor_height)
+            .await?;
         let window = plan_fetch_window(cursor_height, rpc_tip, &self.settings)?;
 
         Ok(StartupProbe {
@@ -428,6 +430,43 @@ impl BlockIngestionDriver {
             });
         }
 
+        Ok(())
+    }
+
+    /// Startup sanity guard against a wrong-network RPC. Once gen3 blocks are synced
+    /// (cursor above the boundary), the node's block at the cursor height must
+    /// hash-match our stored block; a mismatch means the configured RPC points at a
+    /// different network than this DB holds, so we refuse rather than corrupt the DB
+    /// above the boundary (the boundary guard alone cannot catch this). A fresh DB
+    /// with nothing above the boundary cannot be checked here — deploy discipline
+    /// (pair the devnet DB with the devnet RPC) covers that case.
+    async fn guard_node_matches_db(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        chain_id: i32,
+        cursor_height: BlockHeight,
+    ) -> Result<(), IngestionError> {
+        if cursor_height.value() <= MAIN_ZERO_STATE_BOUNDARY_HEIGHT {
+            return Ok(());
+        }
+        let Some(db_hash) =
+            explorer_db::block_hash_at_height(conn, chain_id, cursor_height).await?
+        else {
+            return Ok(());
+        };
+        let node_block = self
+            .rpc
+            .get_block_by_height(&self.chain.chain, cursor_height)
+            .await?;
+        if !db_hash.eq_ignore_ascii_case(&node_block.hash) {
+            return Err(IngestionError::NodeChainMismatch {
+                height: cursor_height.value(),
+                db_hash,
+                node_hash: node_block.hash,
+                chain: self.chain.chain.to_string(),
+                configured_nexus: self.chain.nexus.to_string(),
+            });
+        }
         Ok(())
     }
 

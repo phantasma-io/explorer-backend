@@ -539,6 +539,30 @@ pub async fn get_cursor_height(
         .transpose()
 }
 
+/// Hash of the stored block at `height` on the chain, if present. Used by the
+/// worker's startup guard to detect a wrong-network RPC (the node's block at our
+/// cursor height must match the block we already stored there).
+pub async fn block_hash_at_height(
+    conn: &mut PgConnection,
+    chain_id: i32,
+    height: BlockHeight,
+) -> Result<Option<String>, DbError> {
+    let stored_height = i64::try_from(height.value())
+        .map_err(|_| DbError::StoredBlockHeightOutOfRange { height: i64::MAX })?;
+    let hash = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT hash
+        FROM blocks
+        WHERE chain_id = $1 AND height = $2
+        "#,
+    )
+    .bind(chain_id)
+    .bind(stored_height)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(hash)
+}
+
 pub async fn get_token_decimals(
     conn: &mut PgConnection,
     chain_id: i32,
