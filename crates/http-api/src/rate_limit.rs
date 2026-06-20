@@ -42,6 +42,10 @@ const SEGMENTS: u64 = 6;
 const SEGMENT_SECONDS: u64 = WINDOW_SECONDS / SEGMENTS;
 /// `Retry-After` advertised on a 429 (seconds), matching the node.
 const RETRY_AFTER_SECONDS: u64 = WINDOW_SECONDS;
+/// Sweep dead partitions out of the window map this often (in admitted partition
+/// checks), so the map stays bounded under a flood of distinct IPs/keys — the
+/// limiter's own state must not become a memory-exhaustion DoS vector.
+const SWEEP_EVERY_OPS: usize = 4096;
 
 /// A fixed-granularity sliding window: the trailing `SEGMENTS` time buckets. The
 /// count over the window is the sum of buckets still inside it. O(SEGMENTS) per
@@ -105,6 +109,8 @@ struct RateLimiterInner {
     trusted_proxies: Vec<IpAddr>,
     /// Per-partition sliding windows, keyed `"apikey:<k>"` or `"ip:<addr>"`.
     windows: Mutex<HashMap<String, SlidingWindow>>,
+    /// Counts partition checks to trigger the periodic dead-window sweep.
+    ops_since_sweep: AtomicUsize,
     /// Total in-flight request bound (concurrency + queue). A simple atomic gate:
     /// over capacity we shed load with 429 rather than buffer unboundedly.
     in_flight: Arc<AtomicUsize>,
@@ -153,6 +159,7 @@ impl RateLimiter {
                 key_limits,
                 trusted_proxies,
                 windows: Mutex::new(HashMap::new()),
+                ops_since_sweep: AtomicUsize::new(0),
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 capacity,
                 start: Instant::now(),
@@ -181,24 +188,51 @@ fn build_key_limits(tiers: &[RateLimitTier]) -> HashMap<String, i64> {
     limits
 }
 
+/// Drop windows that have fully rolled out of the current window (no bucket newer
+/// than `now_segment - SEGMENTS + 1`), bounding the map under many distinct IPs/keys.
+/// Cheap: a stale window is detectable from its buckets, no extra timestamps.
+fn sweep_dead_windows(windows: &mut HashMap<String, SlidingWindow>, now_segment: u64) {
+    let window_start = now_segment.saturating_sub(SEGMENTS - 1);
+    windows.retain(|_, window| {
+        window
+            .buckets
+            .iter()
+            .any(|&(segment, _)| segment >= window_start)
+    });
+}
+
+/// Paths that bypass rate limiting entirely: liveness probes and the API docs, so a
+/// health check (which sends no API key) is never rejected in keys-only mode.
+fn is_exempt_path(path: &str) -> bool {
+    path == "/health"
+        || path == "/version"
+        || path.starts_with("/swagger-ui")
+        || path.starts_with("/api-docs")
+}
+
 impl RateLimiterInner {
     /// Current segment index from the monotonic clock.
     fn current_segment(&self) -> u64 {
         self.start.elapsed().as_secs() / SEGMENT_SECONDS
     }
 
-    /// Resolve the client IP: the socket peer, unless the peer is a configured
-    /// trusted proxy and forwards an `X-Forwarded-For`, in which case the first hop
-    /// (the original client) is used.
+    /// Resolve the client IP. Only when the socket peer is a configured trusted proxy
+    /// do we consult `X-Forwarded-For`, and then take the RIGHT-most hop that is not
+    /// itself a trusted proxy. The left-most entries are client-supplied and forgeable,
+    /// so trusting them would let a client evade per-IP limits and flood the window map.
     fn resolve_client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
         if self.trusted_proxies.contains(&peer)
             && let Some(forwarded) = headers
                 .get("x-forwarded-for")
                 .and_then(|value| value.to_str().ok())
-            && let Some(first) = forwarded.split(',').next()
-            && let Ok(ip) = first.trim().parse::<IpAddr>()
         {
-            return ip;
+            for hop in forwarded.rsplit(',') {
+                if let Ok(ip) = hop.trim().parse::<IpAddr>()
+                    && !self.trusted_proxies.contains(&ip)
+                {
+                    return ip;
+                }
+            }
         }
         peer
     }
@@ -211,6 +245,11 @@ impl RateLimiterInner {
             // wedge the whole API. The global cap is the backstop.
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Periodic dead-window sweep keeps the map bounded (see SWEEP_EVERY_OPS).
+        if self.ops_since_sweep.fetch_add(1, Ordering::Relaxed) >= SWEEP_EVERY_OPS {
+            self.ops_since_sweep.store(0, Ordering::Relaxed);
+            sweep_dead_windows(&mut windows, now_segment);
+        }
         windows
             .entry(partition)
             .or_insert_with(SlidingWindow::new)
@@ -285,6 +324,12 @@ pub async fn rate_limit_middleware(
         return next.run(request).await;
     }
 
+    // Liveness probes and docs bypass limiting so a keyless health check is never
+    // 401'd (keys-only mode) or 429'd under load.
+    if is_exempt_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
     let presented_key = request
         .headers()
         .get(API_KEY_HEADER)
@@ -328,6 +373,7 @@ pub async fn rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use std::net::Ipv4Addr;
 
     fn tier(name: &str, per_minute: i64, keys: &[&str]) -> RateLimitTier {
@@ -446,5 +492,55 @@ mod tests {
         assert!(limiter.inner.try_enter().is_none()); // at capacity (2)
         drop(g1);
         assert!(limiter.inner.try_enter().is_some()); // slot freed
+    }
+
+    // Liveness/docs paths bypass the limiter so a keyless health probe is never
+    // 401'd in keys-only mode.
+    #[test]
+    fn health_and_docs_paths_are_exempt() {
+        assert!(is_exempt_path("/health"));
+        assert!(is_exempt_path("/version"));
+        assert!(is_exempt_path("/swagger-ui"));
+        assert!(is_exempt_path("/api-docs/openapi.json"));
+        assert!(!is_exempt_path("/api/v1/blocks"));
+        assert!(!is_exempt_path("/"));
+    }
+
+    // Behind a trusted proxy the client IP is the right-most non-proxy XFF hop, not
+    // the forgeable left-most one; a non-trusted direct peer ignores XFF.
+    #[test]
+    fn resolve_client_ip_takes_rightmost_untrusted_hop() {
+        let mut cfg = config(vec![]);
+        cfg.trusted_proxies = vec!["10.0.0.1".to_owned()];
+        let inner = &RateLimiter::new(&cfg).inner;
+        let mut headers = HeaderMap::new();
+        // Client forges a fake left-most hop; the proxy appends the real client.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("9.9.9.9, 203.0.113.7"),
+        );
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(
+            inner.resolve_client_ip(proxy, &headers),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+        let direct = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5));
+        assert_eq!(inner.resolve_client_ip(direct, &headers), direct);
+    }
+
+    // The sweep drops windows that have rolled fully out of the current window and
+    // keeps those with recent activity — this is the memory bound.
+    #[test]
+    fn sweep_drops_rolled_out_windows() {
+        let mut windows: HashMap<String, SlidingWindow> = HashMap::new();
+        let mut old = SlidingWindow::new();
+        old.try_admit(0, 100); // activity at segment 0
+        let mut recent = SlidingWindow::new();
+        recent.try_admit(100, 100); // activity at segment 100
+        windows.insert("old".to_owned(), old);
+        windows.insert("recent".to_owned(), recent);
+        sweep_dead_windows(&mut windows, 100);
+        assert!(!windows.contains_key("old")); // rolled out → dropped
+        assert!(windows.contains_key("recent")); // still live → kept
     }
 }
