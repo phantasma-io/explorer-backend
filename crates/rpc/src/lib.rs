@@ -75,11 +75,20 @@ impl PhantasmaSdkClient {
         let endpoints = config
             .rpc_endpoints
             .iter()
-            .map(|endpoint| SdkEndpoint {
-                url: endpoint.to_string(),
-                rpc: PhantasmaRpc::new(endpoint.as_str())
+            .map(|endpoint| {
+                let mut rpc = PhantasmaRpc::new(endpoint.as_str())
                     .with_timeout(config.timeout)
-                    .with_max_response_bytes(config.max_response_bytes),
+                    .with_max_response_bytes(config.max_response_bytes);
+                // Send the API key as the `X-Api-Key` header when configured, so a
+                // rate-limiting node maps us to our key's tier. Absent => no header
+                // (anonymous), identical to the pre-1.2.0 SDK behaviour.
+                if let Some(api_key) = &config.api_key {
+                    rpc = rpc.with_api_key(api_key.clone());
+                }
+                SdkEndpoint {
+                    url: endpoint.to_string(),
+                    rpc,
+                }
             })
             .collect();
 

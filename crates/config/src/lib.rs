@@ -180,6 +180,7 @@ struct RpcFileConfig {
     endpoints: Option<Vec<String>>,
     timeout_seconds: Option<u64>,
     max_response_bytes: Option<usize>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -303,6 +304,10 @@ pub struct RpcConfig {
     pub rpc_endpoints: Vec<Url>,
     pub timeout: Duration,
     pub max_response_bytes: usize,
+    /// Optional API key sent as the `X-Api-Key` header on every RPC request, so a
+    /// rate-limiting node maps us to our key's tier. `None` => no header (anonymous,
+    /// identical to the behaviour before the node enforced per-key limits).
+    pub api_key: Option<String>,
 }
 
 impl RpcConfig {
@@ -335,6 +340,10 @@ impl RpcConfig {
                 file.and_then(|file| file.max_response_bytes),
                 64 * 1024 * 1024,
             )?,
+            api_key: optional_env_or_file_str(
+                "EXPLORER_RPC_API_KEY",
+                file.and_then(|file| file.api_key.as_deref()),
+            ),
         })
     }
 }
@@ -546,6 +555,19 @@ fn required_env_or_file(
                 .map(ToOwned::to_owned)
         })
         .ok_or(ConfigError::MissingConfig { name: config_name })
+}
+
+/// Resolve an OPTIONAL string from env (`env_name`) or the config file (env wins).
+/// Returns `None` when neither source provides a non-empty value. Mirrors
+/// `required_env_or_file` but for values that may legitimately be absent (e.g. the
+/// RPC API key, which is only set when the node enforces rate-limit tiers).
+fn optional_env_or_file_str(env_name: &'static str, file_value: Option<&str>) -> Option<String> {
+    non_empty_env(env_name).or_else(|| {
+        file_value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn env_or_file_or_default<T>(
