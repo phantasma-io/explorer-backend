@@ -627,6 +627,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "explorer-config",
  "explorer-db",
  "explorer-domain",
  "num-bigint",

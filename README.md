@@ -72,6 +72,16 @@ JSON-RPC URLs, tried round-robin with failover), `EXPLORER_BIND_ADDR`,
 namespace). The Explorer database contains only the legacy chains `main` and
 `main-generation-1`.
 
+### Rate limiting
+
+The worker can present an API key to a rate-limited node via `EXPLORER_RPC_API_KEY`
+(sent as the `X-Api-Key` header, mapping the worker to its key tier). The API
+enforces its own inbound rate limiting, modeled on the node's: per-key tiers, an
+optional keys-only mode (`require_api_key`), a per-IP fallback (only behind trusted
+proxies), and an always-on global in-flight cap — over a limit it returns HTTP 429
+with `Retry-After`. Configure it in the `[rate_limiting]` section of
+`config/example-api.toml`; clients send their key in the `X-Api-Key` header.
+
 ## Running
 
 Apply migrations to the target database:

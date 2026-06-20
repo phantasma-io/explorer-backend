@@ -24,6 +24,37 @@ statement_timeout_seconds = 30
 # bind to 0.0.0.0 so the published port is reachable from the host.
 bind_addr = "localhost:9000"
 
+[rate_limiting]
+# Inbound rate limiting for the public API, modeled on the node's per-key limiter.
+# Clients send their key in the `X-Api-Key` header (same as our outbound RPC).
+# EXPLORER_RATE_LIMIT_ENABLED — master switch; false disables all limiting.
+enabled = true
+# EXPLORER_RATE_LIMIT_REQUIRE_API_KEY — keys-only mode: reject any request whose
+# X-Api-Key is missing/unknown with HTTP 401. Default false (anonymous allowed).
+require_api_key = false
+# EXPLORER_RATE_LIMIT_PER_IP_PER_MINUTE — anonymous per-IP budget. ONLY enforced
+# when trusted_proxies is non-empty (otherwise the real client IP is unknown behind
+# a proxy and anonymous traffic is bounded only by the global cap below).
+per_ip_per_minute = 300
+# Proxy IPs whose X-Forwarded-For is trusted to carry the real client IP. Leave
+# empty when the API is exposed directly (no per-IP limiting then).
+trusted_proxies = []
+# EXPLORER_RATE_LIMIT_GLOBAL_CONCURRENT_LIMIT / _GLOBAL_QUEUE_LIMIT — always-on
+# in-flight cap (concurrency + queue); requests beyond it are shed with HTTP 429.
+global_concurrent_limit = 1000
+global_queue_limit = 200
+# API-key tiers (structural → config file only, not env). Each key in `keys` is
+# limited to `per_minute` requests/minute; per_minute <= 0 means unlimited (our own
+# keys). Over the limit returns HTTP 429 with `Retry-After: 60`.
+# [[rate_limiting.tiers]]
+# name = "own"
+# per_minute = 20000
+# keys = ["replace-with-a-real-key"]
+# [[rate_limiting.tiers]]
+# name = "partner"
+# per_minute = 10000
+# keys = []
+
 [chain]
 # EXPLORER_NEXUS is an RPC/worker label, not a database namespace.
 nexus = "mainnet"

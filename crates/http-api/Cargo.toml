@@ -9,6 +9,7 @@ authors.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
+explorer-config.workspace = true
 explorer-db.workspace = true
 explorer-domain.workspace = true
 num-bigint.workspace = true

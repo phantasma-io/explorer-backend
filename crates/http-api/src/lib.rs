@@ -1,5 +1,6 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -49,8 +50,11 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 mod handlers;
+mod rate_limit;
 mod support;
+
 pub(crate) use handlers::*;
+pub use rate_limit::RateLimiter;
 pub(crate) use support::*;
 
 /// Cache key for the overview counters: (chain name, include-legacy flag).
@@ -1129,6 +1133,13 @@ enum ApiError {
         occurrence_count: i64,
         matches: Vec<TransactionOccurrenceResponse>,
     },
+    /// Keys-only mode rejected a request with a missing/unknown API key (401).
+    Unauthorized(String),
+    /// A per-key/per-IP window or the global in-flight cap was exceeded (429);
+    /// carries the advertised `Retry-After` in seconds.
+    RateLimited {
+        retry_after_secs: u64,
+    },
     Internal(String),
 }
 
@@ -1138,6 +1149,8 @@ impl ApiError {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
             Self::AmbiguousTransactionHash { .. } => "ambiguous_transaction_hash",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::RateLimited { .. } => "rate_limited",
             Self::Internal(_) => "internal_error",
         }
     }
@@ -1147,6 +1160,8 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::AmbiguousTransactionHash { .. } => StatusCode::CONFLICT,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -1174,6 +1189,23 @@ impl IntoResponse for ApiError {
             return (StatusCode::CONFLICT, Json(response)).into_response();
         }
 
+        // Rate-limit rejections carry a `Retry-After` header alongside the body.
+        if let Self::RateLimited { retry_after_secs } = self {
+            let response = ErrorResponse {
+                code: "rate_limited".to_owned(),
+                error: "rate limit exceeded".to_owned(),
+            };
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    retry_after_secs.to_string(),
+                )],
+                Json(response),
+            )
+                .into_response();
+        }
+
         let status = self.status_code();
         let code = self.code().to_owned();
         // `Internal` carries diagnostic detail (DB/SQL text, serde/parse internals) meant for the
@@ -1181,12 +1213,12 @@ impl IntoResponse for ApiError {
         // so the public, unauthenticated client never receives internal error strings. The
         // `BadRequest`/`NotFound` messages are written for the caller and are safe to return as-is.
         let error = match self {
-            Self::BadRequest(error) | Self::NotFound(error) => error,
+            Self::BadRequest(error) | Self::NotFound(error) | Self::Unauthorized(error) => error,
             Self::Internal(detail) => {
                 tracing::error!(detail = %detail, "internal API error");
                 "internal server error".to_owned()
             }
-            Self::AmbiguousTransactionHash { .. } => unreachable!(),
+            Self::AmbiguousTransactionHash { .. } | Self::RateLimited { .. } => unreachable!(),
         };
         let response = ErrorResponse { code, error };
         (status, Json(response)).into_response()
@@ -1218,7 +1250,7 @@ fn handle_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
     ApiError::Internal(format!("panic in request handler: {detail}")).into_response()
 }
 
-pub fn router(state: ApiState) -> Router {
+pub fn router(state: ApiState, rate_limiter: RateLimiter) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/", get(swagger_redirect))
@@ -1277,6 +1309,12 @@ pub fn router(state: ApiState) -> Router {
             Duration::from_secs(30),
         ))
         .layer(TraceLayer::new_for_http())
+        // Outermost: reject over-limit / keys-only requests before any handler work.
+        // A disabled limiter makes this middleware a cheap pass-through.
+        .layer(from_fn_with_state(
+            rate_limiter,
+            rate_limit::rate_limit_middleware,
+        ))
         .with_state(state)
 }
 

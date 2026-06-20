@@ -47,6 +47,7 @@ impl AppConfig {
 pub struct ApiConfig {
     pub service_name: String,
     pub http: HttpConfig,
+    pub rate_limiting: RateLimitConfig,
     pub database: DatabaseConfig,
     pub chain: ChainConfig,
     pub logging: LoggingConfig,
@@ -65,6 +66,7 @@ impl ApiConfig {
         Ok(Self {
             service_name: service_name.into(),
             http: HttpConfig::from_file_or_env(file.http.as_ref())?,
+            rate_limiting: RateLimitConfig::from_file_or_env(file.rate_limiting.as_ref())?,
             database: DatabaseConfig::from_file_or_env(file.database.as_ref())?,
             chain: ChainConfig::from_file_or_env(file.chain.as_ref())?,
             logging: LoggingConfig::from_file_or_env(file.logging.as_ref())?,
@@ -128,6 +130,7 @@ impl LoggingConfig {
 struct ExplorerConfigFile {
     database: Option<DatabaseFileConfig>,
     http: Option<HttpFileConfig>,
+    rate_limiting: Option<RateLimitFileConfig>,
     chain: Option<ChainFileConfig>,
     rpc: Option<RpcFileConfig>,
     worker: Option<WorkerFileConfig>,
@@ -165,6 +168,26 @@ struct DatabaseFileConfig {
 #[serde(default, deny_unknown_fields)]
 struct HttpFileConfig {
     bind_addr: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RateLimitFileConfig {
+    enabled: Option<bool>,
+    require_api_key: Option<bool>,
+    trusted_proxies: Option<Vec<String>>,
+    per_ip_per_minute: Option<u32>,
+    global_concurrent_limit: Option<usize>,
+    global_queue_limit: Option<usize>,
+    tiers: Option<Vec<RateLimitTierFileConfig>>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct RateLimitTierFileConfig {
+    name: Option<String>,
+    per_minute: Option<i64>,
+    keys: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,6 +243,90 @@ impl HttpConfig {
     fn from_file_or_env(file: Option<&HttpFileConfig>) -> Result<Self, ConfigError> {
         Ok(Self {
             bind_addr: resolve_bind_addr(file.and_then(|file| file.bind_addr.as_deref()))?,
+        })
+    }
+}
+
+/// Inbound rate-limiting for the public HTTP API, modeled on the node's per-key
+/// tier limiter. `enabled=false` makes the middleware a no-op. A request's
+/// `X-Api-Key` is matched against `key_tiers`; an unknown/absent key falls back to
+/// the per-IP limit, unless `require_api_key` (keys-only mode) rejects it with 401.
+/// A tier with `per_minute <= 0` is unlimited (intended for our own keys). Per-IP
+/// limiting only takes effect when `trusted_proxies` is non-empty (otherwise the
+/// real client IP cannot be trusted behind a proxy, so anonymous traffic is bounded
+/// only by the global concurrency cap).
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    pub require_api_key: bool,
+    pub trusted_proxies: Vec<String>,
+    pub per_ip_per_minute: u32,
+    pub global_concurrent_limit: usize,
+    pub global_queue_limit: usize,
+    pub key_tiers: Vec<RateLimitTier>,
+}
+
+/// One API-key tier: every key in `keys` is limited to `per_minute` requests per
+/// minute (`<= 0` means unlimited). `name` is diagnostics only.
+#[derive(Debug, Clone)]
+pub struct RateLimitTier {
+    pub name: String,
+    pub per_minute: i64,
+    pub keys: Vec<String>,
+}
+
+impl RateLimitConfig {
+    fn from_file_or_env(file: Option<&RateLimitFileConfig>) -> Result<Self, ConfigError> {
+        // Tiers and trusted proxies are structural lists → resolved from the TOML
+        // file only; scalars also accept an EXPLORER_RATE_LIMIT_* env override.
+        let key_tiers = file
+            .and_then(|file| file.tiers.as_ref())
+            .map(|tiers| {
+                tiers
+                    .iter()
+                    .map(|tier| RateLimitTier {
+                        name: tier.name.clone().unwrap_or_default(),
+                        per_minute: tier.per_minute.unwrap_or(0),
+                        keys: tier.keys.clone().unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            enabled: env_or_file_or_default(
+                "EXPLORER_RATE_LIMIT_ENABLED",
+                "rate_limiting.enabled",
+                file.and_then(|file| file.enabled),
+                true,
+            )?,
+            require_api_key: env_or_file_or_default(
+                "EXPLORER_RATE_LIMIT_REQUIRE_API_KEY",
+                "rate_limiting.require_api_key",
+                file.and_then(|file| file.require_api_key),
+                false,
+            )?,
+            trusted_proxies: file
+                .and_then(|file| file.trusted_proxies.clone())
+                .unwrap_or_default(),
+            per_ip_per_minute: env_or_file_or_default(
+                "EXPLORER_RATE_LIMIT_PER_IP_PER_MINUTE",
+                "rate_limiting.per_ip_per_minute",
+                file.and_then(|file| file.per_ip_per_minute),
+                300,
+            )?,
+            global_concurrent_limit: env_or_file_or_default(
+                "EXPLORER_RATE_LIMIT_GLOBAL_CONCURRENT_LIMIT",
+                "rate_limiting.global_concurrent_limit",
+                file.and_then(|file| file.global_concurrent_limit),
+                1000,
+            )?,
+            global_queue_limit: env_or_file_or_default(
+                "EXPLORER_RATE_LIMIT_GLOBAL_QUEUE_LIMIT",
+                "rate_limiting.global_queue_limit",
+                file.and_then(|file| file.global_queue_limit),
+                200,
+            )?,
+            key_tiers,
         })
     }
 }
