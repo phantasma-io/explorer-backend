@@ -406,7 +406,7 @@ impl ChainConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcConfig {
     pub rpc_endpoints: Vec<Url>,
     pub timeout: Duration,
@@ -415,6 +415,20 @@ pub struct RpcConfig {
     /// rate-limiting node maps us to our key's tier. `None` => no header (anonymous,
     /// identical to the behaviour before the node enforced per-key limits).
     pub api_key: Option<String>,
+}
+
+// Manual Debug so the API key is never printed in logs/diagnostics (a config struct
+// is easy to `{:?}` by accident); presence is shown, the value redacted.
+impl std::fmt::Debug for RpcConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RpcConfig")
+            .field("rpc_endpoints", &self.rpc_endpoints)
+            .field("timeout", &self.timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 impl RpcConfig {
