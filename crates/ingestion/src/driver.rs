@@ -20,6 +20,7 @@ impl BlockIngestionDriver {
             pool,
             chain,
             settings,
+            node_guard_checked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -31,8 +32,7 @@ impl BlockIngestionDriver {
             .await?
             .unwrap_or_else(|| BlockHeight::new(0));
         self.validate_zero_state_scope(cursor_height)?;
-        self.guard_node_matches_db(&mut conn, chain_id, cursor_height)
-            .await?;
+        self.guard_node_matches_db(chain_id, cursor_height).await?;
         let window = plan_fetch_window(cursor_height, rpc_tip, &self.settings)?;
 
         Ok(StartupProbe {
@@ -341,6 +341,7 @@ impl BlockIngestionDriver {
         // pass; the pipeline acquires its own per-block transactions.
         drop(conn);
         self.validate_zero_state_scope(cursor_height)?;
+        self.guard_node_matches_db(chain_id, cursor_height).await?;
         let Some(window) = plan_fetch_window(cursor_height, rpc_tip, &self.settings)? else {
             return Ok(SyncBatchReport {
                 configured_nexus: self.chain.nexus.to_string(),
@@ -442,16 +443,25 @@ impl BlockIngestionDriver {
     /// (pair the devnet DB with the devnet RPC) covers that case.
     async fn guard_node_matches_db(
         &self,
-        conn: &mut sqlx::PgConnection,
         chain_id: i32,
         cursor_height: BlockHeight,
     ) -> Result<(), IngestionError> {
+        // Checked once per process (after a confirmed match) to avoid an RPC per sync.
+        if self
+            .node_guard_checked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        // A fresh DB with nothing above the boundary cannot be verified yet; don't
+        // latch, so the check runs as soon as gen3 blocks exist.
         if cursor_height.value() <= MAIN_ZERO_STATE_BOUNDARY_HEIGHT {
             return Ok(());
         }
-        let Some(db_hash) =
-            explorer_db::block_hash_at_height(conn, chain_id, cursor_height).await?
-        else {
+        let mut conn = self.pool.acquire().await?;
+        let stored = explorer_db::block_hash_at_height(&mut conn, chain_id, cursor_height).await?;
+        drop(conn);
+        let Some(db_hash) = stored else {
             return Ok(());
         };
         let node_block = self
@@ -467,6 +477,8 @@ impl BlockIngestionDriver {
                 configured_nexus: self.chain.nexus.to_string(),
             });
         }
+        self.node_guard_checked
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

@@ -65,6 +65,9 @@ pub struct BlockIngestionDriver {
     pool: PgPool,
     chain: ChainConfig,
     settings: WorkerConfig,
+    /// Latches once the configured node is verified to match the stored chain, so the
+    /// startup guard's RPC check runs only once per process, not on every sync pass.
+    node_guard_checked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
