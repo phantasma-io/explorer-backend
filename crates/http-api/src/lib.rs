@@ -408,7 +408,7 @@ struct NftListQuery {
     status: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 struct NftMetadataResponse {
     description: Option<String>,
     name: Option<String>,
@@ -432,7 +432,7 @@ struct NftOwnerResponse {
     amount: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 struct SeriesResponse {
     id: i32,
     series_id: Option<String>,
@@ -1056,6 +1056,8 @@ struct EventListQuery {
     nft_description_partial: Option<String>,
     address_partial: Option<String>,
     chain: Option<String>,
+    with_metadata: Option<i32>,
+    with_series: Option<i32>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }
@@ -1091,6 +1093,10 @@ struct EventResponse {
     payload_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nft_metadata: Option<NftMetadataResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    series: Option<SeriesResponse>,
     #[serde(flatten)]
     event_data: EventDataFields,
 }

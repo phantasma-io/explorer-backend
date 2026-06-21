@@ -350,6 +350,8 @@ pub(crate) fn platform_from_row(row: &PgRow) -> PlatformResponse {
                 .get::<Option<Value>, _>("create_payload_json")
                 .and_then(|value| serde_json::to_string(&value).ok()),
             raw_data: row.get("create_raw_data"),
+            nft_metadata: None,
+            series: None,
             event_data: EventDataFields::default(),
         });
 
@@ -423,11 +425,13 @@ pub(crate) async fn events_from_rows(
     pool: &PgPool,
     rows: &[PgRow],
     with_event_data: bool,
+    with_metadata: bool,
+    with_series: bool,
 ) -> Result<Vec<EventResponse>, ApiError> {
     let token_symbols = collect_event_token_symbols(rows);
     let tokens = load_event_tokens_by_symbols(pool, token_symbols).await?;
     rows.iter()
-        .map(|row| event_from_row(row, &tokens, with_event_data))
+        .map(|row| event_from_row(row, &tokens, with_event_data, with_metadata, with_series))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -533,6 +537,8 @@ pub(crate) fn event_from_row(
     row: &PgRow,
     tokens: &HashMap<String, Value>,
     with_event_data: bool,
+    with_metadata: bool,
+    with_series: bool,
 ) -> Result<EventResponse, ApiError> {
     let contract_hash = row
         .get::<Option<String>, _>("contract_hash")
@@ -582,6 +588,16 @@ pub(crate) fn event_from_row(
         token_id: row.get("token_id"),
         payload_json,
         raw_data: row.get("raw_data"),
+        nft_metadata: if with_metadata {
+            json_opt(row.get("nft_metadata_json"))?
+        } else {
+            None
+        },
+        series: if with_series {
+            json_opt(row.get("series_json"))?
+        } else {
+            None
+        },
         event_data,
     })
 }

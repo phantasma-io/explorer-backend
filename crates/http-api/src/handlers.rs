@@ -1600,7 +1600,14 @@ pub(crate) async fn load_events(
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, "event")?;
-    let events = events_from_rows(&state.pool, &rows, query.with_event_data == Some(1)).await?;
+    let events = events_from_rows(
+        &state.pool,
+        &rows,
+        query.with_event_data == Some(1),
+        query.with_metadata == Some(1),
+        query.with_series == Some(1),
+    )
+    .await?;
 
     Ok(EventListResponse {
         total_results: None,
@@ -1736,7 +1743,13 @@ pub(crate) async fn load_events_by_transaction_ids(
         grouped
             .entry(transaction_id)
             .or_default()
-            .push(event_from_row(&row, &tokens, with_event_data)?);
+            .push(event_from_row(
+                &row,
+                &tokens,
+                with_event_data,
+                false,
+                false,
+            )?);
     }
     Ok(grouped)
 }
