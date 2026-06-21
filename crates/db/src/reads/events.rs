@@ -77,6 +77,8 @@ pub struct EventFilter<'a> {
     pub nft_name_partial: Option<&'a str>,
     pub nft_description_partial: Option<&'a str>,
     pub address_partial: Option<&'a str>,
+    /// Restrict address-scoped events to this chain (None = all chains for the id).
+    pub chain_id: Option<i32>,
 }
 
 // Derive the substring (`q_like`) and numeric (`q_height`) forms of the
@@ -242,6 +244,7 @@ pub async fn list_events_by_address(
           AND ($4::text IS NULL OR event_kind.name = $4)
           AND ($5::text IS NULL OR $5 = 'legacy')
           AND ($6::integer IS NULL OR event.address_id = $6 OR event.target_address_id = $6)
+          AND ($25::integer IS NULL OR event.chain_id = $25)
           AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
           AND ($11::integer IS NULL OR event.id = $11)
           AND ($12::text IS NULL OR tx.hash ILIKE $12 OR block.hash ILIKE $12 OR block.height = $13 OR event_kind.name ILIKE $12 OR address.address ILIKE $12 OR target_address.address ILIKE $12 OR address.address_name ILIKE $12 OR contract.hash ILIKE $12 OR contract.name ILIKE $12 OR contract.symbol ILIKE $12 OR event.token_id ILIKE $12)
@@ -291,6 +294,7 @@ pub async fn list_events_by_address(
         .bind(filter.nft_name_partial)
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
+        .bind(filter.chain_id)
         .fetch_all(executor)
         .await?;
 

@@ -1055,6 +1055,7 @@ struct EventListQuery {
     nft_name_partial: Option<String>,
     nft_description_partial: Option<String>,
     address_partial: Option<String>,
+    chain: Option<String>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }

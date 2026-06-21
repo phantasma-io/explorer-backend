@@ -1524,6 +1524,11 @@ pub(crate) async fn load_events(
     let nft_description_partial =
         empty_to_none(query.nft_description_partial).map(|value| format!("%{value}%"));
     let address_partial = empty_to_none(query.address_partial).map(|value| format!("%{value}%"));
+    let chain = empty_to_none(query.chain);
+    let chain_filter_id = match chain.as_deref() {
+        Some(name) => Some(resolve_chain_id_by_name(&state.pool, name).await?),
+        None => None,
+    };
     let order_by_param = empty_to_none(query.order_by);
     let order_by = EventOrderBy::from_api_param(order_by_param.as_deref()).ok_or_else(|| {
         ApiError::BadRequest(format!(
@@ -1551,6 +1556,7 @@ pub(crate) async fn load_events(
         nft_name_partial: nft_name_partial.as_deref(),
         nft_description_partial: nft_description_partial.as_deref(),
         address_partial: address_partial.as_deref(),
+        chain_id: chain_filter_id,
     };
     let page = EventPage {
         order_by,
@@ -1576,8 +1582,12 @@ pub(crate) async fn load_events(
             None => Vec::new(),
         }
     } else {
-        let chain_id = resolve_chain_id(state).await?;
-        list_events_global(&state.pool, chain_id, state.chain.as_str(), &filter, &page).await?
+        let chain_id = match chain_filter_id {
+            Some(id) => id,
+            None => resolve_chain_id(state).await?,
+        };
+        let chain_name = chain.as_deref().unwrap_or_else(|| state.chain.as_str());
+        list_events_global(&state.pool, chain_id, chain_name, &filter, &page).await?
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, "event")?;
