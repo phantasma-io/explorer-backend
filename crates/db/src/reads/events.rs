@@ -72,6 +72,11 @@ pub struct EventFilter<'a> {
     pub date_less: Option<i64>,
     pub date_greater: Option<i64>,
     pub date_day: Option<i64>,
+    /// `%value%` LIKE forms for the partial filters (C# `.Contains`).
+    pub event_kind_partial: Option<&'a str>,
+    pub nft_name_partial: Option<&'a str>,
+    pub nft_description_partial: Option<&'a str>,
+    pub address_partial: Option<&'a str>,
 }
 
 // Derive the substring (`q_like`) and numeric (`q_height`) forms of the
@@ -124,6 +129,7 @@ pub async fn list_events_global(
         JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
         LEFT JOIN addresses address ON address.id = event.address_id
         LEFT JOIN contracts contract ON contract.id = event.contract_id
+        LEFT JOIN nfts nft ON nft.id = event.nft_id
         WHERE event.chain_id = $1
           AND ($3::text IS NULL OR tx.hash = $3)
           AND ($4::bigint IS NULL OR block.height = $4)
@@ -139,6 +145,10 @@ pub async fn list_events_global(
           AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
           AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
           AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
+          AND ($21::text IS NULL OR event_kind.name ILIKE $21)
+          AND ($22::text IS NULL OR nft.name ILIKE $22)
+          AND ($23::text IS NULL OR nft.description ILIKE $23)
+          AND ($24::text IS NULL OR address.address ILIKE $24 OR address.address_name ILIKE $24 OR address.user_name ILIKE $24)
           AND (
               $8::bigint IS NULL
               OR {column} {op} $8
@@ -170,6 +180,10 @@ pub async fn list_events_global(
         .bind(filter.date_less)
         .bind(filter.date_greater)
         .bind(filter.date_day)
+        .bind(filter.event_kind_partial)
+        .bind(filter.nft_name_partial)
+        .bind(filter.nft_description_partial)
+        .bind(filter.address_partial)
         .fetch_all(executor)
         .await?;
 
@@ -221,6 +235,7 @@ pub async fn list_events_by_address(
         LEFT JOIN addresses address ON address.id = event.address_id
         LEFT JOIN addresses target_address ON target_address.id = event.target_address_id
         LEFT JOIN contracts contract ON contract.id = event.contract_id
+        LEFT JOIN nfts nft ON nft.id = event.nft_id
         WHERE ($6::integer IS NOT NULL OR chain.name = $1)
           AND ($2::text IS NULL OR tx.hash = $2)
           AND ($3::bigint IS NULL OR block.height = $3)
@@ -237,6 +252,10 @@ pub async fn list_events_by_address(
           AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
           AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
           AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
+          AND ($21::text IS NULL OR event_kind.name ILIKE $21)
+          AND ($22::text IS NULL OR nft.name ILIKE $22)
+          AND ($23::text IS NULL OR nft.description ILIKE $23)
+          AND ($24::text IS NULL OR address.address ILIKE $24 OR address.address_name ILIKE $24 OR address.user_name ILIKE $24)
           AND (
               $8::bigint IS NULL
               OR {column} {op} $8
@@ -268,6 +287,10 @@ pub async fn list_events_by_address(
         .bind(filter.date_less)
         .bind(filter.date_greater)
         .bind(filter.date_day)
+        .bind(filter.event_kind_partial)
+        .bind(filter.nft_name_partial)
+        .bind(filter.nft_description_partial)
+        .bind(filter.address_partial)
         .fetch_all(executor)
         .await?;
 

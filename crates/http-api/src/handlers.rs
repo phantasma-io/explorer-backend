@@ -1518,6 +1518,12 @@ pub(crate) async fn load_events(
     let date_greater =
         parse_optional_i64(empty_to_none(query.date_greater).as_deref(), "date_greater")?;
     let date_day = parse_optional_i64(empty_to_none(query.date_day).as_deref(), "date_day")?;
+    let event_kind_partial =
+        empty_to_none(query.event_kind_partial).map(|value| format!("%{value}%"));
+    let nft_name_partial = empty_to_none(query.nft_name_partial).map(|value| format!("%{value}%"));
+    let nft_description_partial =
+        empty_to_none(query.nft_description_partial).map(|value| format!("%{value}%"));
+    let address_partial = empty_to_none(query.address_partial).map(|value| format!("%{value}%"));
     let order_by_param = empty_to_none(query.order_by);
     let order_by = EventOrderBy::from_api_param(order_by_param.as_deref()).ok_or_else(|| {
         ApiError::BadRequest(format!(
@@ -1541,6 +1547,10 @@ pub(crate) async fn load_events(
         date_less,
         date_greater,
         date_day,
+        event_kind_partial: event_kind_partial.as_deref(),
+        nft_name_partial: nft_name_partial.as_deref(),
+        nft_description_partial: nft_description_partial.as_deref(),
+        address_partial: address_partial.as_deref(),
     };
     let page = EventPage {
         order_by,
