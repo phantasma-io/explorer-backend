@@ -414,6 +414,39 @@ pub async fn list_events_by_transaction_ids(
     Ok(rows)
 }
 
+/// USD prices for market-event fiat enrichment (C# parity): the stored per-day
+/// price for each `(symbol, day-start)` pair on the chain, plus each symbol's
+/// current spot price as the symbol-only fallback. The API picks daily-first,
+/// spot-fallback per event.
+pub async fn market_event_usd_prices(
+    pool: &sqlx::PgPool,
+    chain_id: i32,
+    symbols: &[String],
+    days: &[i64],
+) -> Result<(Vec<(String, i64, f64)>, Vec<(String, i32, Option<f64>)>), DbError> {
+    let daily = sqlx::query_as::<_, (String, i64, f64)>(
+        r#"
+        SELECT t.symbol, tdp.date_unix_seconds, tdp.price_usd::float8
+        FROM token_daily_prices tdp
+        JOIN tokens t ON t.id = tdp.token_id
+        WHERE t.chain_id = $1 AND t.symbol = ANY($2) AND tdp.date_unix_seconds = ANY($3)
+        "#,
+    )
+    .bind(chain_id)
+    .bind(symbols)
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+    let token_meta = sqlx::query_as::<_, (String, i32, Option<f64>)>(
+        "SELECT symbol, decimals, price_usd::float8 FROM tokens WHERE chain_id = $1 AND symbol = ANY($2)",
+    )
+    .bind(chain_id)
+    .bind(symbols)
+    .fetch_all(pool)
+    .await?;
+    Ok((daily, token_meta))
+}
+
 /// Load the token rows used to enrich event payloads, by uppercase symbol. The
 /// API builds the per-symbol JSON map from these rows.
 pub async fn list_event_tokens_by_symbols(

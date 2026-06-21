@@ -427,12 +427,195 @@ pub(crate) async fn events_from_rows(
     with_event_data: bool,
     with_metadata: bool,
     with_series: bool,
+    with_fiat: bool,
 ) -> Result<Vec<EventResponse>, ApiError> {
     let token_symbols = collect_event_token_symbols(rows);
     let tokens = load_event_tokens_by_symbols(pool, token_symbols).await?;
-    rows.iter()
+    let mut events = rows
+        .iter()
         .map(|row| event_from_row(row, &tokens, with_event_data, with_metadata, with_series))
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()?;
+    attach_fiat_to_market_events(pool, &mut events, with_fiat).await?;
+    Ok(events)
+}
+
+/// Truncate a unix timestamp to the start of its UTC day (C# `UnixSeconds.GetDate`).
+fn start_of_day(timestamp: i64) -> i64 {
+    timestamp - timestamp.rem_euclid(86_400)
+}
+
+/// The quote-token symbol of a (possibly enriched) market event: the enriched token
+/// object's `symbol`, or the raw symbol string before enrichment.
+fn market_quote_symbol(market: &Value) -> Option<String> {
+    match market.get("quote_token") {
+        Some(Value::Object(object)) => object
+            .get("symbol")
+            .and_then(Value::as_str)
+            .map(|symbol| symbol.to_uppercase()),
+        Some(Value::String(symbol)) => Some(symbol.to_uppercase()),
+        _ => None,
+    }
+}
+
+/// USD value of a raw quote-token price: `raw / 10^decimals * price`, where `price`
+/// is the stored daily USD price (or current spot as fallback). `None` when the
+/// result is zero, matching the C# null rule.
+fn compute_fiat_usd(
+    raw: &str,
+    decimals: i32,
+    daily: Option<f64>,
+    spot: Option<f64>,
+) -> Option<f64> {
+    if raw.is_empty() || raw == "0" {
+        return None;
+    }
+    let whole = raw.parse::<f64>().ok()? / 10f64.powi(decimals);
+    let daily = daily.unwrap_or(0.0);
+    let result = if daily > 0.0 {
+        whole * daily
+    } else {
+        whole * spot.unwrap_or(0.0)
+    };
+    (result != 0.0).then_some(result)
+}
+
+/// Attach a USD `fiat_price` block to each market event (C# parity, `with_fiat`).
+/// Chain-scoped, USD only (cross-currency conversion needs `fiat_exchange_rates`,
+/// which is currently empty, so other currencies would resolve to 0 as in C#).
+pub(crate) async fn attach_fiat_to_market_events(
+    pool: &PgPool,
+    events: &mut [EventResponse],
+    with_fiat: bool,
+) -> Result<(), ApiError> {
+    if !with_fiat {
+        return Ok(());
+    }
+    struct Need {
+        index: usize,
+        chain_name: String,
+        symbol: String,
+        day: i64,
+        raw_price: Option<String>,
+        raw_end: Option<String>,
+    }
+    let mut needs: Vec<Need> = Vec::new();
+    let mut chain_names: HashSet<String> = HashSet::new();
+    for (index, event) in events.iter().enumerate() {
+        let Some(market) = event.event_data.market_event.as_ref() else {
+            continue;
+        };
+        let Some(symbol) = market_quote_symbol(market) else {
+            continue;
+        };
+        let Some(day) = event.date.parse::<i64>().ok().map(start_of_day) else {
+            continue;
+        };
+        let raw_price = market
+            .get("price")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let raw_end = market
+            .get("end_price")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if raw_price.is_none() && raw_end.is_none() {
+            continue;
+        }
+        chain_names.insert(event.chain.clone());
+        needs.push(Need {
+            index,
+            chain_name: event.chain.clone(),
+            symbol,
+            day,
+            raw_price,
+            raw_end,
+        });
+    }
+    if needs.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve chains and fetch each chain's daily + meta (decimals, spot) prices.
+    let mut chain_id_by_name: HashMap<String, i32> = HashMap::new();
+    for name in &chain_names {
+        if let Some(id) = explorer_db::chain_ids_by_name(pool, name)
+            .await?
+            .first()
+            .copied()
+        {
+            chain_id_by_name.insert(name.clone(), id);
+        }
+    }
+    let mut daily: HashMap<(i32, String, i64), f64> = HashMap::new();
+    let mut decimals: HashMap<(i32, String), i32> = HashMap::new();
+    let mut spot: HashMap<(i32, String), f64> = HashMap::new();
+    let unique_chain_ids: HashSet<i32> = chain_id_by_name.values().copied().collect();
+    for chain_id in unique_chain_ids {
+        let symbols: Vec<String> = needs
+            .iter()
+            .filter(|need| chain_id_by_name.get(&need.chain_name) == Some(&chain_id))
+            .map(|need| need.symbol.clone())
+            .collect();
+        let days: Vec<i64> = needs
+            .iter()
+            .filter(|need| chain_id_by_name.get(&need.chain_name) == Some(&chain_id))
+            .map(|need| need.day)
+            .collect();
+        if symbols.is_empty() {
+            continue;
+        }
+        let (daily_rows, meta_rows) =
+            explorer_db::market_event_usd_prices(pool, chain_id, &symbols, &days).await?;
+        for (symbol, day, price) in daily_rows {
+            daily.insert((chain_id, symbol, day), price);
+        }
+        for (symbol, token_decimals, token_spot) in meta_rows {
+            decimals.insert((chain_id, symbol.clone()), token_decimals);
+            if let Some(price) = token_spot {
+                spot.insert((chain_id, symbol), price);
+            }
+        }
+    }
+
+    for need in needs {
+        let Some(&chain_id) = chain_id_by_name.get(&need.chain_name) else {
+            continue;
+        };
+        let Some(&token_decimals) = decimals.get(&(chain_id, need.symbol.clone())) else {
+            continue;
+        };
+        let daily_price = daily
+            .get(&(chain_id, need.symbol.clone(), need.day))
+            .copied();
+        let spot_price = spot.get(&(chain_id, need.symbol.clone())).copied();
+        let fiat_price = need
+            .raw_price
+            .as_deref()
+            .and_then(|raw| compute_fiat_usd(raw, token_decimals, daily_price, spot_price));
+        let fiat_price_end = need
+            .raw_end
+            .as_deref()
+            .and_then(|raw| compute_fiat_usd(raw, token_decimals, daily_price, spot_price));
+        if fiat_price.is_none() && fiat_price_end.is_none() {
+            continue;
+        }
+        if let Some(market) = events[need.index]
+            .event_data
+            .market_event
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            market.insert(
+                "fiat_price".to_owned(),
+                serde_json::json!({
+                    "fiat_currency": "USD",
+                    "fiat_price": fiat_price,
+                    "fiat_price_end": fiat_price_end,
+                }),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn collect_event_token_symbols(rows: &[PgRow]) -> HashSet<String> {

@@ -213,6 +213,7 @@ struct BlockListQuery {
     with_event_data: Option<i32>,
     with_script: Option<i32>,
     with_nft: Option<i32>,
+    with_fiat: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -941,6 +942,7 @@ struct TransactionListQuery {
     with_event_data: Option<i32>,
     with_script: Option<i32>,
     with_nft: Option<i32>,
+    with_fiat: Option<i32>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }
@@ -1060,6 +1062,7 @@ struct EventListQuery {
     chain: Option<String>,
     with_metadata: Option<i32>,
     with_series: Option<i32>,
+    with_fiat: Option<i32>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }

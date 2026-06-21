@@ -389,6 +389,7 @@ pub(crate) async fn blocks(
     let with_event_data = query.with_event_data == Some(1);
     let with_script = query.with_script == Some(1);
     let with_nft = query.with_nft == Some(1);
+    let with_fiat = query.with_fiat == Some(1);
 
     let filter = BlockFilter {
         chain_id,
@@ -418,6 +419,7 @@ pub(crate) async fn blocks(
             with_event_data,
             with_script,
             with_nft,
+            with_fiat,
         )
         .await?;
         for (row, block) in rows.iter().zip(blocks.iter_mut()) {
@@ -1421,6 +1423,7 @@ pub(crate) async fn load_transactions(
     let with_event_data = query.with_event_data == Some(1);
     let with_script = query.with_script == Some(1);
     let with_nft = query.with_nft == Some(1);
+    let with_fiat = query.with_fiat == Some(1);
 
     let rows = if let Some(address) = address {
         match address_id_by_address(&state.pool, &address).await? {
@@ -1470,8 +1473,14 @@ pub(crate) async fn load_transactions(
         }
     }
     if with_events {
-        attach_events_to_transactions(&state.pool, &mut transactions, with_event_data, with_nft)
-            .await?;
+        attach_events_to_transactions(
+            &state.pool,
+            &mut transactions,
+            with_event_data,
+            with_nft,
+            with_fiat,
+        )
+        .await?;
     }
 
     Ok(TransactionListResponse {
@@ -1488,6 +1497,7 @@ pub(crate) async fn load_transactions_by_block_ids(
     with_event_data: bool,
     with_script: bool,
     with_nft: bool,
+    with_fiat: bool,
 ) -> Result<HashMap<i32, Vec<TransactionResponse>>, ApiError> {
     if block_ids.is_empty() {
         return Ok(HashMap::new());
@@ -1501,7 +1511,14 @@ pub(crate) async fn load_transactions_by_block_ids(
         }
     }
     if with_events {
-        attach_events_to_transactions(pool, &mut transactions, with_event_data, with_nft).await?;
+        attach_events_to_transactions(
+            pool,
+            &mut transactions,
+            with_event_data,
+            with_nft,
+            with_fiat,
+        )
+        .await?;
     }
 
     let mut grouped: HashMap<i32, Vec<TransactionResponse>> = HashMap::new();
@@ -1611,6 +1628,7 @@ pub(crate) async fn load_events(
         query.with_event_data == Some(1),
         query.with_metadata == Some(1),
         query.with_series == Some(1),
+        query.with_fiat == Some(1),
     )
     .await?;
 
@@ -1709,7 +1727,8 @@ pub(crate) async fn load_transaction_events(
     pool: &PgPool,
     transaction_id: i32,
 ) -> Result<Vec<EventResponse>, ApiError> {
-    let mut grouped = load_events_by_transaction_ids(pool, &[transaction_id], true, false).await?;
+    let mut grouped =
+        load_events_by_transaction_ids(pool, &[transaction_id], true, false, false).await?;
     Ok(grouped.remove(&transaction_id).unwrap_or_default())
 }
 
@@ -1718,12 +1737,14 @@ pub(crate) async fn attach_events_to_transactions(
     transactions: &mut [TransactionResponse],
     with_event_data: bool,
     with_nft: bool,
+    with_fiat: bool,
 ) -> Result<(), ApiError> {
     let ids = transactions
         .iter()
         .map(|transaction| parse_i32_id("transaction_id", &transaction.transaction_id))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut grouped = load_events_by_transaction_ids(pool, &ids, with_event_data, with_nft).await?;
+    let mut grouped =
+        load_events_by_transaction_ids(pool, &ids, with_event_data, with_nft, with_fiat).await?;
     for transaction in transactions {
         let id = parse_i32_id("transaction_id", &transaction.transaction_id)?;
         transaction.events = Some(grouped.remove(&id).unwrap_or_default());
@@ -1736,6 +1757,7 @@ pub(crate) async fn load_events_by_transaction_ids(
     transaction_ids: &[i32],
     with_event_data: bool,
     with_nft: bool,
+    with_fiat: bool,
 ) -> Result<HashMap<i32, Vec<EventResponse>>, ApiError> {
     if transaction_ids.is_empty() {
         return Ok(HashMap::new());
@@ -1744,19 +1766,23 @@ pub(crate) async fn load_events_by_transaction_ids(
 
     let token_symbols = collect_event_token_symbols(&rows);
     let tokens = load_event_tokens_by_symbols(pool, token_symbols).await?;
+    let mut tx_ids: Vec<i32> = Vec::with_capacity(rows.len());
+    let mut events: Vec<EventResponse> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        tx_ids.push(row.get("event_transaction_id"));
+        events.push(event_from_row(
+            row,
+            &tokens,
+            with_event_data,
+            with_nft,
+            with_nft,
+        )?);
+    }
+    // Fiat enrichment needs the pool, so it runs once over the flat list before grouping.
+    attach_fiat_to_market_events(pool, &mut events, with_fiat).await?;
     let mut grouped: HashMap<i32, Vec<EventResponse>> = HashMap::new();
-    for row in rows {
-        let transaction_id = row.get("event_transaction_id");
-        grouped
-            .entry(transaction_id)
-            .or_default()
-            .push(event_from_row(
-                &row,
-                &tokens,
-                with_event_data,
-                with_nft,
-                with_nft,
-            )?);
+    for (transaction_id, event) in tx_ids.into_iter().zip(events) {
+        grouped.entry(transaction_id).or_default().push(event);
     }
     Ok(grouped)
 }
