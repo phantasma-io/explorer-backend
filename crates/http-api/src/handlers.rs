@@ -744,7 +744,9 @@ pub(crate) async fn series(
     let series_id = empty_to_none(query.series_id);
     let creator = empty_to_none(query.creator);
     let name = empty_to_none(query.name).map(|value| format!("%{value}%"));
-    let q = empty_to_none(query.q).map(|value| format!("%{value}%"));
+    let q_raw = empty_to_none(query.q);
+    let q_id = q_raw.as_deref().and_then(|value| value.parse::<i64>().ok());
+    let q = q_raw.map(|value| format!("%{value}%"));
     let contract = empty_to_none(query.contract);
     let symbol = empty_to_none(query.symbol).map(|value| value.to_uppercase());
     let token_id = empty_to_none(query.token_id);
@@ -759,6 +761,7 @@ pub(crate) async fn series(
         contract: contract.as_deref(),
         symbol: symbol.as_deref(),
         token_id: token_id.as_deref(),
+        q_id,
     };
     let rows = list_series(&state.pool, &filter, order_by, direction, limit + 1, offset).await?;
 
@@ -1106,6 +1109,11 @@ pub(crate) async fn searches(
             endpoint_name: "organizations".to_owned(),
             endpoint_parameter: "organization_name".to_owned(),
             found: existence.organizations,
+        },
+        SearchResponse {
+            endpoint_name: "platforms".to_owned(),
+            endpoint_parameter: "name".to_owned(),
+            found: existence.platforms,
         },
         SearchResponse {
             endpoint_name: "tokens".to_owned(),

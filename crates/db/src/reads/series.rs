@@ -52,6 +52,8 @@ pub struct SeriesFilter<'a> {
     pub contract: Option<&'a str>,
     pub symbol: Option<&'a str>,
     pub token_id: Option<&'a str>,
+    /// Numeric `q` also matches the surrogate `series.id` (C# parity).
+    pub q_id: Option<i64>,
 }
 
 /// List visible series for a chain matching the filter, ordered by the chosen
@@ -79,7 +81,7 @@ pub async fn list_series(
               AND ($3::text IS NULL OR series.series_id = $3)
               AND ($4::text IS NULL OR creator.address = $4)
               AND ($5::text IS NULL OR series.name ILIKE $5 OR series.description ILIKE $5)
-              AND ($6::text IS NULL OR series.name ILIKE $6 OR series.description ILIKE $6 OR series.series_id ILIKE $6 OR contract.symbol ILIKE $6 OR contract.hash ILIKE $6)
+              AND ($6::text IS NULL OR series.name ILIKE $6 OR series.description ILIKE $6 OR series.series_id ILIKE $6 OR contract.symbol ILIKE $6 OR contract.hash ILIKE $6 OR ($12::bigint IS NOT NULL AND series.id = $12))
               AND ($7::text IS NULL OR contract.hash = $7)
               AND ($8::text IS NULL OR contract.symbol = $8)
               AND (
@@ -138,6 +140,7 @@ pub async fn list_series(
         .bind(filter.token_id)
         .bind(limit)
         .bind(offset)
+        .bind(filter.q_id)
         .fetch_all(executor)
         .await?;
 

@@ -14,6 +14,7 @@ pub struct SearchExistence {
     pub chains: bool,
     pub contracts: bool,
     pub organizations: bool,
+    pub platforms: bool,
     pub tokens: bool,
     pub transactions: bool,
 }
@@ -67,6 +68,11 @@ pub async fn search_existence(
     .bind(value)
     .fetch_one(pool)
     .await?;
+    let platforms =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM platforms WHERE name = $1)")
+            .bind(value)
+            .fetch_one(pool)
+            .await?;
     let tokens = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM tokens WHERE lower(symbol) = $1)",
     )
@@ -85,6 +91,7 @@ pub async fn search_existence(
         chains,
         contracts,
         organizations,
+        platforms,
         tokens,
         transactions,
     })
