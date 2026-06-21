@@ -686,7 +686,8 @@ pub(crate) async fn nfts(
     let owner = empty_to_none(query.owner);
     let contract_hash = empty_to_none(query.contract_hash);
     let name = empty_to_none(query.name).map(|value| format!("%{value}%"));
-    let q = empty_to_none(query.q).map(|value| format!("%{value}%"));
+    let q_tokens: Option<Vec<String>> =
+        empty_to_none(query.q).map(|value| value.split_whitespace().map(str::to_owned).collect());
     let symbol = empty_to_none(query.symbol).map(|value| value.to_uppercase());
     let token_id = empty_to_none(query.token_id);
     let series_id = empty_to_none(query.series_id);
@@ -702,7 +703,7 @@ pub(crate) async fn nfts(
         creator: creator.as_deref(),
         contract_hash: contract_hash.as_deref(),
         name: name.as_deref(),
-        q: q.as_deref(),
+        q_tokens: q_tokens.as_deref(),
         symbol: symbol.as_deref(),
         token_id: token_id.as_deref(),
         series_id: series_id.as_deref(),

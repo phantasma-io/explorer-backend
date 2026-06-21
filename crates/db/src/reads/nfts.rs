@@ -42,7 +42,9 @@ pub struct NftFilter<'a> {
     pub creator: Option<&'a str>,
     pub contract_hash: Option<&'a str>,
     pub name: Option<&'a str>,
-    pub q: Option<&'a str>,
+    /// Whitespace-split `q` tokens; every token must match somewhere (C# multi-word
+    /// AND so "Crown 2261" matches "Crown #2261").
+    pub q_tokens: Option<&'a [String]>,
     pub symbol: Option<&'a str>,
     pub token_id: Option<&'a str>,
     pub series_id: Option<&'a str>,
@@ -77,7 +79,25 @@ pub async fn list_nfts(
               AND ($2::text IS NULL OR creator.address = $2)
               AND ($3::text IS NULL OR contract.hash = $3)
               AND ($4::text IS NULL OR nft.name ILIKE $4 OR nft.description ILIKE $4)
-              AND ($5::text IS NULL OR nft.name ILIKE $5 OR nft.description ILIKE $5 OR nft.token_id ILIKE $5 OR contract.symbol ILIKE $5 OR series.name ILIKE $5 OR series.series_id ILIKE $5)
+              AND ($5::text[] IS NULL OR (
+                  SELECT bool_and(
+                      nft.name ILIKE '%' || tok || '%'
+                      OR nft.description ILIKE '%' || tok || '%'
+                      OR nft.token_id = tok
+                      OR nft.token_id ILIKE '%' || tok || '%'
+                      OR contract.symbol ILIKE '%' || tok || '%'
+                      OR series.name ILIKE '%' || tok || '%'
+                      OR series.series_id ILIKE '%' || tok || '%'
+                      OR (length(tok) >= 6 AND contract.hash ILIKE '%' || tok || '%')
+                      OR creator.address = tok
+                      OR EXISTS (
+                          SELECT 1 FROM nft_ownerships o
+                          JOIN addresses oa ON oa.id = o.address_id
+                          WHERE o.nft_id = nft.id AND oa.address = tok AND o.amount > 0
+                      )
+                  )
+                  FROM unnest($5::text[]) AS tok
+              ))
               AND ($6::text IS NULL OR contract.symbol = $6)
               AND ($7::text IS NULL OR nft.token_id = $7)
               AND ($8::text IS NULL OR series.series_id = $8)
@@ -183,7 +203,7 @@ pub async fn list_nfts(
         .bind(filter.creator)
         .bind(filter.contract_hash)
         .bind(filter.name)
-        .bind(filter.q)
+        .bind(filter.q_tokens)
         .bind(filter.symbol)
         .bind(filter.token_id)
         .bind(filter.series_id)
