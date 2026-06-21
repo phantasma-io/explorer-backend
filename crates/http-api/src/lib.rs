@@ -212,6 +212,7 @@ struct BlockListQuery {
     with_events: Option<i32>,
     with_event_data: Option<i32>,
     with_script: Option<i32>,
+    with_nft: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -939,6 +940,7 @@ struct TransactionListQuery {
     with_events: Option<i32>,
     with_event_data: Option<i32>,
     with_script: Option<i32>,
+    with_nft: Option<i32>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }

@@ -372,7 +372,26 @@ pub async fn list_events_by_transaction_ids(
             contract.hash AS raw_contract,
             event.token_id,
             event.payload_json,
-            event.raw_data
+            event.raw_data,
+            CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
+                'description', nft.description, 'name', nft.name,
+                'imageURL', nft.image, 'videoURL', nft.video, 'infoURL', nft.info_url,
+                'rom', nft.rom, 'ram', nft.ram,
+                'mint_date', nft.mint_date_unix_seconds::text,
+                'mint_number', nft.mint_number::text, 'metadata', nft.metadata
+            ) END AS nft_metadata_json,
+            CASE WHEN series.id IS NOT NULL THEN jsonb_build_object(
+                'id', series.id, 'series_id', series.series_id, 'creator', series_creator.address,
+                'created_unix_seconds', series.series_created_unix_seconds,
+                'current_supply', series.current_supply, 'max_supply', series.max_supply,
+                'mode_name', series_mode.mode_name, 'name', series.name,
+                'description', series.description, 'image', series.image,
+                'royalties', series.royalties::text, 'type', series.type,
+                'attr_type_1', series.attr_type_1, 'attr_value_1', series.attr_value_1,
+                'attr_type_2', series.attr_type_2, 'attr_value_2', series.attr_value_2,
+                'attr_type_3', series.attr_type_3, 'attr_value_3', series.attr_value_3,
+                'metadata', series.metadata
+            ) END AS series_json
         FROM events event
         JOIN transactions tx ON tx.id = event.transaction_id
         JOIN blocks block ON block.id = tx.block_id
@@ -380,6 +399,10 @@ pub async fn list_events_by_transaction_ids(
         JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
         LEFT JOIN addresses address ON address.id = event.address_id
         LEFT JOIN contracts contract ON contract.id = event.contract_id
+        LEFT JOIN nfts nft ON nft.id = event.nft_id
+        LEFT JOIN series series ON series.id = nft.series_id
+        LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
+        LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
         WHERE event.transaction_id = ANY($1)
         ORDER BY event.transaction_id ASC, event.event_index ASC
         "#,
