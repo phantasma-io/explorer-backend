@@ -8,19 +8,25 @@
 use crate::*;
 use sqlx::postgres::PgRow;
 
-/// Resolve an address string to its unique id. `addresses.address` is globally
-/// unique, so an address-scoped read can resolve the id once and bind it as an
-/// integer; matching on `address_id` lets the planner use the address indexes
-/// that a string match across a join cannot. Returns `None` for an unknown
-/// address (the caller can then skip the query and return no rows).
+/// Resolve an address string to its unique id, matching the on-chain address OR the
+/// address name (C# parity — `EP.Transactions.cs:276-283` / `EP.Events.cs:440-446`
+/// resolve by `ADDRESS` else `ADDRESS_NAME`, because the frontend's `/address/<name>`
+/// route sends the NAME, not the P2K string). An exact address match wins over a name
+/// match. `addresses.address` is globally unique, so the resolved id can be bound as
+/// an integer; matching on `address_id` lets the planner use the address indexes that
+/// a string match across a join cannot. Returns `None` for an unknown address (the
+/// caller can then skip the query and return no rows).
 pub async fn address_id_by_address(
     executor: impl sqlx::PgExecutor<'_>,
     address: &str,
 ) -> Result<Option<i32>, DbError> {
-    let id = sqlx::query_scalar::<_, i32>("SELECT id FROM addresses WHERE address = $1")
-        .bind(address)
-        .fetch_optional(executor)
-        .await?;
+    let id = sqlx::query_scalar::<_, i32>(
+        "SELECT id FROM addresses WHERE address = $1 OR address_name = $1 \
+         ORDER BY (address = $1) DESC LIMIT 1",
+    )
+    .bind(address)
+    .fetch_optional(executor)
+    .await?;
     Ok(id)
 }
 
