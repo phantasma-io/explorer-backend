@@ -1044,6 +1044,13 @@ struct EventListQuery {
     contract: Option<String>,
     q: Option<String>,
     with_event_data: Option<i32>,
+    with_nsfw: Option<i32>,
+    with_blacklisted: Option<i32>,
+    token_id: Option<String>,
+    block_hash: Option<String>,
+    date_less: Option<String>,
+    date_greater: Option<String>,
+    date_day: Option<String>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }

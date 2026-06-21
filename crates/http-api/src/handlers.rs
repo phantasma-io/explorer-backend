@@ -1512,6 +1512,12 @@ pub(crate) async fn load_events(
     let address = empty_to_none(query.address);
     let contract = empty_to_none(query.contract);
     let q = empty_to_none(query.q);
+    let token_id = empty_to_none(query.token_id);
+    let block_hash = empty_to_none(query.block_hash);
+    let date_less = parse_optional_i64(empty_to_none(query.date_less).as_deref(), "date_less")?;
+    let date_greater =
+        parse_optional_i64(empty_to_none(query.date_greater).as_deref(), "date_greater")?;
+    let date_day = parse_optional_i64(empty_to_none(query.date_day).as_deref(), "date_day")?;
     let order_by_param = empty_to_none(query.order_by);
     let order_by = EventOrderBy::from_api_param(order_by_param.as_deref()).ok_or_else(|| {
         ApiError::BadRequest(format!(
@@ -1528,6 +1534,13 @@ pub(crate) async fn load_events(
         contract: contract.as_deref(),
         q: q.as_deref(),
         event_id: query.event_id,
+        show_nsfw: query.with_nsfw == Some(1),
+        show_blacklisted: query.with_blacklisted == Some(1),
+        token_id: token_id.as_deref(),
+        block_hash: block_hash.as_deref(),
+        date_less,
+        date_greater,
+        date_day,
     };
     let page = EventPage {
         order_by,

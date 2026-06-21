@@ -63,6 +63,15 @@ pub struct EventFilter<'a> {
     pub contract: Option<&'a str>,
     pub q: Option<&'a str>,
     pub event_id: Option<i32>,
+    /// Show NSFW / blacklisted events. Default false → excluded (C# parity: the
+    /// `with_nsfw`/`with_blacklisted` toggles default to 0 = hide).
+    pub show_nsfw: bool,
+    pub show_blacklisted: bool,
+    pub token_id: Option<&'a str>,
+    pub block_hash: Option<&'a str>,
+    pub date_less: Option<i64>,
+    pub date_greater: Option<i64>,
+    pub date_day: Option<i64>,
 }
 
 // Derive the substring (`q_like`) and numeric (`q_height`) forms of the
@@ -123,6 +132,13 @@ pub async fn list_events_global(
           AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
           AND ($11::integer IS NULL OR event.id = $11)
           AND ($12::text IS NULL OR tx.hash ILIKE $12 OR block.hash ILIKE $12 OR block.height = $13 OR event_kind.name ILIKE $12 OR address.address ILIKE $12 OR address.address_name ILIKE $12 OR contract.hash ILIKE $12 OR contract.name ILIKE $12 OR contract.symbol ILIKE $12 OR event.token_id ILIKE $12)
+          AND ($14::bool OR NOT event.nsfw)
+          AND ($15::bool OR NOT event.blacklisted)
+          AND ($16::text IS NULL OR event.token_id = $16)
+          AND ($17::text IS NULL OR block.hash = $17)
+          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
+          AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
+          AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
           AND (
               $8::bigint IS NULL
               OR {column} {op} $8
@@ -147,6 +163,13 @@ pub async fn list_events_global(
         .bind(filter.event_id)
         .bind(q_like.as_deref())
         .bind(q_height)
+        .bind(filter.show_nsfw)
+        .bind(filter.show_blacklisted)
+        .bind(filter.token_id)
+        .bind(filter.block_hash)
+        .bind(filter.date_less)
+        .bind(filter.date_greater)
+        .bind(filter.date_day)
         .fetch_all(executor)
         .await?;
 
@@ -207,6 +230,13 @@ pub async fn list_events_by_address(
           AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
           AND ($11::integer IS NULL OR event.id = $11)
           AND ($12::text IS NULL OR tx.hash ILIKE $12 OR block.hash ILIKE $12 OR block.height = $13 OR event_kind.name ILIKE $12 OR address.address ILIKE $12 OR target_address.address ILIKE $12 OR address.address_name ILIKE $12 OR contract.hash ILIKE $12 OR contract.name ILIKE $12 OR contract.symbol ILIKE $12 OR event.token_id ILIKE $12)
+          AND ($14::bool OR NOT event.nsfw)
+          AND ($15::bool OR NOT event.blacklisted)
+          AND ($16::text IS NULL OR event.token_id = $16)
+          AND ($17::text IS NULL OR block.hash = $17)
+          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
+          AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
+          AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
           AND (
               $8::bigint IS NULL
               OR {column} {op} $8
@@ -231,6 +261,13 @@ pub async fn list_events_by_address(
         .bind(filter.event_id)
         .bind(q_like.as_deref())
         .bind(q_height)
+        .bind(filter.show_nsfw)
+        .bind(filter.show_blacklisted)
+        .bind(filter.token_id)
+        .bind(filter.block_hash)
+        .bind(filter.date_less)
+        .bind(filter.date_greater)
+        .bind(filter.date_day)
         .fetch_all(executor)
         .await?;
 
