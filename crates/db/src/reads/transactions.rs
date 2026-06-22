@@ -651,10 +651,7 @@ pub async fn transaction_neighbors(
         FROM transactions tx
         JOIN blocks block ON block.id = tx.block_id
         WHERE ($1::integer IS NULL OR block.chain_id = $1)
-          AND (
-              tx.timestamp_unix_seconds < $2
-              OR (tx.timestamp_unix_seconds = $2 AND tx.id < $3)
-          )
+          AND (tx.timestamp_unix_seconds, tx.id) < ($2, $3)
         ORDER BY tx.timestamp_unix_seconds DESC, tx.id DESC
         LIMIT 1
         "#,
@@ -672,10 +669,7 @@ pub async fn transaction_neighbors(
         FROM transactions tx
         JOIN blocks block ON block.id = tx.block_id
         WHERE ($1::integer IS NULL OR block.chain_id = $1)
-          AND (
-              tx.timestamp_unix_seconds > $2
-              OR (tx.timestamp_unix_seconds = $2 AND tx.id > $3)
-          )
+          AND (tx.timestamp_unix_seconds, tx.id) > ($2, $3)
         ORDER BY tx.timestamp_unix_seconds ASC, tx.id ASC
         LIMIT 1
         "#,
