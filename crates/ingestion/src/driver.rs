@@ -2113,10 +2113,14 @@ impl BlockIngestionDriver {
                 continue;
             }
             match self.sync_token_supplies_once().await {
-                Ok(token_report) => info!(
+                // Only log when something actually changed, like the other
+                // maintenance tasks — supplies rarely move, so logging every tick
+                // would just spam an idle-tip worker once a minute.
+                Ok(token_report) if token_report.updated_tokens > 0 => info!(
                     "synced token supplies fetched={} updated={}",
                     token_report.fetched_tokens, token_report.updated_tokens
                 ),
+                Ok(_) => {}
                 Err(error) => warn!(%error, "token supply sync failed"),
             }
         }
