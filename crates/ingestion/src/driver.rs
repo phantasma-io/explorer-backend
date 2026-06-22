@@ -8,6 +8,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Notify, watch};
 
+/// Record a per-token NFT metadata fetch failure. A permanent RPC error (e.g.
+/// `getNFT` "ID not found") would otherwise recur every maintenance cycle because
+/// the candidate gate re-selects every NFT whose `chain_api_response` is still
+/// NULL, so negative-cache it (mirrors the series error path). A transient
+/// transport failure — already retried by `with_failover` — is only logged and
+/// left to retry on the next pass so a node outage cannot poison resolvable
+/// tokens.
+fn record_nft_metadata_fetch_failure(
+    upserts: &mut Vec<NftRpcMetadataUpsert>,
+    symbol: &str,
+    token_id: &str,
+    error: &RpcError,
+) {
+    if explorer_rpc::is_transient_rpc_error(error) {
+        warn!(%error, symbol, token_id, "single NFT RPC metadata fetch failed");
+    } else {
+        warn!(
+            %error,
+            symbol, token_id, "single NFT RPC metadata fetch failed; storing error response"
+        );
+        upserts.push(nft_error_to_metadata_upsert(symbol, token_id, error));
+    }
+}
+
 impl BlockIngestionDriver {
     pub fn new(
         rpc: PhantasmaSdkClient,
@@ -1508,11 +1532,11 @@ impl BlockIngestionDriver {
                                     upserts.push(upsert);
                                 }
                             }
-                            Err(error) => warn!(
-                                %error,
-                                symbol,
+                            Err(error) => record_nft_metadata_fetch_failure(
+                                &mut upserts,
+                                &symbol,
                                 token_id,
-                                "single NFT RPC metadata fetch failed"
+                                &error,
                             ),
                         }
                     }
@@ -1531,11 +1555,11 @@ impl BlockIngestionDriver {
                                     upserts.push(upsert);
                                 }
                             }
-                            Err(error) => warn!(
-                                %error,
-                                symbol,
-                                token_id,
-                                "single NFT RPC metadata fetch failed"
+                            Err(error) => record_nft_metadata_fetch_failure(
+                                &mut upserts,
+                                &symbol,
+                                &token_id,
+                                &error,
                             ),
                         }
                     }

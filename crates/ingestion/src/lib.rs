@@ -757,6 +757,43 @@ fn series_result_to_metadata_upsert(
     })
 }
 
+/// A negative-cache sentinel for an NFT whose metadata permanently fails to
+/// resolve on the node (e.g. `getNFT` returns "ID not found"). Mirrors
+/// [`series_error_to_metadata_upsert`]: it writes an error object into
+/// `chain_api_response`, which flips the NULL-`chain_api_response` candidate gate
+/// (`fetch_nft_rpc_metadata_candidates`) so the worker stops re-fetching the same
+/// unresolvable token every cycle. Only used for permanent (non-transient) errors
+/// so a node outage cannot poison a token that would otherwise resolve. All
+/// metadata columns stay `None`, so `apply_nft_rpc_metadata`'s `COALESCE`s leave
+/// any existing values untouched and only the sentinel is written.
+fn nft_error_to_metadata_upsert(
+    symbol: &str,
+    token_id: &str,
+    error: &RpcError,
+) -> NftRpcMetadataUpsert {
+    NftRpcMetadataUpsert {
+        symbol: symbol.to_owned(),
+        token_id: token_id.to_owned(),
+        series_id: None,
+        creator_address: None,
+        mint_number: None,
+        mint_date_unix_seconds: None,
+        rom: None,
+        ram: None,
+        name: None,
+        description: None,
+        image: None,
+        info_url: None,
+        metadata: Value::Object(Map::new()),
+        chain_api_response: serde_json::json!({
+            "error": error.to_string(),
+            "method": "getNFT",
+            "symbol": symbol,
+            "tokenId": token_id
+        }),
+    }
+}
+
 fn series_error_to_metadata_upsert(
     candidate: &SeriesRpcMetadataCandidate,
     error: &RpcError,

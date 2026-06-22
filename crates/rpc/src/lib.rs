@@ -25,7 +25,7 @@ const RPC_RETRY_MAX_DELAY_MS: u64 = 2_000;
 /// connection resets, premature EOF, 5xx — the SDK maps these to `Http`) are
 /// transient; an RPC-level error (`Rpc`, e.g. "ID not found") or a decode error is
 /// permanent and retrying it only wastes time and node load.
-fn is_transient_rpc_error(error: &RpcError) -> bool {
+pub fn is_transient_rpc_error(error: &RpcError) -> bool {
     matches!(error, RpcError::Sdk(PhantasmaError::Http(_)))
 }
 
