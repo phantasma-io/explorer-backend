@@ -95,7 +95,7 @@ fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>) {
 /// Fetches `limit + 1` rows so the API can detect a following page.
 pub async fn list_events_global(
     executor: impl sqlx::PgExecutor<'_>,
-    chain_id: i32,
+    chain_id: Option<i32>,
     chain_name: &str,
     filter: &EventFilter<'_>,
     page: &EventPage,
@@ -110,7 +110,7 @@ pub async fn list_events_global(
             {column}::bigint AS cursor_sort_value,
             event.event_index,
             'legacy'::text AS event_source,
-            $2::text AS chain_name,
+            COALESCE(chain.name, $2::text) AS chain_name,
             event.timestamp_unix_seconds,
             block.hash AS block_hash,
             tx.hash AS transaction_hash,
@@ -147,6 +147,7 @@ pub async fn list_events_global(
         FROM events event
         JOIN transactions tx ON tx.id = event.transaction_id
         JOIN blocks block ON block.id = tx.block_id
+        JOIN chains chain ON chain.id = event.chain_id
         JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
         LEFT JOIN addresses address ON address.id = event.address_id
         LEFT JOIN contracts contract ON contract.id = event.contract_id
@@ -154,7 +155,7 @@ pub async fn list_events_global(
         LEFT JOIN series series ON series.id = nft.series_id
         LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
         LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
-        WHERE event.chain_id = $1
+        WHERE ($1::integer IS NULL OR event.chain_id = $1)
           AND ($3::text IS NULL OR tx.hash = $3)
           AND ($4::bigint IS NULL OR block.height = $4)
           AND ($5::text IS NULL OR event_kind.name = $5)

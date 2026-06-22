@@ -1613,12 +1613,12 @@ pub(crate) async fn load_events(
             None => Vec::new(),
         }
     } else {
-        let chain_id = match chain_filter_id {
-            Some(id) => id,
-            None => resolve_chain_id(state).await?,
-        };
+        // Empty chain ⇒ no chain filter (all chains), matching C# EP.Events (which
+        // leaves chainId NULL when `chain` is empty). Forcing main here dropped
+        // gen1 / non-main events for transaction_hash/block_hash lookups, leaving
+        // legacy transaction pages with an empty narrative and no events.
         let chain_name = chain.as_deref().unwrap_or_else(|| state.chain.as_str());
-        list_events_global(&state.pool, chain_id, chain_name, &filter, &page).await?
+        list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, "event")?;
