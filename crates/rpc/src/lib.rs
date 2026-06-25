@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Failover rounds per RPC call (each round tries every endpoint once). Bounds the
@@ -20,6 +21,15 @@ use thiserror::Error;
 const MAX_RPC_ATTEMPTS: usize = 4;
 const RPC_RETRY_BASE_DELAY_MS: u64 = 250;
 const RPC_RETRY_MAX_DELAY_MS: u64 = 2_000;
+
+/// Block-fetch retry rounds. Block data is the one heavy call — a dense block can take
+/// the node tens of seconds to serialize and transfer — so it gets its own
+/// escalating-timeout path (below) and one extra round over the default.
+const BLOCK_FETCH_MAX_ATTEMPTS: usize = 5;
+/// Absolute ceiling for a single escalated block-fetch attempt, so a wedged node
+/// cannot hold one fetch open arbitrarily long. With the default 30s base the
+/// escalation runs 30/60/120/240/480s, all under this ceiling.
+const BLOCK_FETCH_MAX_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Whether an RPC error is worth retrying. Only transport-level failures (timeouts,
 /// connection resets, premature EOF, 5xx — the SDK maps these to `Http`) are
@@ -37,6 +47,10 @@ pub struct PhantasmaSdkClient {
 struct SdkClientInner {
     endpoints: Vec<SdkEndpoint>,
     next_endpoint: AtomicUsize,
+    /// The configured per-request timeout; the base the block-fetch path doubles per
+    /// attempt. Each endpoint is built with this timeout already, so non-block calls
+    /// use it verbatim.
+    base_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -96,6 +110,7 @@ impl PhantasmaSdkClient {
             inner: Arc::new(SdkClientInner {
                 endpoints,
                 next_endpoint: AtomicUsize::new(0),
+                base_timeout: config.timeout,
             }),
         })
     }
@@ -105,23 +120,77 @@ impl PhantasmaSdkClient {
     /// slot); if the whole round failed with a TRANSIENT error (a transport/timeout
     /// blip) it backs off and retries, up to `MAX_RPC_ATTEMPTS` rounds. A permanent
     /// error (an RPC-level "not found" or a decode error) stops immediately, since
-    /// retrying it only wastes time. Previously the call gave up after one round with
-    /// no retry — a single network blip failed the whole call (the C# client retried
-    /// up to 5 times with backoff). The round-robin start advances each round, so the
+    /// retrying it only wastes time. The round-robin start advances each round, so the
     /// retries also spread across endpoints.
     async fn with_failover<T, F, Fut>(&self, rpc_call: &'static str, call: F) -> Result<T, RpcError>
     where
         F: Fn(SdkEndpoint) -> Fut,
         Fut: std::future::Future<Output = Result<T, RpcError>>,
     {
+        // Default path: every attempt uses the configured (fixed) per-request timeout.
+        self.run_failover(rpc_call, MAX_RPC_ATTEMPTS, false, call)
+            .await
+    }
+
+    /// Failover for the heavy block-data fetch: same retry/backoff/round-robin, but the
+    /// per-attempt request timeout DOUBLES each round (base, 2×, 4×, … capped at
+    /// [`BLOCK_FETCH_MAX_TIMEOUT`]). A dense block the node needs longer than the base
+    /// timeout to serialize and transfer would time out on every fixed-timeout attempt
+    /// and wedge the sync forever; doubling the budget lets a later round absorb it.
+    /// Block fetch is the ONE call worth this; the cheap calls keep the fixed timeout.
+    async fn block_fetch_failover<T, F, Fut>(
+        &self,
+        rpc_call: &'static str,
+        call: F,
+    ) -> Result<T, RpcError>
+    where
+        F: Fn(SdkEndpoint) -> Fut,
+        Fut: std::future::Future<Output = Result<T, RpcError>>,
+    {
+        self.run_failover(rpc_call, BLOCK_FETCH_MAX_ATTEMPTS, true, call)
+            .await
+    }
+
+    /// The per-attempt request timeout for round `attempt`. Fixed at the configured
+    /// base unless `escalate`, in which case it doubles each round (`base << attempt`),
+    /// capped at [`BLOCK_FETCH_MAX_TIMEOUT`]. `None` means "leave the endpoint's baked
+    /// timeout untouched" (the non-escalating path, so behaviour is unchanged there).
+    fn attempt_timeout(&self, attempt: usize, escalate: bool) -> Option<Duration> {
+        if !escalate {
+            return None;
+        }
+        let factor = 1u32.checked_shl(attempt.min(16) as u32).unwrap_or(u32::MAX);
+        Some(
+            self.inner
+                .base_timeout
+                .saturating_mul(factor)
+                .min(BLOCK_FETCH_MAX_TIMEOUT),
+        )
+    }
+
+    async fn run_failover<T, F, Fut>(
+        &self,
+        rpc_call: &'static str,
+        attempts: usize,
+        escalate: bool,
+        call: F,
+    ) -> Result<T, RpcError>
+    where
+        F: Fn(SdkEndpoint) -> Fut,
+        Fut: std::future::Future<Output = Result<T, RpcError>>,
+    {
         let mut last_error: Option<RpcError> = None;
-        for attempt in 0..MAX_RPC_ATTEMPTS {
+        for attempt in 0..attempts {
             if attempt > 0 {
                 let delay_ms =
                     (RPC_RETRY_BASE_DELAY_MS << (attempt - 1)).min(RPC_RETRY_MAX_DELAY_MS);
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            match self.try_endpoints_once(rpc_call, &call).await {
+            let per_attempt_timeout = self.attempt_timeout(attempt, escalate);
+            match self
+                .try_endpoints_once(rpc_call, per_attempt_timeout, &call)
+                .await
+            {
                 Ok(value) => return Ok(value),
                 Err(error) => {
                     let transient = is_transient_rpc_error(&error);
@@ -129,10 +198,13 @@ impl PhantasmaSdkClient {
                     if !transient {
                         break;
                     }
-                    if attempt + 1 < MAX_RPC_ATTEMPTS {
+                    if attempt + 1 < attempts {
                         tracing::warn!(
                             rpc_call,
                             attempt = attempt + 1,
+                            next_timeout_secs = ?self
+                                .attempt_timeout(attempt + 1, escalate)
+                                .map(|t| t.as_secs()),
                             "transient RPC failure across all endpoints; retrying after backoff"
                         );
                     }
@@ -148,6 +220,7 @@ impl PhantasmaSdkClient {
     async fn try_endpoints_once<T, F, Fut>(
         &self,
         rpc_call: &'static str,
+        per_attempt_timeout: Option<Duration>,
         call: &F,
     ) -> Result<T, RpcError>
     where
@@ -162,7 +235,13 @@ impl PhantasmaSdkClient {
             // keeps the future `Send` (the worker spawns these) and avoids the
             // borrow-lifetime gymnastics of handing out `&SdkEndpoint`. Cloning is
             // cheap: the SDK client is internally reference-counted.
-            let endpoint = endpoints[(start + offset) % endpoints.len()].clone();
+            let mut endpoint = endpoints[(start + offset) % endpoints.len()].clone();
+            // Override this attempt's per-request timeout when escalating (block fetch).
+            // `with_timeout` only changes the stored Duration; the reqwest client and its
+            // connection pool are shared by the clone, so this is cheap.
+            if let Some(timeout) = per_attempt_timeout {
+                endpoint.rpc = endpoint.rpc.with_timeout(timeout);
+            }
             let url = endpoint.url.clone();
             match call(endpoint).await {
                 Ok(value) => return Ok(value),
@@ -200,7 +279,7 @@ impl PhantasmaSdkClient {
         chain: &ChainName,
         height: BlockHeight,
     ) -> Result<SdkBlockResult, RpcError> {
-        self.with_failover("get_block_by_height", |endpoint| async move {
+        self.block_fetch_failover("get_block_by_height", |endpoint| async move {
             endpoint
                 .rpc
                 .get_block_by_height(chain.as_str(), height.value())
@@ -216,7 +295,7 @@ impl PhantasmaSdkClient {
         height: BlockHeight,
     ) -> Result<SdkPayload<SdkBlockResult>, RpcError> {
         let response = self
-            .with_failover("get_block_by_height_payload", |endpoint| async move {
+            .block_fetch_failover("get_block_by_height_payload", |endpoint| async move {
                 endpoint
                     .rpc
                     .get_block_by_height_with_raw(chain.as_str(), height.value())
