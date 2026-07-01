@@ -1842,6 +1842,28 @@ impl BlockIngestionDriver {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut maintenance = self.spawn_maintenance_tasks(&lag, &balance_kick, &shutdown_rx);
 
+        // Register the OS shutdown signal listener EXACTLY ONCE, in a dedicated
+        // task that fans the result out through the shutdown watch channel.
+        //
+        // Re-creating `wait_for_shutdown_signal()` inside `select!` on every loop
+        // pass (as this loop used to) is unsound for Ctrl+C: tokio installs a
+        // process-global SIGINT handler on first use, replacing the default
+        // "terminate the process" disposition, and each freshly built future only
+        // observes a signal that arrives while it is actively polled. Dropping and
+        // rebuilding the listener every pass leaves gaps where a Ctrl+C is handled
+        // by neither us nor the (already replaced) default handler, so the worker
+        // stops responding to Ctrl+C. One long-lived listener plus the latched
+        // watch channel (once true, stays true) removes that gap and also stops the
+        // maintenance tasks the moment the signal arrives.
+        {
+            let signal_shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                explorer_runtime::wait_for_shutdown_signal().await;
+                let _ = signal_shutdown_tx.send(true);
+            });
+        }
+        let mut shutdown_signal = shutdown_rx.clone();
+
         let mut ticker = interval(self.settings.poll_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Observability state: count consecutive sync failures (for error-level
@@ -1856,7 +1878,7 @@ impl BlockIngestionDriver {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
-                _ = explorer_runtime::wait_for_shutdown_signal() => {
+                _ = shutdown_signal.changed() => {
                     info!("worker shutdown signal received");
                     break;
                 }
@@ -1864,7 +1886,7 @@ impl BlockIngestionDriver {
 
             let sync_result = tokio::select! {
                 result = self.sync_once() => result,
-                _ = explorer_runtime::wait_for_shutdown_signal() => {
+                _ = shutdown_signal.changed() => {
                     info!("worker shutdown signal received; cancelling current sync batch");
                     break;
                 }
