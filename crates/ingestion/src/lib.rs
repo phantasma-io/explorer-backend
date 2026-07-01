@@ -1264,6 +1264,9 @@ fn event_to_projection(
     };
     let mut contract = payload_contract.clone();
     let mut token_id = None;
+    // ABI event name for self-describing contract events (set in the Custom_V2
+    // branch below); stays None for native kinds, where the kind is the label.
+    let mut event_name = None;
     let mut payload_json = serde_json::json!({
         "event_kind": &event_kind,
         "chain": chain_name,
@@ -1427,6 +1430,13 @@ fn event_to_projection(
         event_kind.as_str(),
         "Custom" | "Custom_V2" | "LeaderboardCreate" | "ValidatorSwitch"
     ) {
+        // Self-describing contract events. The node collapses ABI-declared
+        // contract events (whose on-chain kind byte collides with a native kind,
+        // e.g. marketplace.AuctionCreated on byte 68) to kind "Custom_V2" and
+        // carries the real ABI event name in `name`. Preserve that name so the
+        // API and UI can label the event by its real name; the payload stays
+        // opaque (kept in raw_data, no native decoder is applied).
+        event_name = non_empty_string(&event.name);
     } else {
         payload_json = serde_json::json!({
             "address": &event.address,
@@ -1443,6 +1453,7 @@ fn event_to_projection(
         event_index: event_index_to_i32(block_height, tx_index, EventSource::Legacy, event_index)?
             + 1,
         event_kind,
+        event_name,
         address: Some(address),
         target_address: None,
         contract: Some(contract),
@@ -2787,10 +2798,12 @@ mod tests {
                 SdkEventResult {
                     address: "PADDR".to_owned(),
                     contract: "saturnliquidity".to_owned(),
-                    // C# treats Custom_V2 like Custom: keep the event row but
-                    // leave the payload at InitPayload shape without raw data.
+                    // Self-describing contract event: the node reports kind
+                    // "Custom_V2" and carries the real ABI event name. Keep the
+                    // event row, preserve the name, and leave the payload opaque
+                    // (no "data" key in payload_json; raw bytes go to raw_data).
                     kind: "Custom_V2".to_owned(),
-                    name: "Custom_V2".to_owned(),
+                    name: "AuctionCreated".to_owned(),
                     data: "0103040A63616D706169676E4964030201000406706F6F6C496403020300040D706F6F6C4C6971756964697479030600E876481700".to_owned(),
                 },
                 SdkEventResult {
@@ -2859,6 +2872,8 @@ mod tests {
                     .and_then(|v| v.get("data"))
                     .is_none()
             );
+            // A nameless legacy Custom event echoes its name field verbatim.
+            assert_eq!(events[1].event_name.as_deref(), Some("Custom"));
             assert_eq!(events[2].event_kind, "Custom_V2");
             assert!(
                 events[2]
@@ -2867,6 +2882,12 @@ mod tests {
                     .and_then(|v| v.get("data"))
                     .is_none()
             );
+            // The self-describing contract event keeps its ABI name, distinct
+            // from the "Custom_V2" kind, so the API/UI can label it correctly.
+            assert_eq!(events[2].event_name.as_deref(), Some("AuctionCreated"));
+            // Native decoded kinds carry no separate name (kind is the label).
+            assert!(events[0].event_name.is_none());
+            assert!(events[4].event_name.is_none());
             assert_eq!(events[3].contract.as_deref(), Some("NUAQF"));
             assert_eq!(
                 events[3].token_id.as_deref(),

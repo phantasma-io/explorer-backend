@@ -227,6 +227,9 @@ pub struct EventUpsert {
     pub chain_id: i32,
     pub event_index: i32,
     pub event_kind: String,
+    /// ABI-declared event name for self-describing contract events (kind
+    /// "Custom_V2"); None for native kinds, where the kind itself is the name.
+    pub event_name: Option<String>,
     pub address: Option<String>,
     pub target_address: Option<String>,
     pub contract: Option<String>,

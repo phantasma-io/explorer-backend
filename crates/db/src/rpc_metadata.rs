@@ -1136,6 +1136,7 @@ mod tests {
                 chain_id,
                 event_index: 1,
                 event_kind: "TokenMint".to_owned(),
+                event_name: None,
                 address: Some(owner),
                 target_address: None,
                 contract: Some(symbol.clone()),

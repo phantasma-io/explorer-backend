@@ -368,7 +368,8 @@ CREATE TABLE public.events (
     target_address_id integer,
     payload_format text,
     payload_json jsonb,
-    raw_data text
+    raw_data text,
+    event_name text
 );
 
 

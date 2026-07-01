@@ -223,6 +223,7 @@ pub(crate) async fn insert_block_events(
     let mut payload_format = Vec::new();
     let mut payload_json = Vec::new();
     let mut raw_data = Vec::new();
+    let mut event_name = Vec::new();
     for (_, events) in batches {
         for event in events {
             let kind_id = cache
@@ -263,6 +264,7 @@ pub(crate) async fn insert_block_events(
             payload_format.push(event.payload_format.clone());
             payload_json.push(event.payload_json.as_ref().map(|value| value.to_string()));
             raw_data.push(event.raw_data.clone());
+            event_name.push(event.event_name.clone());
         }
     }
     if event_index.is_empty() {
@@ -288,21 +290,22 @@ pub(crate) async fn insert_block_events(
             target_address_id,
             payload_format,
             payload_json,
-            raw_data
+            raw_data,
+            event_name
         )
         SELECT
             t.timestamp, t.timestamp, t.date, t.event_index, t.token_id, t.burned, t.nsfw,
             t.blacklisted, t.address_id, t.chain_id, t.contract_id, t.transaction_id,
             t.event_kind_id, t.target_address_id, t.payload_format, t.payload_json::jsonb,
-            t.raw_data
+            t.raw_data, t.event_name
         FROM unnest(
             $1::bigint[], $2::bigint[], $3::int[], $4::text[], $5::bool[], $6::bool[], $7::bool[],
             $8::int[], $9::int[], $10::int[], $11::int[], $12::int[], $13::int[], $14::text[],
-            $15::text[], $16::text[]
+            $15::text[], $16::text[], $17::text[]
         ) AS t(
             timestamp, date, event_index, token_id, burned, nsfw, blacklisted, address_id,
             chain_id, contract_id, transaction_id, event_kind_id, target_address_id,
-            payload_format, payload_json, raw_data
+            payload_format, payload_json, raw_data, event_name
         )
         ORDER BY t.transaction_id, t.event_index
         "#,
@@ -323,6 +326,7 @@ pub(crate) async fn insert_block_events(
     .bind(&payload_format)
     .bind(&payload_json)
     .bind(&raw_data)
+    .bind(&event_name)
     .execute(&mut *conn)
     .await?;
 
@@ -530,12 +534,13 @@ pub(crate) async fn upsert_event_cached(
             target_address_id,
             payload_format,
             payload_json,
-            raw_data
+            raw_data,
+            event_name
         )
         VALUES (
             COALESCE($1, nextval(pg_get_serial_sequence('events', 'id'))::integer),
             $2, $3, $4, $5, $6, $7, $8, $9,
-            $10, $11, $12, $13, $14, $15, $16, $17, $18
+            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (id) DO UPDATE SET
             dm_unix_seconds = EXCLUDED.dm_unix_seconds,
@@ -555,7 +560,8 @@ pub(crate) async fn upsert_event_cached(
             target_address_id = EXCLUDED.target_address_id,
             payload_format = EXCLUDED.payload_format,
             payload_json = EXCLUDED.payload_json,
-            raw_data = EXCLUDED.raw_data
+            raw_data = EXCLUDED.raw_data,
+            event_name = EXCLUDED.event_name
         "#,
     )
     .bind(id)
@@ -576,6 +582,7 @@ pub(crate) async fn upsert_event_cached(
     .bind(&event.payload_format)
     .bind(&event.payload_json)
     .bind(&event.raw_data)
+    .bind(&event.event_name)
     .execute(&mut *conn)
     .await?;
 
@@ -1852,6 +1859,7 @@ mod tests {
                 chain_id,
                 event_index: 1,
                 event_kind: "ContractDeploy".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some("entry".to_owned()),
@@ -1878,6 +1886,7 @@ mod tests {
                 chain_id,
                 event_index: 2,
                 event_kind: "ContractUpgrade".to_owned(),
+                event_name: None,
                 address: None,
                 target_address: None,
                 contract: Some("entry".to_owned()),
@@ -2034,6 +2043,7 @@ mod tests {
                 chain_id,
                 event_index: 1,
                 event_kind: "TokenSeriesCreate".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some(nft_symbol.clone()),
@@ -2069,6 +2079,7 @@ mod tests {
                 chain_id,
                 event_index: 2,
                 event_kind: "TokenMint".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some(nft_symbol.clone()),
@@ -2108,6 +2119,7 @@ mod tests {
                 chain_id,
                 event_index: 3,
                 event_kind: "Infusion".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some(nft_symbol.clone()),
@@ -2264,6 +2276,7 @@ mod tests {
                 chain_id,
                 event_index: 1,
                 event_kind: "TokenBurn".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some(burned_symbol.clone()),
@@ -2282,6 +2295,7 @@ mod tests {
                 chain_id,
                 event_index: 2,
                 event_kind: "TokenBurn".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some("KCAL".to_owned()),
@@ -2348,6 +2362,7 @@ mod tests {
                 chain_id,
                 event_index: 1,
                 event_kind: "TokenSend".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some(burned_symbol.clone()),
@@ -2366,6 +2381,7 @@ mod tests {
                 chain_id,
                 event_index: 2,
                 event_kind: "TokenReceive".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some(burned_symbol.clone()),
@@ -2384,6 +2400,7 @@ mod tests {
                 chain_id,
                 event_index: 3,
                 event_kind: "TokenSend".to_owned(),
+                event_name: None,
                 address: Some(owner.clone()),
                 target_address: None,
                 contract: Some("KCAL".to_owned()),
