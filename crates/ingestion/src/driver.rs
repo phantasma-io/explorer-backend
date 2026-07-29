@@ -996,42 +996,82 @@ impl BlockIngestionDriver {
     async fn fetch_balance_accounts(
         &self,
         dirty_addresses: &[DirtyAddress],
-    ) -> Result<Vec<SdkAccountResult>, IngestionError> {
+    ) -> Result<Vec<FetchedBalanceAccount>, IngestionError> {
         if dirty_addresses.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut accounts = Vec::new();
+        // Phase 1: account overviews (name + stake), one getAccountInfos batch
+        // per <=100-address chunk, all read from a single node-side snapshot.
+        // The batch is all-or-nothing — one malformed address rejects the whole
+        // call — so a failed multi-address chunk degrades to per-address calls
+        // and only the offending addresses stay dirty.
+        let mut infos = Vec::with_capacity(dirty_addresses.len());
         for chunk in dirty_addresses.chunks(BALANCE_SYNC_CHUNK_SIZE) {
             let addresses = chunk
                 .iter()
                 .map(|address| address.address.clone())
                 .collect::<Vec<_>>();
 
-            match self
-                .rpc
-                .get_accounts_checked(&addresses, false, false)
-                .await
-            {
-                Ok(chunk_accounts) => accounts.extend(chunk_accounts),
+            match self.rpc.get_account_infos(&addresses, false).await {
+                Ok(chunk_infos) => infos.extend(chunk_infos),
                 Err(error) if addresses.len() > 1 => {
                     warn!(
                         %error,
                         count = addresses.len(),
-                        "batch account balance fetch failed; retrying addresses one by one"
+                        "batch account info fetch failed; retrying addresses one by one"
                     );
                     for address in addresses {
-                        match self.rpc.get_account_checked(&address, false, false).await {
-                            Ok(account) => accounts.push(account),
+                        match self.rpc.get_account_info(&address, false).await {
+                            Ok(info) => infos.push(info),
                             Err(error) => warn!(
                                 %error,
                                 address,
-                                "single account balance fetch failed; keeping address dirty"
+                                "single account info fetch failed; keeping address dirty"
                             ),
                         }
                     }
                 }
                 Err(error) => return Err(error.into()),
+            }
+        }
+
+        // Phase 2: balance rows per address through the paginated endpoints,
+        // with the per-address fan-out bounded so a large dirty batch cannot
+        // flood the node's global concurrency cap. An address whose balance
+        // fetch fails is dropped from the result and stays dirty for the next
+        // pass; the others proceed.
+        let mut accounts = Vec::with_capacity(infos.len());
+        let mut fetches = tokio::task::JoinSet::new();
+        let mut pending = infos.into_iter();
+        loop {
+            while fetches.len() < BALANCE_FETCH_CONCURRENCY {
+                let Some(info) = pending.next() else { break };
+                let rpc = self.rpc.clone();
+                let chain = self.chain.chain.clone();
+                fetches.spawn(async move {
+                    let balances = fetch_address_balances(&rpc, &chain, &info.address).await;
+                    (info, balances)
+                });
+            }
+            let Some(joined) = fetches.join_next().await else {
+                break;
+            };
+            match joined {
+                Ok((info, Ok(balances))) => {
+                    accounts.push(FetchedBalanceAccount { info, balances });
+                }
+                Ok((info, Err(error))) => warn!(
+                    %error,
+                    address = %info.address,
+                    "address balance fetch failed; keeping address dirty"
+                ),
+                // A crashed fetch task (cancellation is never used here) only
+                // loses that one address for this pass.
+                Err(join_error) => warn!(
+                    %join_error,
+                    "address balance fetch task failed; keeping address dirty"
+                ),
             }
         }
 
@@ -1042,7 +1082,7 @@ impl BlockIngestionDriver {
         &self,
         chain_id: i32,
         dirty_addresses: &[DirtyAddress],
-        accounts: Vec<SdkAccountResult>,
+        accounts: Vec<FetchedBalanceAccount>,
     ) -> Result<Vec<DirtyAddress>, IngestionError> {
         if accounts.is_empty() {
             return Ok(Vec::new());
@@ -1063,10 +1103,10 @@ impl BlockIngestionDriver {
         let mut transaction = self.pool.begin().await?;
 
         for account in accounts {
-            let Some(dirty_address) = dirty_by_address.get(account.address.as_str()) else {
+            let Some(dirty_address) = dirty_by_address.get(account.info.address.as_str()) else {
                 continue;
             };
-            let account_upsert = account_result_to_upsert(
+            let account_upsert = account_info_to_upsert(
                 dirty_address.id,
                 &account,
                 soul_decimals,
@@ -1080,7 +1120,7 @@ impl BlockIngestionDriver {
                 updated_dirty_addresses.push((*dirty_address).clone());
             } else {
                 warn!(
-                    address = %account.address,
+                    address = %account.info.address,
                     symbols = ?upsert_result.missing_balance_symbols,
                     "account balance sync returned balances for unknown tokens; keeping address dirty"
                 );
@@ -2353,4 +2393,66 @@ impl BlockIngestionDriver {
             }
         }
     }
+}
+
+/// Assembles the full balance-row set for one address from the paginated
+/// account endpoints: every fungible balance page, then a per-token
+/// `getTokenBalance` for each token surfaced by the owned-tokens index that the
+/// fungible enumeration does not carry — that is, the NFT ownership counts,
+/// whose only remaining source is the single-token balance row (its embedded
+/// `ids` list is ignored). Bounded by construction: pages are capped at 100
+/// rows and the per-token lookups run only for tokens the address actually
+/// holds, so cost scales with the address's real portfolio, never with global
+/// token/NFT growth.
+async fn fetch_address_balances(
+    rpc: &PhantasmaSdkClient,
+    chain: &ChainName,
+    address: &str,
+) -> Result<Vec<explorer_rpc::SdkBalanceResult>, RpcError> {
+    let mut balances = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page = rpc
+            .get_account_fungible_tokens(address, BALANCE_PAGE_SIZE, &cursor, false)
+            .await?;
+        if let Some(rows) = page.result {
+            balances.extend(rows);
+        }
+        match page.cursor {
+            Some(next) if !next.is_empty() => cursor = next,
+            _ => break,
+        }
+    }
+
+    let fungible_symbols = balances
+        .iter()
+        .map(|balance| balance.symbol.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut owned_tokens = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page = rpc
+            .get_account_owned_tokens(address, BALANCE_PAGE_SIZE, &cursor, false)
+            .await?;
+        if let Some(rows) = page.result {
+            owned_tokens.extend(rows);
+        }
+        match page.cursor {
+            Some(next) if !next.is_empty() => cursor = next,
+            _ => break,
+        }
+    }
+
+    for token in owned_tokens {
+        if token.symbol.is_empty() || fungible_symbols.contains(&token.symbol) {
+            continue;
+        }
+        let row = rpc
+            .get_token_balance(address, &token.symbol, chain, false)
+            .await?;
+        balances.push(row);
+    }
+
+    Ok(balances)
 }

@@ -9,8 +9,8 @@ use explorer_db::{
 };
 use explorer_domain::{BlockHeight, ChainName, MAIN_ZERO_STATE_BOUNDARY_HEIGHT};
 use explorer_rpc::{
-    PhantasmaSdkClient, RpcError, SdkAccountResult, SdkBlockResult, SdkContractResult,
-    SdkEventResult, SdkTokenDataResult, SdkTokenPropertyResult, SdkTokenResult,
+    PhantasmaSdkClient, RpcError, SdkAccountInfoResult, SdkBalanceResult, SdkBlockResult,
+    SdkContractResult, SdkEventResult, SdkTokenDataResult, SdkTokenPropertyResult, SdkTokenResult,
     SdkTokenSeriesResult, SdkTransactionResult, decode_block_result,
 };
 use phantasma_sdk::{
@@ -33,6 +33,13 @@ const SPECIAL_RESOLUTION_REFETCH_ATTEMPTS: usize = 25;
 const SPECIAL_RESOLUTION_REFETCH_DELAY_MS: u64 = 50;
 const BALANCE_SYNC_LAG_THRESHOLD: u64 = 50;
 const BALANCE_SYNC_CHUNK_SIZE: usize = 100;
+/// Page size for the cursor-paginated account endpoints; the node bounds it to
+/// 1..100 and rejects anything outside (0 is no longer "unlimited").
+const BALANCE_PAGE_SIZE: u32 = 100;
+/// Bound on the per-address balance-page fan-out, so a 100..700-address dirty
+/// batch cannot open hundreds of concurrent calls against the node's global
+/// concurrency cap.
+const BALANCE_FETCH_CONCURRENCY: usize = 8;
 const STAKE_PROJECTION_INTERVAL_SECONDS: u64 = 30;
 const TOKEN_SUPPLY_SYNC_INTERVAL_SECONDS: u64 = 60;
 const CONTRACT_RPC_METADATA_SYNC_INTERVAL_SECONDS: u64 = 300;
@@ -498,15 +505,28 @@ fn format_token_amount(amount: &str, token_decimals: usize) -> String {
     }
 }
 
-fn account_result_to_upsert(
+/// One dirty address's freshly fetched account state: the lightweight overview
+/// (name + stake from `getAccountInfo(s)`) plus the assembled balance rows —
+/// fungible pages from `getAccountFungibleTokens` and per-token NFT ownership
+/// counts from `getTokenBalance` over the `getAccountOwnedTokens` index.
+#[derive(Debug, Clone)]
+pub(crate) struct FetchedBalanceAccount {
+    pub(crate) info: SdkAccountInfoResult,
+    pub(crate) balances: Vec<SdkBalanceResult>,
+}
+
+fn account_info_to_upsert(
     address_id: i32,
-    account: &SdkAccountResult,
+    account: &FetchedBalanceAccount,
     soul_decimals: i32,
     kcal_decimals: i32,
     now_unix_seconds: i64,
 ) -> AddressAccountUpsert {
-    let staked_amount_raw = normalized_amount_raw(&account.stakes.amount);
-    let unclaimed_amount_raw = normalized_amount_raw(&account.stakes.unclaimed);
+    // The wire key is `stake` here (an object), not the legacy AccountResult's
+    // `stakes`; the SDK models the two endpoints with separate DTOs, so a
+    // mis-map cannot slip through the deserializer.
+    let staked_amount_raw = normalized_amount_raw(&account.info.stake.amount);
+    let unclaimed_amount_raw = normalized_amount_raw(&account.info.stake.unclaimed);
     let soul_balance_raw = account
         .balances
         .iter()
@@ -527,15 +547,13 @@ fn account_result_to_upsert(
         })
         .collect();
     let address_name =
-        non_empty_string(&account.name).filter(|name| !name.eq_ignore_ascii_case("anonymous"));
-    let validator_kind =
-        non_empty_string(&account.validator).unwrap_or_else(|| "Invalid".to_owned());
+        non_empty_string(&account.info.name).filter(|name| !name.eq_ignore_ascii_case("anonymous"));
 
     AddressAccountUpsert {
         address_id,
         address_name,
         name_last_updated_unix_seconds: now_unix_seconds,
-        stake_timestamp: i64::try_from(account.stakes.time).unwrap_or(i64::MAX),
+        stake_timestamp: i64::try_from(account.info.stake.time).unwrap_or(i64::MAX),
         staked_amount: format_token_amount(&staked_amount_raw, decimals_to_usize(soul_decimals)),
         staked_amount_raw,
         unclaimed_amount: format_token_amount(
@@ -544,10 +562,6 @@ fn account_result_to_upsert(
         ),
         unclaimed_amount_raw,
         soul_balance_raw,
-        storage_available: i64::try_from(account.storage.available).unwrap_or(i64::MAX),
-        storage_used: i64::try_from(account.storage.used).unwrap_or(i64::MAX),
-        avatar: non_empty_string(&account.storage.avatar),
-        validator_kind,
         balances,
     }
 }
@@ -2360,40 +2374,65 @@ mod tests {
     }
 
     #[test]
-    fn account_balance_projection_matches_csharp_shape() -> Result<(), Box<dyn std::error::Error>> {
-        let account: SdkAccountResult = serde_json::from_value(serde_json::json!({
+    fn account_balance_projection_reads_the_account_info_stake_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // getAccountInfo carries the staking object under the wire key `stake`
+        // (the legacy getAccount used `stakes` and reserved `stake` for a
+        // deprecated flat scalar); a mis-map would silently zero every stake
+        // and propagate into the Soul-Masters derivation, so the test feeds the
+        // real wire shape through serde rather than building the DTO directly.
+        let info: SdkAccountInfoResult = serde_json::from_value(serde_json::json!({
             "address": "PADDR",
             "name": "anonymous",
-            "validator": "Primary",
-            "stakes": {
+            "stake": {
                 "amount": "5000000000000",
                 "time": 123,
                 "unclaimed": "467"
-            },
-            "storage": {
-                "available": 100,
-                "used": 7,
-                "avatar": "avatar.png"
-            },
-            "balances": [
-                { "chain": "main", "symbol": "SOUL", "amount": "42", "decimals": 8 },
-                { "chain": "main", "symbol": "KCAL", "amount": "467", "decimals": 10 }
-            ]
+            }
         }))?;
+        // Balance rows arrive separately: fungible pages plus a per-token NFT
+        // ownership count (decimals 0, amount = owned items).
+        let balances: Vec<SdkBalanceResult> = serde_json::from_value(serde_json::json!([
+            { "chain": "main", "symbol": "SOUL", "amount": "42", "decimals": 8 },
+            { "chain": "main", "symbol": "KCAL", "amount": "467", "decimals": 10 },
+            { "chain": "main", "symbol": "CROWN", "amount": "20", "decimals": 0 }
+        ]))?;
+        let account = FetchedBalanceAccount { info, balances };
 
-        let projection = account_result_to_upsert(7, &account, 8, 10, 999);
+        let projection = account_info_to_upsert(7, &account, 8, 10, 999);
 
         assert_eq!(projection.address_id, 7);
         assert_eq!(projection.address_name, None);
+        assert_eq!(projection.stake_timestamp, 123);
         assert_eq!(projection.staked_amount, "50000");
         assert_eq!(projection.staked_amount_raw, "5000000000000");
         assert_eq!(projection.unclaimed_amount, "0.0000000467");
         assert_eq!(projection.soul_balance_raw, "42");
-        assert_eq!(projection.storage_available, 100);
-        assert_eq!(projection.storage_used, 7);
-        assert_eq!(projection.validator_kind, "Primary");
-        assert_eq!(projection.balances.len(), 2);
+        assert_eq!(projection.balances.len(), 3);
         assert_eq!(projection.balances[1].amount, "0.0000000467");
+        assert_eq!(projection.balances[2].amount, "20");
+        assert_eq!(projection.balances[2].amount_raw, "20");
+        Ok(())
+    }
+
+    #[test]
+    fn account_balance_projection_keeps_a_real_address_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let info: SdkAccountInfoResult = serde_json::from_value(serde_json::json!({
+            "address": "PADDR",
+            "name": "moneymaker01",
+            "stake": { "amount": "0", "time": 0, "unclaimed": "0" }
+        }))?;
+        let account = FetchedBalanceAccount {
+            info,
+            balances: Vec::new(),
+        };
+
+        let projection = account_info_to_upsert(7, &account, 8, 10, 999);
+
+        assert_eq!(projection.address_name.as_deref(), Some("moneymaker01"));
+        assert_eq!(projection.soul_balance_raw, "0");
+        assert!(projection.balances.is_empty());
         Ok(())
     }
 

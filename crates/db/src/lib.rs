@@ -361,6 +361,10 @@ pub struct AddressBalanceUpsert {
     pub amount_raw: String,
 }
 
+/// The balance-sync projection of one account. Carries only what the new
+/// lightweight account endpoints provide: name, stake and balance rows. The
+/// legacy `validator`/`storage`/`avatar` fields were dead gen2 leftovers the
+/// gen3 RPC hardcoded for every address, and are no longer written.
 #[derive(Debug, Clone)]
 pub struct AddressAccountUpsert {
     pub address_id: i32,
@@ -372,10 +376,6 @@ pub struct AddressAccountUpsert {
     pub unclaimed_amount: String,
     pub unclaimed_amount_raw: String,
     pub soul_balance_raw: String,
-    pub storage_available: i64,
-    pub storage_used: i64,
-    pub avatar: Option<String>,
-    pub validator_kind: String,
     pub balances: Vec<AddressBalanceUpsert>,
 }
 
@@ -833,8 +833,6 @@ pub async fn upsert_address_account(
     chain_id: i32,
     account: &AddressAccountUpsert,
 ) -> Result<AddressAccountUpsertResult, DbError> {
-    let validator_kind_id = upsert_address_validator_kind_id(conn, &account.validator_kind).await?;
-
     sqlx::query(
         r#"
         UPDATE addresses
@@ -848,13 +846,9 @@ pub async fn upsert_address_account(
             unclaimed_amount_raw = $8,
             total_soul_amount =
                 COALESCE(NULLIF($9, '')::numeric, 0)
-                + COALESCE(NULLIF($6, '')::numeric, 0),
-            storage_available = $10,
-            storage_used = $11,
-            avatar = $12,
-            address_validator_kind_id = $13
+                + COALESCE(NULLIF($6, '')::numeric, 0)
         WHERE id = $1
-          AND chain_id = $14
+          AND chain_id = $10
         "#,
     )
     .bind(account.address_id)
@@ -866,10 +860,6 @@ pub async fn upsert_address_account(
     .bind(&account.unclaimed_amount)
     .bind(&account.unclaimed_amount_raw)
     .bind(&account.soul_balance_raw)
-    .bind(account.storage_available)
-    .bind(account.storage_used)
-    .bind(&account.avatar)
-    .bind(validator_kind_id)
     .bind(chain_id)
     .execute(&mut *conn)
     .await?;
@@ -1477,40 +1467,6 @@ async fn replace_address_balances(
     .await?;
 
     Ok(missing_symbols)
-}
-
-async fn upsert_address_validator_kind_id(
-    conn: &mut PgConnection,
-    name: &str,
-) -> Result<i32, DbError> {
-    if let Some(id) = sqlx::query_scalar::<_, i32>(
-        r#"
-        SELECT id
-        FROM address_validator_kinds
-        WHERE name = $1
-        ORDER BY id
-        LIMIT 1
-        "#,
-    )
-    .bind(name)
-    .fetch_optional(&mut *conn)
-    .await?
-    {
-        return Ok(id);
-    }
-
-    let id = sqlx::query_scalar::<_, i32>(
-        r#"
-        INSERT INTO address_validator_kinds (name)
-        VALUES ($1)
-        RETURNING id
-        "#,
-    )
-    .bind(name)
-    .fetch_one(&mut *conn)
-    .await?;
-
-    Ok(id)
 }
 
 pub async fn upsert_contract_id(

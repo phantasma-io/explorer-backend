@@ -1,12 +1,12 @@
 use explorer_config::RpcConfig;
 use explorer_domain::{BlockHeight, ChainName};
 pub use phantasma_sdk::{
-    AccountResult as SdkAccountResult, BlockResult as SdkBlockResult,
-    ContractResult as SdkContractResult, CursorPaginatedResult as SdkCursorPaginatedResult,
-    EventExResult as SdkEventExResult, EventResult as SdkEventResult,
-    TokenDataResult as SdkTokenDataResult, TokenPropertyResult as SdkTokenPropertyResult,
-    TokenResult as SdkTokenResult, TokenSeriesResult as SdkTokenSeriesResult,
-    TransactionResult as SdkTransactionResult,
+    AccountInfoResult as SdkAccountInfoResult, BalanceResult as SdkBalanceResult,
+    BlockResult as SdkBlockResult, ContractResult as SdkContractResult,
+    CursorPaginatedResult as SdkCursorPaginatedResult, EventExResult as SdkEventExResult,
+    EventResult as SdkEventResult, TokenDataResult as SdkTokenDataResult,
+    TokenPropertyResult as SdkTokenPropertyResult, TokenResult as SdkTokenResult,
+    TokenSeriesResult as SdkTokenSeriesResult, TransactionResult as SdkTransactionResult,
 };
 use phantasma_sdk::{PhantasmaError, PhantasmaRpc, RpcCallResult};
 use serde::de::DeserializeOwned;
@@ -317,22 +317,25 @@ impl PhantasmaSdkClient {
         .await
     }
 
-    pub async fn get_account_checked(
+    /// Lightweight account overview (name + stake) for one address. Cost is
+    /// independent of the address's holdings; balances travel separately through
+    /// the cursor-paginated account endpoints below.
+    ///
+    /// `check_address_reserved_byte` is passed explicitly (the node defaults it
+    /// to true) so the balance sync keeps the lenient interpretation the legacy
+    /// path used for pre-gen3 addresses.
+    pub async fn get_account_info(
         &self,
         address: &str,
-        extended: bool,
         check_address_reserved_byte: bool,
-    ) -> Result<SdkAccountResult, RpcError> {
-        self.with_failover("getAccount", |endpoint| async move {
+    ) -> Result<SdkAccountInfoResult, RpcError> {
+        self.with_failover("get_account_info", |endpoint| async move {
             endpoint
                 .rpc
-                .call(
-                    "getAccount",
-                    vec![
-                        json!(address),
-                        json!(extended),
-                        json!(check_address_reserved_byte),
-                    ],
+                .get_account_info_with_address_type(
+                    address,
+                    check_address_reserved_byte,
+                    "Phantasma",
                 )
                 .await
                 .map_err(RpcError::Sdk)
@@ -340,27 +343,22 @@ impl PhantasmaSdkClient {
         .await
     }
 
-    pub async fn get_accounts_checked(
+    /// Batch account overview for up to 100 addresses: one call, one state
+    /// snapshot, results in request order. The batch is all-or-nothing — one
+    /// malformed address rejects the whole request, so callers keep a
+    /// per-address fallback for degraded chunks.
+    pub async fn get_account_infos(
         &self,
         addresses: &[String],
-        extended: bool,
         check_address_reserved_byte: bool,
-    ) -> Result<Vec<SdkAccountResult>, RpcError> {
-        let account_text = addresses.join(",");
-        // Borrow as &str so the multi-attempt `Fn` closure can capture it by Copy
-        // (an owned String would be moved on the first attempt and unavailable on a
-        // failover retry).
-        let account_text = account_text.as_str();
-        self.with_failover("getAccounts", |endpoint| async move {
+    ) -> Result<Vec<SdkAccountInfoResult>, RpcError> {
+        self.with_failover("get_account_infos", |endpoint| async move {
             endpoint
                 .rpc
-                .call(
-                    "getAccounts",
-                    vec![
-                        json!(account_text),
-                        json!(extended),
-                        json!(check_address_reserved_byte),
-                    ],
+                .get_account_infos_with_address_type(
+                    addresses,
+                    check_address_reserved_byte,
+                    "Phantasma",
                 )
                 .await
                 .map_err(RpcError::Sdk)
@@ -368,15 +366,82 @@ impl PhantasmaSdkClient {
         .await
     }
 
-    pub async fn get_token(
+    /// One page of an address's fungible-token balances. Empty `symbol` plus
+    /// `carbon_token_id` 0 enumerates every token; `page_size` must stay within
+    /// the node's 1..100 bound and `cursor` is the previous page's cursor (empty
+    /// for the first page).
+    pub async fn get_account_fungible_tokens(
         &self,
-        symbol: &str,
-        extended: bool,
-    ) -> Result<SdkTokenResult, RpcError> {
-        self.with_failover("get_token", |endpoint| async move {
+        address: &str,
+        page_size: u32,
+        cursor: &str,
+        check_address_reserved_byte: bool,
+    ) -> Result<SdkCursorPaginatedResult<Vec<SdkBalanceResult>>, RpcError> {
+        self.with_failover("get_account_fungible_tokens", |endpoint| async move {
             endpoint
                 .rpc
-                .get_token(symbol, extended)
+                .get_account_fungible_tokens(
+                    address,
+                    "",
+                    0,
+                    page_size,
+                    cursor,
+                    check_address_reserved_byte,
+                )
+                .await
+                .map_err(RpcError::Sdk)
+        })
+        .await
+    }
+
+    /// One page of the tokens an address holds at least one item of, from the
+    /// node's owner->(token,series) index. Used to discover which NFT tokens
+    /// need a per-token balance lookup — getAccountFungibleTokens deliberately
+    /// excludes non-fungibles.
+    pub async fn get_account_owned_tokens(
+        &self,
+        address: &str,
+        page_size: u32,
+        cursor: &str,
+        check_address_reserved_byte: bool,
+    ) -> Result<SdkCursorPaginatedResult<Vec<SdkTokenResult>>, RpcError> {
+        self.with_failover("get_account_owned_tokens", |endpoint| async move {
+            endpoint
+                .rpc
+                .get_account_owned_tokens(
+                    address,
+                    "",
+                    0,
+                    page_size,
+                    cursor,
+                    check_address_reserved_byte,
+                )
+                .await
+                .map_err(RpcError::Sdk)
+        })
+        .await
+    }
+
+    /// Single (address, token) balance row. For a non-fungible token `amount`
+    /// carries the owned-item count — the only remaining source for it, since
+    /// the paginated fungible endpoint excludes NFTs. The embedded `ids` list
+    /// (server-capped at 10 000) is never read.
+    pub async fn get_token_balance(
+        &self,
+        address: &str,
+        symbol: &str,
+        chain: &ChainName,
+        check_address_reserved_byte: bool,
+    ) -> Result<SdkBalanceResult, RpcError> {
+        self.with_failover("get_token_balance", |endpoint| async move {
+            endpoint
+                .rpc
+                .get_token_balance_checked(
+                    address,
+                    symbol,
+                    chain.as_str(),
+                    check_address_reserved_byte,
+                )
                 .await
                 .map_err(RpcError::Sdk)
         })
@@ -427,48 +492,6 @@ impl PhantasmaSdkClient {
         .await
     }
 
-    pub async fn get_token_series_by_ids(
-        &self,
-        symbol: &str,
-        carbon_token_id: u64,
-        series_id: &str,
-        carbon_series_id: u64,
-    ) -> Result<SdkTokenSeriesResult, RpcError> {
-        self.with_failover("getTokenSeriesById", |endpoint| async move {
-            endpoint
-                .rpc
-                .call(
-                    "getTokenSeriesById",
-                    vec![
-                        json!(symbol),
-                        json!(carbon_token_id.to_string()),
-                        json!(series_id),
-                        json!(carbon_series_id.to_string()),
-                    ],
-                )
-                .await
-                .map_err(RpcError::Sdk)
-        })
-        .await
-    }
-
-    pub async fn get_token_series(
-        &self,
-        symbol: &str,
-        carbon_token_id: u64,
-        page_size: u32,
-        cursor: &str,
-    ) -> Result<SdkCursorPaginatedResult<Vec<SdkTokenSeriesResult>>, RpcError> {
-        self.with_failover("get_token_series", |endpoint| async move {
-            endpoint
-                .rpc
-                .get_token_series(symbol, carbon_token_id, page_size, cursor)
-                .await
-                .map_err(RpcError::Sdk)
-        })
-        .await
-    }
-
     pub async fn get_nft(
         &self,
         symbol: &str,
@@ -479,22 +502,6 @@ impl PhantasmaSdkClient {
             endpoint
                 .rpc
                 .get_nft(symbol, token_id, extended)
-                .await
-                .map_err(RpcError::Sdk)
-        })
-        .await
-    }
-
-    pub async fn get_nfts_text(
-        &self,
-        symbol: &str,
-        token_ids: &str,
-        extended: bool,
-    ) -> Result<Vec<SdkTokenDataResult>, RpcError> {
-        self.with_failover("get_nfts_text", |endpoint| async move {
-            endpoint
-                .rpc
-                .get_nfts_text(symbol, token_ids, extended)
                 .await
                 .map_err(RpcError::Sdk)
         })
@@ -515,22 +522,6 @@ impl PhantasmaSdkClient {
                 .map_err(RpcError::Sdk)
         })
         .await
-    }
-
-    pub async fn get_transaction_payload(
-        &self,
-        hash: &str,
-    ) -> Result<SdkPayload<SdkTransactionResult>, RpcError> {
-        let response = self
-            .with_failover("get_transaction_payload", |endpoint| async move {
-                endpoint
-                    .rpc
-                    .get_transaction_with_raw(hash)
-                    .await
-                    .map_err(RpcError::Sdk)
-            })
-            .await?;
-        Ok(payload_from_sdk_response(response))
     }
 
     pub fn endpoint_urls(&self) -> Vec<String> {
