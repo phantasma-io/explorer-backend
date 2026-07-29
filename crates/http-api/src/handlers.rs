@@ -1227,6 +1227,7 @@ pub(crate) async fn block_by_height(
         protocol: row.get("protocol"),
         chain_address: row.get("chain_address"),
         validator_address: row.get("validator_address"),
+        producer_address: row.get("producer_address"),
         date: Some(row.get::<i64, _>("timestamp_unix_seconds").to_string()),
         reward: row.get("reward"),
         transaction_count: row.get("transaction_count"),

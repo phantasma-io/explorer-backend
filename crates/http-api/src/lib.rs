@@ -187,6 +187,10 @@ struct BlockResponse {
     protocol: Option<i32>,
     chain_address: Option<String>,
     validator_address: Option<String>,
+    /// Gas-model-v2 fee-payout identity; absent (not null) on pre-v2 blocks so
+    /// historical block responses stay byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    producer_address: Option<String>,
     date: Option<String>,
     reward: Option<String>,
     transaction_count: i32,

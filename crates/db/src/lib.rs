@@ -139,6 +139,10 @@ pub struct BlockUpsert {
     pub protocol: Option<i32>,
     pub chain_address: Option<String>,
     pub validator_address: Option<String>,
+    /// Gas-model-v2 consensus-covered fee-payout identity; None for pre-v2
+    /// blocks and the flip block itself. Not defaulted to the validator: the
+    /// two coincide today but are distinct on the wire by design.
+    pub producer_address: Option<String>,
     pub timestamp_unix_seconds: i64,
     pub reward: Option<String>,
 }
@@ -156,6 +160,8 @@ pub struct BlockRecord {
     pub chain_address: Option<String>,
     pub validator_address_id: i32,
     pub validator_address: Option<String>,
+    pub producer_address_id: Option<i32>,
+    pub producer_address: Option<String>,
     pub timestamp_unix_seconds: i64,
     pub reward: Option<String>,
 }
@@ -670,6 +676,14 @@ pub async fn mark_block_addresses_dirty(
             SELECT validator_address_id AS address_id
             FROM blocks
             WHERE id = $1
+            UNION
+            -- Under gas model v2 the producer is credited a share of every gas
+            -- bill with no event, so without this its balance never refreshes
+            -- once the payout address stops coinciding with the validator.
+            SELECT producer_address_id AS address_id
+            FROM blocks
+            WHERE id = $1
+              AND producer_address_id IS NOT NULL
             UNION
             SELECT sender_id AS address_id
             FROM transactions
@@ -1591,6 +1605,12 @@ pub async fn upsert_block(
     let validator_address = block.validator_address.as_deref().unwrap_or("NULL");
     let chain_address_id = upsert_address_id(conn, chain_id, chain_address).await?;
     let validator_address_id = upsert_address_id(conn, chain_id, validator_address).await?;
+    // Resolved only when present — never through the "NULL" sentinel used for
+    // chain/validator, or every pre-v2 block would gain a bogus address link.
+    let producer_address_id = match block.producer_address.as_deref() {
+        Some(producer_address) => Some(upsert_address_id(conn, chain_id, producer_address).await?),
+        None => None,
+    };
     let height = block_height_to_i64(block.height)?;
 
     let id = if let Some(id) = sqlx::query_scalar::<_, i32>(
@@ -1613,8 +1633,9 @@ pub async fn upsert_block(
                 protocol = $4,
                 chain_address_id = $5,
                 validator_address_id = $6,
-                timestamp_unix_seconds = $7,
-                reward = $8
+                producer_address_id = $7,
+                timestamp_unix_seconds = $8,
+                reward = $9
             WHERE id = $1
             "#,
         )
@@ -1624,6 +1645,7 @@ pub async fn upsert_block(
         .bind(block.protocol.unwrap_or_default())
         .bind(chain_address_id)
         .bind(validator_address_id)
+        .bind(producer_address_id)
         .bind(block.timestamp_unix_seconds)
         .bind(&block.reward)
         .execute(&mut *conn)
@@ -1641,9 +1663,10 @@ pub async fn upsert_block(
                 protocol,
                 chain_address_id,
                 validator_address_id,
+                producer_address_id,
                 reward
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id
             "#,
         )
@@ -1655,6 +1678,7 @@ pub async fn upsert_block(
         .bind(block.protocol.unwrap_or_default())
         .bind(chain_address_id)
         .bind(validator_address_id)
+        .bind(producer_address_id)
         .bind(&block.reward)
         .fetch_one(&mut *conn)
         .await?
@@ -1672,6 +1696,8 @@ pub async fn upsert_block(
         chain_address: Some(chain_address.to_owned()),
         validator_address_id,
         validator_address: Some(validator_address.to_owned()),
+        producer_address_id,
+        producer_address: block.producer_address,
         timestamp_unix_seconds: block.timestamp_unix_seconds,
         reward: block.reward,
     })

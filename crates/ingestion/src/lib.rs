@@ -343,6 +343,7 @@ fn block_result_to_projection(
         })?),
         chain_address: non_empty_string(&block.chain_address),
         validator_address: non_empty_string(&block.validator_address),
+        producer_address: block.producer_address.as_deref().and_then(non_empty_string),
         timestamp_unix_seconds: i64::try_from(block.timestamp).map_err(|_| {
             IngestionError::BlockFieldOutOfRange {
                 height: height.value(),
@@ -2317,9 +2318,35 @@ mod tests {
                 hash,
                 previous_hash: Some(previous_hash),
                 protocol: Some(18),
+                // Pre-v2 blocks carry no producerAddress on the wire; the
+                // projection must leave it None, never default it.
+                producer_address: None,
                 ..
             }) if hash == "ABC" && previous_hash == "PREV"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn projects_the_gas_model_v2_producer_address() -> Result<(), Box<dyn std::error::Error>> {
+        // Post-flip blocks expose the consensus-covered fee-payout identity as
+        // producerAddress. It must survive the SDK decode + projection intact.
+        let block = decode_block_result(serde_json::json!({
+            "hash": "ABC",
+            "previousHash": "PREV",
+            "protocol": 18,
+            "chainAddress": "PCHAIN",
+            "validatorAddress": "PVALIDATOR",
+            "producerAddress": "PPRODUCER",
+            "timestamp": 123456,
+            "reward": "0",
+            "txs": []
+        }))?;
+
+        let projection =
+            block_result_to_projection(&ChainName::new("main")?, BlockHeight::new(42), &block)?;
+
+        assert_eq!(projection.producer_address.as_deref(), Some("PPRODUCER"));
         Ok(())
     }
 
@@ -2594,6 +2621,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1743530760,
             reward: None,
         };
@@ -2673,6 +2702,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1767146140,
             reward: None,
         };
@@ -2828,6 +2859,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1767146140,
             reward: None,
         };
@@ -2984,6 +3017,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1743530760,
             reward: None,
         };
@@ -3177,6 +3212,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1_743_530_760,
             reward: None,
         };
@@ -3269,6 +3306,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1_743_530_760,
             reward: None,
         };
@@ -3434,6 +3473,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1767146140,
             reward: None,
         };
@@ -3538,6 +3579,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1_767_146_140,
             reward: None,
         };
@@ -3688,6 +3731,8 @@ mod tests {
             chain_address: None,
             validator_address_id: 1,
             validator_address: None,
+            producer_address_id: None,
+            producer_address: None,
             timestamp_unix_seconds: 1767146140,
             reward: None,
         };

@@ -77,6 +77,7 @@ pub async fn list_blocks(
             block.protocol,
             chain_address.address AS chain_address,
             validator_address.address AS validator_address,
+            producer_address.address AS producer_address,
             block.timestamp_unix_seconds,
             block.reward,
             (
@@ -87,6 +88,7 @@ pub async fn list_blocks(
         FROM blocks block
         LEFT JOIN addresses chain_address ON chain_address.id = block.chain_address_id
         LEFT JOIN addresses validator_address ON validator_address.id = block.validator_address_id
+        LEFT JOIN addresses producer_address ON producer_address.id = block.producer_address_id
         WHERE block.chain_id = $1
           AND ($2::text IS NULL OR block.hash = $2 OR block.height = $3)
           AND ($4::text IS NULL OR block.hash = $4)
@@ -136,6 +138,7 @@ pub async fn block_detail(
             block.protocol,
             chain_address.address AS chain_address,
             validator_address.address AS validator_address,
+            producer_address.address AS producer_address,
             block.timestamp_unix_seconds,
             block.reward,
             (
@@ -146,6 +149,7 @@ pub async fn block_detail(
         FROM blocks block
         LEFT JOIN addresses chain_address ON chain_address.id = block.chain_address_id
         LEFT JOIN addresses validator_address ON validator_address.id = block.validator_address_id
+        LEFT JOIN addresses producer_address ON producer_address.id = block.producer_address_id
         WHERE block.chain_id = $1
           AND (
               ($2::bigint IS NOT NULL AND block.height = $2)
@@ -160,4 +164,92 @@ pub async fn block_detail(
     .await?;
 
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    // Round-trip for the gas-model-v2 producer address: a block upserted with a
+    // producer must expose it through the detail read (joined to the addresses
+    // dimension), a block without one must stay NULL — never the "NULL"
+    // sentinel row — and the producer must be balance-dirtied even though its
+    // fee credit emits no event. Runs inside a rolled-back transaction.
+    #[tokio::test]
+    async fn block_detail_exposes_and_dirties_the_producer_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let producer = format!("PTESTPRODUCER{suffix}");
+
+        let with_producer = upsert_block(
+            &mut tx,
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_200_000),
+                hash: format!("TESTPRODBLOCKA{suffix}"),
+                previous_hash: None,
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: Some(producer.clone()),
+                timestamp_unix_seconds: 1_800_200_000,
+                reward: None,
+            },
+        )
+        .await?;
+        let without_producer = upsert_block(
+            &mut tx,
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_200_001),
+                hash: format!("TESTPRODBLOCKB{suffix}"),
+                previous_hash: None,
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: 1_800_200_001,
+                reward: None,
+            },
+        )
+        .await?;
+
+        let row = block_detail(&mut *tx, chain_id, Some(with_producer.height), None)
+            .await?
+            .ok_or("block with producer not found")?;
+        assert_eq!(
+            row.get::<Option<String>, _>("producer_address").as_deref(),
+            Some(producer.as_str())
+        );
+
+        let row = block_detail(&mut *tx, chain_id, Some(without_producer.height), None)
+            .await?
+            .ok_or("block without producer not found")?;
+        assert_eq!(row.get::<Option<String>, _>("producer_address"), None);
+
+        mark_block_addresses_dirty(&mut tx, with_producer.id, BlockHeight::new(9_900_200_000))
+            .await?;
+        let dirty_block = sqlx::query_scalar::<_, i64>(
+            "SELECT balance_dirty_block FROM addresses WHERE chain_id = $1 AND address = $2",
+        )
+        .bind(chain_id)
+        .bind(&producer)
+        .fetch_one(&mut *tx)
+        .await?;
+        assert_eq!(dirty_block, 9_900_200_000);
+
+        Ok(())
+    }
 }

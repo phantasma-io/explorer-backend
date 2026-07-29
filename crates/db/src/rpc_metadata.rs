@@ -1070,6 +1070,7 @@ mod tests {
                 protocol: Some(19),
                 chain_address: Some("NULL".to_owned()),
                 validator_address: Some("NULL".to_owned()),
+                producer_address: None,
                 timestamp_unix_seconds: 1_800_200_000,
                 reward: None,
             },

@@ -208,6 +208,7 @@ CREATE TABLE public.blocks (
     protocol integer NOT NULL,
     chain_address_id integer NOT NULL,
     validator_address_id integer NOT NULL,
+    producer_address_id integer,
     reward text
 );
 
@@ -1635,6 +1636,13 @@ CREATE INDEX "IX_Blocks_ValidatorAddressId" ON public.blocks USING btree (valida
 
 
 --
+-- Name: IX_Blocks_ProducerAddressId; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IX_Blocks_ProducerAddressId" ON public.blocks USING btree (producer_address_id);
+
+
+--
 -- Name: IX_Chains_NAME; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2356,6 +2364,14 @@ ALTER TABLE ONLY public.blocks
 
 ALTER TABLE ONLY public.blocks
     ADD CONSTRAINT "FK_Blocks_Addresses_ValidatorAddressId" FOREIGN KEY (validator_address_id) REFERENCES public.addresses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: blocks FK_Blocks_Addresses_ProducerAddressId; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.blocks
+    ADD CONSTRAINT "FK_Blocks_Addresses_ProducerAddressId" FOREIGN KEY (producer_address_id) REFERENCES public.addresses(id) ON DELETE CASCADE;
 
 
 --
