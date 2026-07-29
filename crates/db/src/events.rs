@@ -969,16 +969,12 @@ async fn upsert_series_for_transaction(
                 chain_id,
                 name_last_updated_unix_seconds,
                 stake_timestamp,
-                storage_available,
-                storage_used,
                 total_soul_amount,
                 balance_dirty_block
             )
             SELECT DISTINCT
                 owner_address,
                 chain_id,
-                0,
-                0,
                 0,
                 0,
                 0,

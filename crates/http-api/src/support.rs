@@ -104,16 +104,9 @@ pub(crate) fn token_from_value(value: Option<Value>) -> Result<Option<TokenRespo
 
 pub(crate) fn address_from_row(
     row: &PgRow,
-    with_storage: bool,
     with_stakes: bool,
     with_balance: bool,
 ) -> Result<AddressResponse, ApiError> {
-    let storage_available = row.get::<i64, _>("storage_available");
-    let storage = (with_storage && storage_available > 0).then(|| AddressStorageResponse {
-        available: storage_available,
-        used: row.get("storage_used"),
-        avatar: row.get("avatar"),
-    });
     let stake = row.get::<Option<String>, _>("staked_amount");
     let unclaimed = row.get::<Option<String>, _>("unclaimed_amount");
     let has_stakes = stake.as_deref().is_some_and(|value| !value.is_empty())
@@ -128,12 +121,10 @@ pub(crate) fn address_from_row(
     Ok(AddressResponse {
         address: row.get("address"),
         address_name: row.get("address_name"),
-        validator_kind: row.get("validator_kind"),
         stake,
         stake_raw: row.get("staked_amount_raw"),
         unclaimed,
         unclaimed_raw: row.get("unclaimed_amount_raw"),
-        storage,
         stakes,
         balances: if with_balance {
             json_vec(row.get("balances_json"))?.or(Some(Vec::new()))
@@ -149,12 +140,10 @@ pub(crate) fn contract_from_row(row: &PgRow) -> Result<ContractResponse, ApiErro
         .map(|address| AddressResponse {
             address: Some(address),
             address_name: row.get("address_name"),
-            validator_kind: None,
             stake: None,
             stake_raw: None,
             unclaimed: None,
             unclaimed_raw: None,
-            storage: None,
             stakes: None,
             balances: None,
         });
@@ -299,12 +288,10 @@ pub(crate) fn organization_from_row(
         address: (with_address && row.address.is_some()).then(|| AddressResponse {
             address: row.address.clone(),
             address_name: row.address_name.clone(),
-            validator_kind: None,
             stake: None,
             stake_raw: None,
             unclaimed: None,
             unclaimed_raw: None,
-            storage: None,
             stakes: None,
             balances: None,
         }),

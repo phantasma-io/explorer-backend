@@ -72,12 +72,10 @@ pub async fn apply_contract_rpc_metadata(
                 chain_id,
                 name_last_updated_unix_seconds,
                 stake_timestamp,
-                storage_available,
-                storage_used,
                 total_soul_amount,
                 balance_dirty_block
             )
-            SELECT $2, $6, 0, 0, 0, 0, 0, 0
+            SELECT $2, $6, 0, 0, 0, 0
             WHERE NULLIF(BTRIM($2), '') IS NOT NULL
               AND BTRIM($2) <> 'NULL'
             ON CONFLICT (chain_id, address) DO UPDATE SET
@@ -475,16 +473,12 @@ pub async fn apply_nft_rpc_metadata(
                 chain_id,
                 name_last_updated_unix_seconds,
                 stake_timestamp,
-                storage_available,
-                storage_used,
                 total_soul_amount,
                 balance_dirty_block
             )
             SELECT DISTINCT
                 creator_address,
                 chain_id,
-                0,
-                0,
                 0,
                 0,
                 0,
@@ -829,16 +823,12 @@ pub async fn apply_series_rpc_metadata(
                 chain_id,
                 name_last_updated_unix_seconds,
                 stake_timestamp,
-                storage_available,
-                storage_used,
                 total_soul_amount,
                 balance_dirty_block
             )
             SELECT DISTINCT
                 creator_address,
                 chain_id,
-                0,
-                0,
                 0,
                 0,
                 0,

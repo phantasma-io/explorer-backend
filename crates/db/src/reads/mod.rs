@@ -78,6 +78,3 @@ pub use tokens::*;
 
 mod transactions;
 pub use transactions::*;
-
-mod validator_kinds;
-pub use validator_kinds::*;

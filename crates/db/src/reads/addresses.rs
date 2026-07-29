@@ -79,7 +79,6 @@ pub struct AddressFilter<'a> {
     pub address_partial: Option<&'a str>,
     pub symbol: &'a str,
     pub organization_name: Option<&'a str>,
-    pub validator_kind: Option<&'a str>,
     pub with_balance: bool,
 }
 
@@ -130,37 +129,24 @@ pub async fn list_addresses(
                         AND org.name = $6
                   )
               )
-              AND (
-                  $7::text IS NULL
-                  OR EXISTS (
-                      SELECT 1
-                      FROM address_validator_kinds validator_kind
-                      WHERE validator_kind.id = address.address_validator_kind_id
-                        AND validator_kind.name = $7
-                  )
-              )
         ),
         page AS MATERIALIZED (
             SELECT base.id, base.balance_raw, base.balance_missing
             FROM base
             JOIN addresses address ON address.id = base.id
             ORDER BY {order_clause}
-            LIMIT $8 OFFSET $9
+            LIMIT $7 OFFSET $8
         )
         SELECT
             address.id,
             address.address,
             address.address_name,
-            validator_kind.name AS validator_kind,
             address.staked_amount,
             address.staked_amount_raw,
             address.unclaimed_amount,
             address.unclaimed_amount_raw,
             address.stake_timestamp,
-            address.storage_available,
-            address.storage_used,
-            address.avatar,
-            CASE WHEN $10::boolean THEN (
+            CASE WHEN $9::boolean THEN (
                 SELECT COALESCE(jsonb_agg(jsonb_build_object(
                     'amount', balance.amount,
                     'amount_raw', balance.amount_raw::text,
@@ -198,7 +184,6 @@ pub async fn list_addresses(
             ) ELSE NULL END AS balances_json
         FROM page
         JOIN addresses address ON address.id = page.id
-        LEFT JOIN address_validator_kinds validator_kind ON validator_kind.id = address.address_validator_kind_id
         ORDER BY {order_clause}
         "#,
         order_clause = order_by.order_clause(direction),
@@ -210,7 +195,6 @@ pub async fn list_addresses(
         .bind(filter.address_partial)
         .bind(filter.symbol)
         .bind(filter.organization_name)
-        .bind(filter.validator_kind)
         .bind(limit)
         .bind(offset)
         .bind(filter.with_balance)

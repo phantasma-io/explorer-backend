@@ -641,12 +641,10 @@ pub async fn upsert_address_id(
             chain_id,
             name_last_updated_unix_seconds,
             stake_timestamp,
-            storage_available,
-            storage_used,
             total_soul_amount,
             balance_dirty_block
         )
-        VALUES ($1, $2, 0, 0, 0, 0, 0, 0)
+        VALUES ($1, $2, 0, 0, 0, 0)
         ON CONFLICT (chain_id, address) DO UPDATE SET
             address = addresses.address
         RETURNING id
@@ -1703,9 +1701,9 @@ impl ProjectionDimensionCache {
             r#"
             INSERT INTO addresses (
                 address, chain_id, name_last_updated_unix_seconds, stake_timestamp,
-                storage_available, storage_used, total_soul_amount, balance_dirty_block
+                total_soul_amount, balance_dirty_block
             )
-            SELECT address, $2, 0, 0, 0, 0, 0, 0
+            SELECT address, $2, 0, 0, 0, 0
             FROM unnest($1::text[]) AS address
             ON CONFLICT (chain_id, address) DO NOTHING
             "#,

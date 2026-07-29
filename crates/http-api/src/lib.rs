@@ -14,21 +14,20 @@ use explorer_db::{
     HistoryPriceOrderBy, NftFilter, NftOrderBy, OracleFilter, OracleOrderBy, OrganizationFilter,
     OrganizationOrderBy, OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy,
     RejectedTransactionRow, SeriesFilter, SeriesOrderBy, SortDirection, TokenFilter, TokenOrderBy,
-    TransactionFilter, TransactionOrderBy, TransactionPage, ValidatorKindOrderBy,
-    address_id_by_address, block_detail, chain_ids_by_name, check_health, circulating_soul_supply,
-    count_chains, count_contract_method_histories, count_event_kinds, count_history_prices,
-    count_oracles, count_platforms, count_validator_kinds, list_addresses, list_blocks,
-    list_chains, list_contract_method_histories, list_contracts, list_event_kinds,
-    list_event_kinds_with_events, list_event_tokens_by_symbols, list_events_by_address,
-    list_events_by_transaction_ids, list_events_global, list_history_prices, list_nfts,
-    list_oracles, list_organizations, list_platforms, list_rejected_transaction_candidates,
-    list_series, list_signatures, list_soul_masters_monthlies, list_staking_dailies, list_tokens,
-    list_transaction_occurrences, list_transactions_by_block_ids,
-    list_transactions_for_address_timeline, list_transactions_for_filtered_address,
-    list_transactions_global, list_validator_kinds, new_address_dailies, overview_counts,
-    rejected_transaction_canonical_exists, search_existence, single_transaction_by_hash,
-    transaction_by_hash_block_index, transaction_neighbors, transaction_occurrence_count,
-    transaction_row_by_block_index, transaction_state_id_by_name,
+    TransactionFilter, TransactionOrderBy, TransactionPage, address_id_by_address, block_detail,
+    chain_ids_by_name, check_health, circulating_soul_supply, count_chains,
+    count_contract_method_histories, count_event_kinds, count_history_prices, count_oracles,
+    count_platforms, list_addresses, list_blocks, list_chains, list_contract_method_histories,
+    list_contracts, list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
+    list_events_by_address, list_events_by_transaction_ids, list_events_global,
+    list_history_prices, list_nfts, list_oracles, list_organizations, list_platforms,
+    list_rejected_transaction_candidates, list_series, list_signatures,
+    list_soul_masters_monthlies, list_staking_dailies, list_tokens, list_transaction_occurrences,
+    list_transactions_by_block_ids, list_transactions_for_address_timeline,
+    list_transactions_for_filtered_address, list_transactions_global, new_address_dailies,
+    overview_counts, rejected_transaction_canonical_exists, search_existence,
+    single_transaction_by_hash, transaction_by_hash_block_index, transaction_neighbors,
+    transaction_occurrence_count, transaction_row_by_block_index, transaction_state_id_by_name,
 };
 use explorer_domain::ChainName;
 use num_bigint::BigInt;
@@ -303,17 +302,8 @@ struct AddressListQuery {
     address_partial: Option<String>,
     symbol: Option<String>,
     organization_name: Option<String>,
-    validator_kind: Option<String>,
-    with_storage: Option<i32>,
     with_stakes: Option<i32>,
     with_balance: Option<i32>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AddressStorageResponse {
-    available: i64,
-    used: i64,
-    avatar: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -343,12 +333,10 @@ struct AddressBalanceResponse {
 struct AddressResponse {
     address: Option<String>,
     address_name: Option<String>,
-    validator_kind: Option<String>,
     stake: Option<String>,
     stake_raw: Option<String>,
     unclaimed: Option<String>,
     unclaimed_raw: Option<String>,
-    storage: Option<AddressStorageResponse>,
     stakes: Option<AddressStakesResponse>,
     balances: Option<Vec<AddressBalanceResponse>>,
 }
@@ -764,27 +752,6 @@ struct OracleResponse {
 struct OracleListResponse {
     total_results: Option<i64>,
     oracles: Vec<OracleResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ValidatorKindListQuery {
-    order_by: Option<String>,
-    order_direction: Option<String>,
-    offset: Option<i64>,
-    limit: Option<i64>,
-    validator_kind: Option<String>,
-    with_total: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidatorKindResponse {
-    name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidatorKindListResponse {
-    total_results: Option<i64>,
-    validator_kinds: Vec<ValidatorKindResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1307,7 +1274,6 @@ pub fn router(state: ApiState, rate_limiter: RateLimiter) -> Router {
         .route("/api/v1/organizations", get(organizations))
         .route("/api/v1/eventKinds", get(event_kinds))
         .route("/api/v1/eventKindsWithEvents", get(event_kinds_with_events))
-        .route("/api/v1/validatorKinds", get(validator_kinds))
         .route("/api/v1/historyPrices", get(history_prices))
         .route("/api/v1/circulatingSupply", get(circulating_supply))
         .route("/api/v1/verifyMessage", get(verify_message))

@@ -166,51 +166,6 @@ pub(crate) async fn oracles(
     }))
 }
 
-pub(crate) async fn validator_kinds(
-    State(state): State<ApiState>,
-    Query(query): Query<ValidatorKindListQuery>,
-) -> Result<Json<ValidatorKindListResponse>, ApiError> {
-    let limit = clamp_limit(query.limit);
-    let offset = nonnegative_offset(query.offset)?;
-    // Map the public query params to typed read-layer inputs here (the API owns
-    // the accepted spellings and the 400 responses); the db read fn then sees
-    // only values it cannot reject, so unsupported sorts are unrepresentable
-    // past this point.
-    let order_by_param = empty_to_none(query.order_by);
-    let order_by =
-        ValidatorKindOrderBy::from_api_param(order_by_param.as_deref()).ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "unsupported order_by '{}'",
-                order_by_param.as_deref().unwrap_or_default()
-            ))
-        })?;
-    let direction = parse_sort_direction(query.order_direction.as_deref())?;
-    let name_filter = empty_to_none(query.validator_kind);
-
-    let rows = list_validator_kinds(
-        &state.pool,
-        name_filter.as_deref(),
-        order_by,
-        direction,
-        limit,
-        offset,
-    )
-    .await?;
-    let total_results = if query.with_total == Some(1) {
-        Some(count_validator_kinds(&state.pool, name_filter.as_deref()).await?)
-    } else {
-        None
-    };
-
-    Ok(Json(ValidatorKindListResponse {
-        total_results,
-        validator_kinds: rows
-            .into_iter()
-            .map(|row| ValidatorKindResponse { name: row.name })
-            .collect(),
-    }))
-}
-
 pub(crate) async fn history_prices(
     State(state): State<ApiState>,
     Query(query): Query<HistoryPriceListQuery>,
@@ -498,8 +453,6 @@ pub(crate) async fn addresses(
         .map(|value| value.to_uppercase())
         .unwrap_or_else(|| "SOUL".to_owned());
     let organization_name = empty_to_none(query.organization_name);
-    let validator_kind = empty_to_none(query.validator_kind);
-    let with_storage = query.with_storage == Some(1);
     let with_stakes = query.with_stakes == Some(1);
     let with_balance = query.with_balance == Some(1);
 
@@ -510,7 +463,6 @@ pub(crate) async fn addresses(
         address_partial: address_partial.as_deref(),
         symbol: symbol.as_str(),
         organization_name: organization_name.as_deref(),
-        validator_kind: validator_kind.as_deref(),
         with_balance,
     };
     let rows = list_addresses(&state.pool, &filter, order_by, direction, limit + 1, offset).await?;
@@ -518,7 +470,7 @@ pub(crate) async fn addresses(
     let (rows, next_cursor) = trim_offset_rows(rows, limit, offset)?;
     let addresses = rows
         .iter()
-        .map(|row| address_from_row(row, with_storage, with_stakes, with_balance))
+        .map(|row| address_from_row(row, with_stakes, with_balance))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(AddressListResponse {
         total_results: None,
