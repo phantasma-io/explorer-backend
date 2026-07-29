@@ -1714,14 +1714,22 @@ fn decode_carbon_event_or_default<T: CarbonSerializable + Default>(
             // The C# importer stores malformed governance config events by
             // calling `GetParsedData<T>()`, which returns `default(T)` after a
             // failed Carbon parse. Preserve that observable DB/API payload
-            // instead of rejecting historical Saturn contract events.
-            warn!(
+            // instead of rejecting the whole block.
+            //
+            // error!, not warn!: with the Custom_V2 read-time remap the RPC no
+            // longer presents contract events under governance kinds, so a decode
+            // failure here means a genuine system event this build cannot parse
+            // (e.g. a config format newer than the pinned SDK) — and the stored
+            // payload silently degrades to an all-zero default. The blob length
+            // distinguishes a truncated blob from an unknown newer layout.
+            error!(
                 block_height,
                 tx_index,
                 event_index,
                 event_kind,
+                raw_data_bytes = raw_data.len() / 2,
                 error = %error,
-                "using default governance config payload for malformed Carbon event"
+                "using default governance config payload for undecodable Carbon event"
             );
             T::default()
         }
@@ -1748,7 +1756,7 @@ fn legacy_token_create_raw_data(symbol: &str, chain_name: &str) -> String {
 }
 
 fn build_governance_gas_config_payload(config: &GasConfig) -> Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "version": config.version.to_string(),
         "max_name_length": config.max_name_length.to_string(),
         "max_token_symbol_length": config.max_token_symbol_length.to_string(),
@@ -1768,7 +1776,54 @@ fn build_governance_gas_config_payload(config: &GasConfig) -> Value {
         "gas_fee_register_name": config.gas_fee_register_name.to_string(),
         "gas_burn_ratio_mul": config.gas_burn_ratio_mul.to_string(),
         "gas_burn_ratio_shift": config.gas_burn_ratio_shift.to_string(),
-    })
+    });
+    // The gas-model-v2 tail exists on the wire only for version >= 1; emit its
+    // keys under the same gate the node serializer uses so version-0 payloads
+    // stay byte-identical to every historical row already in the database.
+    if config.has_gas_model_v2()
+        && let Some(object) = payload.as_object_mut()
+    {
+        let v2_fields = [
+            ("minimum_gas_bill", config.minimum_gas_bill.to_string()),
+            (
+                "gas_producer_ratio_mul",
+                config.gas_producer_ratio_mul.to_string(),
+            ),
+            (
+                "gas_producer_ratio_shift",
+                config.gas_producer_ratio_shift.to_string(),
+            ),
+            ("gas_dapp_ratio_mul", config.gas_dapp_ratio_mul.to_string()),
+            (
+                "gas_dapp_ratio_shift",
+                config.gas_dapp_ratio_shift.to_string(),
+            ),
+            (
+                "policy_fee_create_token_base",
+                config.policy_fee_create_token_base.to_string(),
+            ),
+            (
+                "policy_fee_create_token_symbol",
+                config.policy_fee_create_token_symbol.to_string(),
+            ),
+            (
+                "policy_fee_create_token_series",
+                config.policy_fee_create_token_series.to_string(),
+            ),
+            (
+                "policy_fee_register_name",
+                config.policy_fee_register_name.to_string(),
+            ),
+            (
+                "legacy_data_escrow_per_row",
+                config.legacy_data_escrow_per_row.to_string(),
+            ),
+        ];
+        for (key, value) in v2_fields {
+            object.insert(key.to_owned(), Value::String(value));
+        }
+    }
+    payload
 }
 
 fn build_governance_chain_config_payload(config: &CarbonChainConfig) -> Value {
@@ -3025,6 +3080,16 @@ mod tests {
                     .and_then(|v| v.get("gas_fee_create_token_series")),
                 Some(&serde_json::json!("2500000000"))
             );
+            // A version-0 blob must produce exactly the 19 v1 keys and none of
+            // the gas-model-v2 tail, so payloads of rows ingested before the v2
+            // flip stay byte-identical on re-projection.
+            let v0_payload = events[1]
+                .payload_json
+                .as_ref()
+                .and_then(|v| v.get("governance_gas_config_event"))
+                .and_then(Value::as_object);
+            assert_eq!(v0_payload.map(serde_json::Map::len), Some(19));
+            assert_eq!(v0_payload.and_then(|p| p.get("minimum_gas_bill")), None);
             assert_eq!(events[2].event_kind, "SpecialResolution");
             assert_eq!(events[2].event_index, 3);
             assert_eq!(
@@ -3048,6 +3113,51 @@ mod tests {
             );
             assert_eq!(events[2].date_unix_seconds, 1743465600);
         }
+    }
+
+    #[test]
+    fn decodes_gas_model_v2_config_event_with_extension_fields() {
+        // Real GovernanceSetGasConfig blob from localnet block 8,937,519 (the
+        // gas-model-v2 flip SR): 179 bytes = the 113-byte v0 image plus the
+        // 66-byte v2 tail. Expected values match the node's own decoding of the
+        // resolution (note data_escrow_per_row 200000 is the value this SR set;
+        // the chain's current config may differ after later SRs).
+        let raw_data = "01FFFF00000010001027000000000000010000000000000002000000000000000A00000000000000400D0300000000000A000000000000000A0000000000000000E40B540200000000E40B540200000000F902950000000090D003000000000000A0724E18090000010000000000000001809698000000000001000000000000000201000000000000000300E876481700000000E876481700000000BA1DD2050000000010A5D4E80000000200000000000000";
+        let config = decode_carbon_event_or_default::<GasConfig>(
+            8_937_519,
+            0,
+            0,
+            "GovernanceSetGasConfig",
+            raw_data,
+        );
+        // A silent parse failure would fall back to an all-zero default; the
+        // version check catches that before the field-level assertions.
+        assert!(config.has_gas_model_v2());
+
+        let payload = build_governance_gas_config_payload(&config);
+        let object = payload.as_object();
+        // 19 v1 keys + the 10-field v2 tail.
+        assert_eq!(object.map(serde_json::Map::len), Some(29));
+        let get = |key: &str| {
+            object
+                .and_then(|payload| payload.get(key))
+                .and_then(Value::as_str)
+        };
+        assert_eq!(get("version"), Some("1"));
+        assert_eq!(get("fee_multiplier"), Some("10000"));
+        assert_eq!(get("data_escrow_per_row"), Some("200000"));
+        assert_eq!(get("gas_burn_ratio_mul"), Some("1"));
+        assert_eq!(get("gas_burn_ratio_shift"), Some("1"));
+        assert_eq!(get("minimum_gas_bill"), Some("10000000"));
+        assert_eq!(get("gas_producer_ratio_mul"), Some("1"));
+        assert_eq!(get("gas_producer_ratio_shift"), Some("2"));
+        assert_eq!(get("gas_dapp_ratio_mul"), Some("1"));
+        assert_eq!(get("gas_dapp_ratio_shift"), Some("3"));
+        assert_eq!(get("policy_fee_create_token_base"), Some("100000000000"));
+        assert_eq!(get("policy_fee_create_token_symbol"), Some("100000000000"));
+        assert_eq!(get("policy_fee_create_token_series"), Some("25000000000"));
+        assert_eq!(get("policy_fee_register_name"), Some("1000000000000"));
+        assert_eq!(get("legacy_data_escrow_per_row"), Some("2"));
     }
 
     #[test]
