@@ -455,11 +455,16 @@ impl RpcConfig {
                 file.and_then(|file| file.timeout_seconds),
                 30,
             )?),
+            // Historical repair blocks serialize to well over 100 MB of JSON, so a
+            // 64 MiB ceiling (the old default) made those heights permanently
+            // unfetchable on any deployment that did not override it — the worker
+            // wedged instead of syncing. The shipped configs already used 256 MiB;
+            // the default now matches them so an env-only deployment is safe too.
             max_response_bytes: env_or_file_or_default(
                 "EXPLORER_RPC_MAX_RESPONSE_BYTES",
                 "rpc.max_response_bytes",
                 file.and_then(|file| file.max_response_bytes),
-                64 * 1024 * 1024,
+                256 * 1024 * 1024,
             )?,
             api_key: optional_env_or_file_str(
                 "EXPLORER_RPC_API_KEY",
