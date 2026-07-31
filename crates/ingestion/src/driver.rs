@@ -2794,54 +2794,87 @@ impl BlockIngestionDriver {
     }
 }
 
+/// Walk one cursor-paginated account endpoint to its end.
+///
+/// The walk is driven entirely by the node: it ends when the node stops handing
+/// out a next-page cursor. That makes two node-side faults unbounded loops with
+/// no other exit — not even shutdown — while the worker keeps requesting pages:
+/// a cursor that never empties, and a cursor that repeats the one just used.
+/// Both are refused here instead of being trusted, and refusing is deliberately
+/// not the same as stopping early: a truncated page set would be persisted as
+/// the address's complete holdings and silently delete the rest of its balances.
+async fn collect_account_pages<T, F, Fut>(
+    endpoint: &'static str,
+    address: &str,
+    mut fetch_page: F,
+) -> Result<Vec<T>, RpcError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<explorer_rpc::SdkCursorPaginatedResult<Vec<T>>, RpcError>,
+        >,
+{
+    let mut rows = Vec::new();
+    let mut cursor = String::new();
+    for page_number in 1..=BALANCE_MAX_PAGES {
+        let page = fetch_page(cursor.clone()).await?;
+        if let Some(page_rows) = page.result {
+            rows.extend(page_rows);
+        }
+        match page.cursor {
+            Some(next) if next.is_empty() => return Ok(rows),
+            Some(next) if next != cursor => cursor = next,
+            // A repeated cursor would replay the same page forever.
+            Some(_) => {
+                return Err(RpcError::UnterminatedPagination {
+                    endpoint,
+                    address: address.to_owned(),
+                    pages: page_number,
+                });
+            }
+            None => return Ok(rows),
+        }
+    }
+
+    Err(RpcError::UnterminatedPagination {
+        endpoint,
+        address: address.to_owned(),
+        pages: BALANCE_MAX_PAGES,
+    })
+}
+
 /// Assembles the full balance-row set for one address from the paginated
 /// account endpoints: every fungible balance page, then a per-token
 /// `getTokenBalance` for each token surfaced by the owned-tokens index that the
 /// fungible enumeration does not carry — that is, the NFT ownership counts,
 /// whose only remaining source is the single-token balance row (its embedded
-/// `ids` list is ignored). Bounded by construction: pages are capped at 100
-/// rows and the per-token lookups run only for tokens the address actually
-/// holds, so cost scales with the address's real portfolio, never with global
-/// token/NFT growth.
+/// `ids` list is ignored). Cost scales with the address's real portfolio, never
+/// with global token/NFT growth: pages hold at most `BALANCE_PAGE_SIZE` rows,
+/// their number is capped by `collect_account_pages`, and the per-token lookups
+/// run only for tokens the address actually holds.
 async fn fetch_address_balances(
     rpc: &PhantasmaSdkClient,
     chain: &ChainName,
     address: &str,
 ) -> Result<Vec<explorer_rpc::SdkBalanceResult>, RpcError> {
-    let mut balances = Vec::new();
-    let mut cursor = String::new();
-    loop {
-        let page = rpc
-            .get_account_fungible_tokens(address, BALANCE_PAGE_SIZE, &cursor, false)
-            .await?;
-        if let Some(rows) = page.result {
-            balances.extend(rows);
-        }
-        match page.cursor {
-            Some(next) if !next.is_empty() => cursor = next,
-            _ => break,
-        }
-    }
+    let mut balances =
+        collect_account_pages("getAccountFungibleTokens", address, |cursor| async move {
+            rpc.get_account_fungible_tokens(address, BALANCE_PAGE_SIZE, &cursor, false)
+                .await
+        })
+        .await?;
 
     let fungible_symbols = balances
         .iter()
         .map(|balance| balance.symbol.clone())
         .collect::<std::collections::HashSet<_>>();
 
-    let mut owned_tokens = Vec::new();
-    let mut cursor = String::new();
-    loop {
-        let page = rpc
-            .get_account_owned_tokens(address, BALANCE_PAGE_SIZE, &cursor, false)
-            .await?;
-        if let Some(rows) = page.result {
-            owned_tokens.extend(rows);
-        }
-        match page.cursor {
-            Some(next) if !next.is_empty() => cursor = next,
-            _ => break,
-        }
-    }
+    let owned_tokens =
+        collect_account_pages("getAccountOwnedTokens", address, |cursor| async move {
+            rpc.get_account_owned_tokens(address, BALANCE_PAGE_SIZE, &cursor, false)
+                .await
+        })
+        .await?;
 
     for token in owned_tokens {
         if token.symbol.is_empty() || fungible_symbols.contains(&token.symbol) {
@@ -2859,6 +2892,87 @@ async fn fetch_address_balances(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds one page of a cursor-paginated response: `rows` items, and `next`
+    /// as the cursor the node hands back (`None` ends the walk).
+    fn page(rows: usize, next: Option<&str>) -> explorer_rpc::SdkCursorPaginatedResult<Vec<u8>> {
+        explorer_rpc::SdkCursorPaginatedResult {
+            result: Some(vec![0u8; rows]),
+            cursor: next.map(str::to_owned),
+        }
+    }
+
+    /// The normal walk: follow the node's cursors until it stops handing one out,
+    /// and return every page's rows in order.
+    #[tokio::test]
+    async fn a_paginated_account_endpoint_is_walked_to_its_end() {
+        let mut seen_cursors = Vec::new();
+        let rows = collect_account_pages("getAccountFungibleTokens", "PADDR", |cursor| {
+            seen_cursors.push(cursor.clone());
+            async move {
+                Ok(match cursor.as_str() {
+                    "" => page(100, Some("page-2")),
+                    "page-2" => page(100, Some("page-3")),
+                    // An empty cursor ends the walk just like a missing one.
+                    "page-3" => page(7, Some("")),
+                    // Any other cursor is a bug: end the walk and let the
+                    // `seen_cursors` assertion below report it.
+                    _ => page(0, None),
+                })
+            }
+        })
+        .await;
+
+        assert_eq!(rows.map(|rows| rows.len()).ok(), Some(207));
+        assert_eq!(seen_cursors, vec!["", "page-2", "page-3"]);
+    }
+
+    /// A node that echoes the cursor it was just given would replay the same page
+    /// forever. The walk has no other exit — not even shutdown — so it must fail
+    /// the call rather than spin.
+    #[tokio::test]
+    async fn a_repeated_cursor_is_refused_instead_of_replayed() {
+        let mut calls = 0u32;
+        // The node hands back the same non-empty cursor no matter what it is given.
+        let result = collect_account_pages("getAccountOwnedTokens", "PADDR", |_cursor| {
+            calls += 1;
+            async move { Ok(page(100, Some("stuck"))) }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RpcError::UnterminatedPagination {
+                endpoint: "getAccountOwnedTokens",
+                ref address,
+                pages: 2,
+            }) if address == "PADDR"
+        ));
+        assert_eq!(calls, 2, "the repeat must be caught on the very next page");
+    }
+
+    /// A cursor that keeps advancing but never ends is bounded by the page cap,
+    /// and is likewise an error: truncating the walk would persist a partial page
+    /// set as the address's complete holdings and delete the rest of its balances.
+    #[tokio::test]
+    async fn an_endless_cursor_stops_at_the_page_cap() {
+        let mut calls = 0usize;
+        let result = collect_account_pages("getAccountFungibleTokens", "PADDR", |_cursor| {
+            calls += 1;
+            let next = format!("page-{calls}");
+            async move { Ok(page(1, Some(&next))) }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RpcError::UnterminatedPagination {
+                pages: BALANCE_MAX_PAGES,
+                ..
+            })
+        ));
+        assert_eq!(calls, BALANCE_MAX_PAGES);
+    }
 
     /// Shutdown must cut a backoff short. A worker that sits out a multi-minute
     /// wait after the signal outlives the stop grace period of every orchestrator

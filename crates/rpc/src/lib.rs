@@ -78,6 +78,16 @@ pub enum RpcError {
         target: &'static str,
         source: serde_json::Error,
     },
+    /// The node kept handing out a next-page cursor instead of ending the walk.
+    /// A cursor-paginated loop has no other exit, so this is surfaced as a failed
+    /// call rather than silently truncated: a partial page set would otherwise be
+    /// written to the database as if it were the address's complete holdings.
+    #[error("{endpoint} did not end its cursor pagination for {address} after {pages} pages")]
+    UnterminatedPagination {
+        endpoint: &'static str,
+        address: String,
+        pages: usize,
+    },
 }
 
 impl PhantasmaSdkClient {

@@ -40,6 +40,11 @@ const BALANCE_PAGE_SIZE: u32 = 100;
 /// batch cannot open hundreds of concurrent calls against the node's global
 /// concurrency cap.
 const BALANCE_FETCH_CONCURRENCY: usize = 8;
+/// Hard cap on pages walked per cursor-paginated account endpoint. At
+/// `BALANCE_PAGE_SIZE` rows a page this is orders of magnitude above any real
+/// portfolio; it exists so a node whose cursor never terminates cannot pin the
+/// balance task in an endless request loop.
+const BALANCE_MAX_PAGES: usize = 1000;
 const STAKE_PROJECTION_INTERVAL_SECONDS: u64 = 30;
 const TOKEN_SUPPLY_SYNC_INTERVAL_SECONDS: u64 = 60;
 const CONTRACT_RPC_METADATA_SYNC_INTERVAL_SECONDS: u64 = 300;
