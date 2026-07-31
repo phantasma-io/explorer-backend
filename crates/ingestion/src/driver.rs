@@ -5,9 +5,160 @@
 //! its inherent impl.
 use super::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
+
+/// Committed blocks required, without a stall in between, before the worker
+/// leaves load-shed mode. Recovery is deliberately conservative so one lucky
+/// fetch does not immediately restore the full fan-out (C# parity:
+/// `RpcReliefRecoveryCommitThreshold`).
+const RELIEF_RECOVERY_COMMIT_BLOCKS: u32 = 4;
+/// Wait after the first stalled fetch; it doubles on every consecutive stall at
+/// the SAME height (C# parity: `BlockFetchFailureBackoffBaseMs`).
+const RELIEF_STALL_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Ceiling for that wait (C# parity: `BlockFetchFailureBackoffMaxMs`).
+const RELIEF_STALL_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Doublings applied before the ceiling (C# parity: exponent clamped to 5).
+const RELIEF_STALL_BACKOFF_MAX_DOUBLINGS: u32 = 5;
+
+/// Wait before retrying a height that keeps stalling: `base * 2^(stalls-1)`,
+/// capped. Repeatedly re-requesting a block the node cannot serve is exactly how
+/// a worker drives a struggling node into OOM, so each failed attempt buys the
+/// node more room.
+fn relief_stall_backoff(stall_count: u32) -> Duration {
+    if stall_count == 0 {
+        return Duration::ZERO;
+    }
+    let doublings = stall_count
+        .saturating_sub(1)
+        .min(RELIEF_STALL_BACKOFF_MAX_DOUBLINGS);
+    RELIEF_STALL_BACKOFF_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(RELIEF_STALL_BACKOFF_MAX)
+}
+
+/// Automatic RPC load-shed state — the Rust port of the C# plugin's
+/// `RpcReliefModeState`.
+///
+/// Why this exists: a handful of historical blocks serialize to 100+ MB of JSON.
+/// Fetching several of them concurrently (the normal `fetch_concurrency`
+/// fan-out), failing, and immediately re-requesting the same set is what pushes
+/// the node into OOM — and, because the window is retried unchanged, the worker
+/// never recovers on its own. Once a fetch stalls, the worker drops to ONE block
+/// per pass with ONE request in flight, waits on an escalating schedule, and only
+/// restores the fan-out after a streak of committed blocks.
+#[derive(Debug, Default)]
+pub struct RpcReliefState {
+    active: AtomicBool,
+    /// Blocks committed since the last stall while shedding; resets on any stall.
+    committed_streak: AtomicU32,
+    /// Height of the current stall and how many consecutive passes stalled on it.
+    /// A stall on a NEW height starts the escalation over, so an unrelated later
+    /// failure does not inherit a long backoff.
+    stalled_height: AtomicU64,
+    stall_count: AtomicU32,
+}
+
+impl RpcReliefState {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn stall_count(&self) -> u32 {
+        self.stall_count.load(Ordering::Relaxed)
+    }
+
+    /// Record a stalled fetch at `height` and switch shedding on. Returns the
+    /// consecutive stall count for that height and whether this call was the
+    /// transition into load-shed mode (so the caller logs it once, not per pass).
+    fn register_stall(&self, height: u64) -> (u32, bool) {
+        let previous_height = self.stalled_height.swap(height, Ordering::Relaxed);
+        let stalls = if previous_height == height {
+            self.stall_count.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.stall_count.store(1, Ordering::Relaxed);
+            1
+        };
+        // Progress must be re-earned from zero after every stall.
+        self.committed_streak.store(0, Ordering::Relaxed);
+        let entered = !self.active.swap(true, Ordering::Relaxed);
+        (stalls, entered)
+    }
+
+    /// Record a pass that committed `blocks` with no stall. Returns true when the
+    /// streak was long enough to leave load-shed mode (logged by the caller).
+    fn register_progress(&self, blocks: u64) -> bool {
+        self.stall_count.store(0, Ordering::Relaxed);
+        if !self.is_active() || blocks == 0 {
+            return false;
+        }
+        let blocks = u32::try_from(blocks).unwrap_or(u32::MAX);
+        let streak = self
+            .committed_streak
+            .fetch_add(blocks, Ordering::Relaxed)
+            .saturating_add(blocks);
+        if streak < RELIEF_RECOVERY_COMMIT_BLOCKS {
+            return false;
+        }
+        self.committed_streak.store(0, Ordering::Relaxed);
+        self.active.swap(false, Ordering::Relaxed)
+    }
+
+    /// Leave load-shed mode outright. Used when there is nothing left to fetch:
+    /// the recovery streak can never be earned while the chain produces no new
+    /// blocks, so without this the worker would sit at the tip with shedding —
+    /// and its paused RPC maintenance — latched on indefinitely. Returns true if
+    /// this call was the transition back to normal.
+    fn clear(&self) -> bool {
+        self.stall_count.store(0, Ordering::Relaxed);
+        self.committed_streak.store(0, Ordering::Relaxed);
+        self.active.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Is this failure ours (the database) rather than the node's?
+///
+/// Load shedding exists to spare a struggling node, so a Postgres outage must not
+/// trigger it: collapsing the fetch window and parking RPC maintenance would slow
+/// the recovery down and hide the component that actually needs attention. Every
+/// other failure — node errors, unusable block payloads — is worth backing off on.
+fn is_database_failure(error: &IngestionError) -> bool {
+    matches!(error, IngestionError::Db(_) | IngestionError::Sqlx(_))
+}
+
+/// Does a mid-window failure keep the blocks committed so far and become a stall on
+/// the current height, instead of failing the whole pass?
+///
+/// Both projection paths answer this the same way, and must: the height the worker
+/// backs off on is derived from it. A pass that failed the whole window blocks on
+/// its first height, so the caller can name that height itself; a pass that failed
+/// after committing a prefix blocks somewhere in the middle, which only the path
+/// itself knows — reporting that as a plain error would key the escalating backoff
+/// on the wrong (already committed) height. Database failures are excluded because
+/// they are not the node's problem and must not shed RPC load.
+fn keeps_committed_prefix(projected_blocks: u64, error: &IngestionError) -> bool {
+    projected_blocks > 0 && !is_database_failure(error)
+}
+
+/// How long to wait after a failed sync pass.
+///
+/// The generic escalation (5 s per consecutive failure, capped at 30 s) covers
+/// ordinary flakiness; a stalled block fetch needs the far longer relief schedule,
+/// so the two are combined by taking the longer one. A database failure is exempt:
+/// relief exists to spare the NODE, and inheriting its up-to-five-minute wait for a
+/// Postgres problem would idle the worker long after the database is back.
+fn failed_pass_backoff(
+    consecutive_failures: u32,
+    stall_count: u32,
+    database_failure: bool,
+) -> Duration {
+    let generic = Duration::from_secs(u64::from(consecutive_failures.min(6)) * 5);
+    if database_failure {
+        return generic;
+    }
+    generic.max(relief_stall_backoff(stall_count))
+}
 
 /// Wait out `backoff`, unless shutdown arrives first; returns true when it did.
 ///
@@ -23,6 +174,16 @@ async fn wait_or_shutdown(backoff: Duration, shutdown: &mut watch::Receiver<bool
         _ = sleep(backoff) => false,
         _ = shutdown.changed() => true,
     }
+}
+
+/// Result of projecting one fetch window.
+struct WindowOutcome {
+    projected_blocks: u64,
+    cursor_height_after: BlockHeight,
+    /// Lowest height the pass could not fetch. The contiguous prefix below it is
+    /// committed; the window above it is abandoned (and its in-flight fetches
+    /// aborted) because the cursor can only advance through that gap.
+    stalled_height: Option<u64>,
 }
 
 /// Record a per-token NFT metadata fetch failure. A permanent RPC error (e.g.
@@ -62,6 +223,7 @@ impl BlockIngestionDriver {
             chain,
             settings,
             node_guard_checked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            relief: Arc::new(RpcReliefState::default()),
         }
     }
 
@@ -74,7 +236,12 @@ impl BlockIngestionDriver {
             .unwrap_or_else(|| BlockHeight::new(0));
         self.validate_zero_state_scope(cursor_height)?;
         self.guard_node_matches_db(chain_id, cursor_height).await?;
-        let window = plan_fetch_window(cursor_height, rpc_tip, &self.settings)?;
+        let window = plan_fetch_window(
+            cursor_height,
+            rpc_tip,
+            &self.settings,
+            self.relief.is_active(),
+        )?;
 
         Ok(StartupProbe {
             configured_nexus: self.chain.nexus.to_string(),
@@ -383,7 +550,20 @@ impl BlockIngestionDriver {
         drop(conn);
         self.validate_zero_state_scope(cursor_height)?;
         self.guard_node_matches_db(chain_id, cursor_height).await?;
-        let Some(window) = plan_fetch_window(cursor_height, rpc_tip, &self.settings)? else {
+        let load_shed = self.relief.is_active();
+        let Some(window) = plan_fetch_window(cursor_height, rpc_tip, &self.settings, load_shed)?
+        else {
+            // Caught up to the tip: nothing to fetch, and the node just answered
+            // the tip probe. Shedding protects nothing here, while the recovery
+            // streak it waits for cannot be earned until new blocks appear — so
+            // on a quiet chain it would keep RPC maintenance parked for as long
+            // as the chain stays quiet. Leave the mode instead.
+            if self.relief.clear() {
+                info!(
+                    tip = rpc_tip.value(),
+                    "leaving RPC load-shed mode: caught up to the tip and the node is responding"
+                );
+            }
             return Ok(SyncBatchReport {
                 configured_nexus: self.chain.nexus.to_string(),
                 chain: self.chain.chain.to_string(),
@@ -396,6 +576,8 @@ impl BlockIngestionDriver {
                 projected_blocks: 0,
                 cursor_height_after: cursor_height.value(),
                 fetch_concurrency: 0,
+                load_shed,
+                stalled_height: None,
             });
         };
 
@@ -405,16 +587,36 @@ impl BlockIngestionDriver {
         // deterministic, reproducible ingestion and Relief for one-block,
         // load-shedding passes over difficult ranges. In every mode blocks are
         // written and the cursor advances in strict height order.
-        let (projected_blocks, cursor_height_after) = match self.settings.sync_mode {
-            WorkerSyncMode::Normal => {
-                self.project_window_pipelined(&window, cursor_height)
-                    .await?
-            }
+        let outcome = match self.settings.sync_mode {
+            WorkerSyncMode::Normal => self.project_window_pipelined(&window, cursor_height).await,
             WorkerSyncMode::Sequential | WorkerSyncMode::Relief => {
                 self.project_window_sequentially(&window, cursor_height)
-                    .await?
+                    .await
             }
         };
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // An error here means the pass committed nothing: both projection
+                // paths keep their prefix and report a stall instead of failing
+                // once anything was written (`keeps_committed_prefix`), so the
+                // window's first height IS the height that blocks us. Shed load
+                // before the retry: without this the same window (and the same
+                // concurrent multi-megabyte fetches) is re-fired every poll until
+                // the node dies. A database failure is not the node's fault, so it
+                // keeps the plain retry path.
+                if !is_database_failure(&error) {
+                    self.note_fetch_stall(window.from_height.value());
+                }
+                return Err(error);
+            }
+        };
+
+        match outcome.stalled_height {
+            Some(height) => self.note_fetch_stall(height),
+            None => self.note_fetch_progress(outcome.projected_blocks),
+        }
 
         if !self.settings.batch_delay.is_zero() {
             sleep(self.settings.batch_delay).await;
@@ -433,10 +635,41 @@ impl BlockIngestionDriver {
             cursor_height_before: cursor_height.value(),
             from_height: Some(window.from_height.value()),
             to_height: Some(window.to_height.value()),
-            projected_blocks,
-            cursor_height_after: cursor_height_after.value(),
+            projected_blocks: outcome.projected_blocks,
+            cursor_height_after: outcome.cursor_height_after.value(),
             fetch_concurrency,
+            load_shed,
+            stalled_height: outcome.stalled_height,
         })
+    }
+
+    /// A fetch could not be served: switch to (or stay in) load-shed mode and log
+    /// the escalating wait the worker loop will honour before retrying `height`.
+    fn note_fetch_stall(&self, height: u64) {
+        let (stalls, entered) = self.relief.register_stall(height);
+        if entered {
+            warn!(
+                height,
+                "entering RPC load-shed mode: fetching one block per pass until the node recovers"
+            );
+        }
+        warn!(
+            height,
+            stalls,
+            backoff_ms = relief_stall_backoff(stalls).as_millis(),
+            "block fetch stalled; backing off before retrying this height"
+        );
+    }
+
+    /// A pass committed blocks with no stall: clear the escalation and, once the
+    /// recovery streak is met, restore the configured batch size and fan-out.
+    fn note_fetch_progress(&self, projected_blocks: u64) {
+        if self.relief.register_progress(projected_blocks) {
+            info!(
+                committed_blocks = RELIEF_RECOVERY_COMMIT_BLOCKS,
+                "leaving RPC load-shed mode: node is serving blocks again"
+            );
+        }
     }
 
     // Zero-state protection (network-agnostic by design). The gen2 base — `main`
@@ -527,22 +760,47 @@ impl BlockIngestionDriver {
         &self,
         window: &FetchWindow,
         cursor_height: BlockHeight,
-    ) -> Result<(u64, BlockHeight), IngestionError> {
+    ) -> Result<WindowOutcome, IngestionError> {
         let mut projected_blocks = 0;
         let mut cursor_height_after = cursor_height;
         for height in window.from_height.value()..=window.to_height.value() {
-            let (_, advanced_height) = self
+            match self
                 .project_raw_block_and_advance_cursor(BlockHeight::new(height))
-                .await?;
-            cursor_height_after = advanced_height;
-            projected_blocks += 1;
+                .await
+            {
+                Ok((_, advanced_height)) => {
+                    cursor_height_after = advanced_height;
+                    projected_blocks += 1;
+                }
+                // A node-side failure after some blocks were committed is a stall on
+                // THIS height, not a failed pass — the committed prefix stands and
+                // the worker backs off on the stalled height instead of replaying
+                // the whole window. Same contract as the pipelined path.
+                Err(error) if keeps_committed_prefix(projected_blocks, &error) => {
+                    warn!(
+                        height,
+                        %error,
+                        "block projection stalled mid-window; kept the committed prefix"
+                    );
+                    return Ok(WindowOutcome {
+                        projected_blocks,
+                        cursor_height_after,
+                        stalled_height: Some(height),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
 
             if height < window.to_height.value() && !self.settings.inter_block_delay.is_zero() {
                 sleep(self.settings.inter_block_delay).await;
             }
         }
 
-        Ok((projected_blocks, cursor_height_after))
+        Ok(WindowOutcome {
+            projected_blocks,
+            cursor_height_after,
+            stalled_height: None,
+        })
     }
 
     /// Fetch/process pipeline: keep up to `window.concurrency` block fetches in
@@ -562,7 +820,7 @@ impl BlockIngestionDriver {
         &self,
         window: &FetchWindow,
         cursor_height: BlockHeight,
-    ) -> Result<(u64, BlockHeight), IngestionError> {
+    ) -> Result<WindowOutcome, IngestionError> {
         let from = window.from_height.value();
         let to = window.to_height.value();
         let concurrency = window.concurrency.max(1);
@@ -580,9 +838,10 @@ impl BlockIngestionDriver {
         let mut next_to_write = from;
         let mut projected_blocks = 0u64;
         let mut cursor_height_after = cursor_height;
-        // First fetch error stops new fetches; the already-committed contiguous
-        // prefix stays valid and the cursor reflects it.
-        let mut fetch_error: Option<IngestionError> = None;
+        // Lowest height whose fetch failed. It stops new fetches; the
+        // already-committed contiguous prefix below it stays valid and the cursor
+        // reflects it.
+        let mut fetch_error: Option<(u64, IngestionError)> = None;
 
         loop {
             // Top up the fetch pipeline: up to `concurrency` requests in flight,
@@ -618,16 +877,31 @@ impl BlockIngestionDriver {
             // the DB, which is what overlaps fetch with write.
             while let Some(block) = ready.remove(&next_to_write) {
                 let height = BlockHeight::new(next_to_write);
-                let mut transaction = self.pool.begin().await?;
-                let block_record = self
-                    .project_decoded_block(&mut transaction, height, &block)
-                    .await?;
-                cursor_height_after =
-                    explorer_db::advance_cursor(&mut transaction, block_record.chain_id, height)
-                        .await?;
-                transaction.commit().await?;
-                projected_blocks += 1;
-                next_to_write += 1;
+                match self.write_decoded_block(height, &block).await {
+                    Ok(advanced_height) => {
+                        cursor_height_after = advanced_height;
+                        projected_blocks += 1;
+                        next_to_write += 1;
+                    }
+                    // A write-side failure is treated exactly like a fetch-side one
+                    // (and exactly like the sequential path): keep the committed
+                    // prefix and report the stall on the height that actually
+                    // blocks, so the escalating backoff is keyed on it rather than
+                    // on the window's first — already committed — height.
+                    Err(error) if keeps_committed_prefix(projected_blocks, &error) => {
+                        warn!(
+                            height = next_to_write,
+                            %error,
+                            "block projection stalled mid-window; kept the committed prefix"
+                        );
+                        return Ok(WindowOutcome {
+                            projected_blocks,
+                            cursor_height_after,
+                            stalled_height: Some(next_to_write),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
 
                 if next_to_write <= to && !self.settings.inter_block_delay.is_zero() {
                     sleep(self.settings.inter_block_delay).await;
@@ -645,29 +919,58 @@ impl BlockIngestionDriver {
             }
         }
 
-        if let Some(error) = fetch_error {
+        if let Some((stalled_height, error)) = fetch_error {
             // No progress at all (the next height itself failed) → surface the
             // error so the worker loop backs off. Otherwise keep the committed
-            // prefix and let the next pass retry the failed height.
+            // prefix and report the stall so the caller sheds load and backs off
+            // on that height instead of replaying the window at full fan-out.
             if projected_blocks == 0 {
                 return Err(error);
             }
             warn!(
-                height = next_to_write,
+                height = stalled_height,
                 %error,
                 "block fetch stalled mid-window; kept the committed prefix, retrying the failed height next pass"
             );
+            return Ok(WindowOutcome {
+                projected_blocks,
+                cursor_height_after,
+                stalled_height: Some(stalled_height),
+            });
         }
 
-        Ok((projected_blocks, cursor_height_after))
+        Ok(WindowOutcome {
+            projected_blocks,
+            cursor_height_after,
+            stalled_height: None,
+        })
+    }
+
+    /// Write one already-fetched block and advance the cursor to it, in a single
+    /// transaction — the pipeline's writer step. Kept separate from the write loop
+    /// so a failure is a value the loop can classify (stall vs. hard error) instead
+    /// of a `?` that discards the pass and the height it failed on.
+    async fn write_decoded_block(
+        &self,
+        height: BlockHeight,
+        block: &SdkBlockResult,
+    ) -> Result<BlockHeight, IngestionError> {
+        let mut transaction = self.pool.begin().await?;
+        let block_record = self
+            .project_decoded_block(&mut transaction, height, block)
+            .await?;
+        let cursor_height_after =
+            explorer_db::advance_cursor(&mut transaction, block_record.chain_id, height).await?;
+        transaction.commit().await?;
+        Ok(cursor_height_after)
     }
 
     /// Record a completed block fetch from the pipeline: buffer a fetched block
-    /// for the writer, or remember the first fetch error so the writer stops at
-    /// the first missing (failed) height with a gap-free committed prefix below.
+    /// for the writer, or remember the LOWEST failed height so the writer stops
+    /// there with a gap-free committed prefix below it.
     fn record_fetched(
         ready: &mut BTreeMap<u64, SdkBlockResult>,
-        fetch_error: &mut Option<IngestionError>,
+        fetch_error: &mut Option<(u64, IngestionError)>,
         joined: (u64, Result<SdkBlockResult, IngestionError>),
     ) {
         let (height, result) = joined;
@@ -675,8 +978,15 @@ impl BlockIngestionDriver {
             Ok(block) => {
                 ready.insert(height, block);
             }
-            Err(error) if fetch_error.is_none() => *fetch_error = Some(error),
-            Err(_) => {}
+            Err(error) => {
+                let supersedes = match fetch_error {
+                    Some((failed_height, _)) => height < *failed_height,
+                    None => true,
+                };
+                if supersedes {
+                    *fetch_error = Some((height, error));
+                }
+            }
         }
     }
 
@@ -1976,6 +2286,18 @@ impl BlockIngestionDriver {
                     }
 
                     consecutive_sync_failures = 0;
+                    // A pass that committed its prefix but stalled on a height is
+                    // not a failure — it still must wait before touching that
+                    // height again, on the escalating schedule (30s..5min), or the
+                    // poll tick would re-request the same unservable block within
+                    // seconds. This is the load the node feels most.
+                    if report.stalled_height.is_some() {
+                        let backoff = relief_stall_backoff(self.relief.stall_count());
+                        if wait_or_shutdown(backoff, &mut shutdown_signal).await {
+                            info!("worker shutdown signal received during the stall backoff");
+                            break;
+                        }
+                    }
                     let current_lag = report
                         .rpc_tip_height
                         .saturating_sub(report.cursor_height_after);
@@ -2018,8 +2340,13 @@ impl BlockIngestionDriver {
                     );
                     // Back off on repeated failures (e.g. the RPC node is down) so we
                     // neither hammer it nor log-spam; capped, on top of the poll tick.
-                    let backoff =
-                        Duration::from_secs(u64::from(consecutive_sync_failures.min(6)) * 5);
+                    // A stalled block fetch carries its own, much longer escalating
+                    // wait, which a database failure does not inherit.
+                    let backoff = failed_pass_backoff(
+                        consecutive_sync_failures,
+                        self.relief.stall_count(),
+                        is_database_failure(&error),
+                    );
                     if wait_or_shutdown(backoff, &mut shutdown_signal).await {
                         info!("worker shutdown signal received during the failure backoff");
                         break;
@@ -2511,5 +2838,175 @@ mod tests {
         // A zero backoff is not a wait at all — it must not park the loop on a
         // channel that may never change.
         assert!(!wait_or_shutdown(Duration::ZERO, &mut shutdown_rx).await);
+    }
+
+    /// The escalating wait is what actually keeps a struggling node alive: every
+    /// consecutive failure on the same height must buy it more room, up to the cap.
+    #[test]
+    fn stall_backoff_doubles_per_consecutive_stall_and_caps() {
+        assert_eq!(relief_stall_backoff(0), Duration::ZERO);
+        assert_eq!(relief_stall_backoff(1), Duration::from_secs(30));
+        assert_eq!(relief_stall_backoff(2), Duration::from_secs(60));
+        assert_eq!(relief_stall_backoff(3), Duration::from_secs(120));
+        assert_eq!(relief_stall_backoff(4), Duration::from_secs(240));
+        // 5th doubling would be 480s; the cap takes over and never grows again.
+        assert_eq!(relief_stall_backoff(5), RELIEF_STALL_BACKOFF_MAX);
+        assert_eq!(relief_stall_backoff(6), RELIEF_STALL_BACKOFF_MAX);
+        assert_eq!(relief_stall_backoff(u32::MAX), RELIEF_STALL_BACKOFF_MAX);
+    }
+
+    /// The first stalled fetch must switch shedding on immediately (one block per
+    /// pass), and only a streak of committed blocks may restore the full fan-out.
+    #[test]
+    fn first_stall_sheds_load_and_the_recovery_streak_restores_it() {
+        let relief = RpcReliefState::default();
+        assert!(!relief.is_active());
+
+        let (stalls, entered) = relief.register_stall(8_736_257);
+        assert_eq!(stalls, 1);
+        assert!(entered, "the first stall must report the mode transition");
+        assert!(relief.is_active());
+
+        // Repeating the transition must not re-report it: the log line is once per
+        // episode, not once per pass.
+        let (stalls, entered) = relief.register_stall(8_736_257);
+        assert_eq!(stalls, 2);
+        assert!(!entered);
+
+        // Blocks trickling in one at a time: shedding holds until the streak is met.
+        for _ in 0..(RELIEF_RECOVERY_COMMIT_BLOCKS - 1) {
+            assert!(!relief.register_progress(1));
+            assert!(relief.is_active());
+        }
+        assert!(relief.register_progress(1), "streak met → back to normal");
+        assert!(!relief.is_active());
+        assert_eq!(relief.stall_count(), 0);
+    }
+
+    /// A stall on a different height is a different problem: it must start the
+    /// escalation over instead of inheriting a 5-minute wait from an earlier one.
+    #[test]
+    fn stall_on_a_new_height_restarts_the_escalation() {
+        let relief = RpcReliefState::default();
+        relief.register_stall(8_736_257);
+        relief.register_stall(8_736_257);
+        assert_eq!(relief.stall_count(), 2);
+
+        let (stalls, entered) = relief.register_stall(8_736_259);
+        assert_eq!(stalls, 1);
+        assert!(!entered, "already shedding; only the height changed");
+        assert_eq!(relief.stall_count(), 1);
+    }
+
+    /// A stall in the middle of a recovery streak must void that streak, otherwise
+    /// a flapping node would be handed the full fan-out again after two lucky passes.
+    #[test]
+    fn a_stall_voids_the_recovery_streak() {
+        let relief = RpcReliefState::default();
+        relief.register_stall(100);
+        assert!(!relief.register_progress(RELIEF_RECOVERY_COMMIT_BLOCKS as u64 - 1));
+        relief.register_stall(100);
+
+        // Only one block short of the threshold if the streak had survived.
+        assert!(!relief.register_progress(RELIEF_RECOVERY_COMMIT_BLOCKS as u64 - 1));
+        assert!(relief.is_active());
+    }
+
+    /// Idle passes at the tip commit nothing and must not count as recovery — the
+    /// node is only proven healthy by actually serving blocks.
+    #[test]
+    fn idle_passes_do_not_end_load_shedding() {
+        let relief = RpcReliefState::default();
+        relief.register_stall(100);
+
+        for _ in 0..10 {
+            assert!(!relief.register_progress(0));
+        }
+        assert!(relief.is_active());
+    }
+
+    /// Shedding must be reserved for the node: a Postgres outage would otherwise
+    /// collapse the fetch window and park RPC maintenance while the database, not
+    /// the node, is the thing to fix.
+    #[test]
+    fn database_failures_do_not_shed_rpc_load() {
+        assert!(is_database_failure(&IngestionError::Sqlx(
+            sqlx::Error::PoolClosed
+        )));
+        assert!(!is_database_failure(&IngestionError::EmptyFetchBatch));
+        assert!(!is_database_failure(&IngestionError::PayloadTooLarge {
+            height: 8_736_257
+        }));
+    }
+
+    /// Reaching the tip must end shedding even though no recovery streak was
+    /// earned: with no blocks left to fetch the streak can never be completed, and
+    /// a latched mode would keep RPC maintenance parked while the chain is quiet.
+    #[test]
+    fn catching_up_to_the_tip_ends_load_shedding() {
+        let relief = RpcReliefState::default();
+        relief.register_stall(100);
+        relief.register_progress(1); // one block short of the streak
+        assert!(relief.is_active());
+
+        assert!(relief.clear(), "the first clear reports the transition");
+        assert!(!relief.is_active());
+        assert_eq!(relief.stall_count(), 0);
+        assert!(!relief.clear(), "already normal: nothing to report");
+
+        // A later stall starts a fresh episode at the base backoff.
+        let (stalls, entered) = relief.register_stall(100);
+        assert_eq!(stalls, 1);
+        assert!(entered);
+    }
+
+    /// A pass that commits a whole batch clears shedding in one go: the streak is
+    /// counted in blocks, not in passes.
+    #[test]
+    fn a_committed_batch_ends_load_shedding_in_one_pass() {
+        let relief = RpcReliefState::default();
+        relief.register_stall(100);
+
+        assert!(relief.register_progress(u64::from(RELIEF_RECOVERY_COMMIT_BLOCKS)));
+        assert!(!relief.is_active());
+    }
+
+    /// A pass that committed nothing fails outright, so the caller can name the
+    /// blocked height itself; once anything is committed the path must report the
+    /// stall instead, because only it knows where the window actually broke.
+    #[test]
+    fn only_a_pass_with_committed_blocks_keeps_its_prefix() {
+        let node_failure = IngestionError::PayloadTooLarge { height: 8_736_257 };
+        assert!(!keeps_committed_prefix(0, &node_failure));
+        assert!(keeps_committed_prefix(1, &node_failure));
+
+        // Ours, not the node's: it must stay a hard error at any progress, or a
+        // Postgres outage would masquerade as a stalled block fetch and shed load.
+        let database_failure = IngestionError::Sqlx(sqlx::Error::PoolClosed);
+        assert!(!keeps_committed_prefix(0, &database_failure));
+        assert!(!keeps_committed_prefix(500, &database_failure));
+    }
+
+    /// The relief wait exists to spare the node. A database outage that happens to
+    /// follow a stall must not inherit it — otherwise the worker idles for up to
+    /// five minutes per pass while the component that needs attention is Postgres.
+    #[test]
+    fn a_database_failure_does_not_inherit_the_relief_backoff() {
+        // Same inputs, both failure kinds: 3 consecutive failures = 15 s generic,
+        // and a height that has stalled 5 times = the 300 s relief cap.
+        assert_eq!(
+            failed_pass_backoff(3, 5, false),
+            RELIEF_STALL_BACKOFF_MAX,
+            "a node failure takes the longer of the two schedules"
+        );
+        assert_eq!(
+            failed_pass_backoff(3, 5, true),
+            Duration::from_secs(15),
+            "a database failure keeps the plain generic escalation"
+        );
+
+        // The generic escalation still wins while the relief wait is short or absent.
+        assert_eq!(failed_pass_backoff(6, 0, false), Duration::from_secs(30));
+        assert_eq!(failed_pass_backoff(0, 0, false), Duration::ZERO);
     }
 }

@@ -39,7 +39,10 @@ sync_mode = "normal"
 # fill/drain over the catch-up; near the tip the pass is naturally small.
 fetch_batch_size = 1000
 # Concurrent in-flight block fetches (the C# backend uses 6). Raise to hide
-# remote-RPC latency, but stay within what the node tolerates.
+# remote-RPC latency, but stay within what the node tolerates. This is the
+# ceiling, not a fixed rate: when a fetch stalls, the worker automatically sheds
+# load (one block, one request in flight, escalating 30s..5min waits) until the
+# node serves blocks again, so a range of huge blocks cannot be hammered.
 fetch_concurrency = 6
 poll_seconds = 1
 # Max blocks fetched ahead of the writer (backpressure + jitter buffer); bounds

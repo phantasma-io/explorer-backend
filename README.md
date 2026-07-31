@@ -111,6 +111,18 @@ order, for parity/debug runs. `relief` forces one-block fetch/project windows fo
 difficult ranges. `EXPLORER_WORKER_INTER_BLOCK_DELAY_MS` and
 `EXPLORER_WORKER_BATCH_DELAY_MS` add explicit throttling for heavy chain sections.
 
+### Automatic RPC load shedding
+
+Some historical blocks serialize to well over 100 MB of JSON. When a block fetch
+stalls, the worker shifts on its own into a load-shed pass — one block per window,
+one request in flight, regardless of `fetch_concurrency` — aborts the look-ahead
+fetches that can no longer be committed, and waits before touching that height
+again on an escalating schedule (30 s, doubling to a 5 min cap) while the per-attempt
+RPC timeout escalates too. RPC-heavy maintenance (balances, metadata, supplies,
+failed-tx traces) pauses for the duration, so the node is not squeezed from two
+sides. Normal throughput returns automatically after four committed blocks. Watch
+for `entering RPC load-shed mode` / `leaving RPC load-shed mode` in the worker log.
+
 ### Near-tip maintenance
 
 Once caught up to the tip, the worker also runs best-effort maintenance from the same

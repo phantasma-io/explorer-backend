@@ -75,6 +75,10 @@ pub struct BlockIngestionDriver {
     /// Latches once the configured node is verified to match the stored chain, so the
     /// startup guard's RPC check runs only once per process, not on every sync pass.
     node_guard_checked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Automatic RPC load-shed ("relief") state. Shared by every clone of the
+    /// driver — the block loop and all maintenance tasks — so a node in distress
+    /// is spared by the whole worker, not just by the task that noticed.
+    relief: std::sync::Arc<driver::RpcReliefState>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +110,13 @@ pub struct SyncBatchReport {
     pub cursor_height_after: u64,
     /// In-flight block-fetch concurrency used for this pass (0 when idle).
     pub fetch_concurrency: usize,
+    /// True when this pass ran under automatic RPC load shedding: one block per
+    /// window, one request in flight, regardless of the configured batch size.
+    pub load_shed: bool,
+    /// Lowest height this pass could not fetch, if any. Everything below it was
+    /// committed; the worker backs off on an escalating schedule keyed on this
+    /// height before asking the node for it again.
+    pub stalled_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2170,10 +2181,19 @@ fn non_empty_string(value: &str) -> Option<String> {
     }
 }
 
+/// Plan the next contiguous fetch window.
+///
+/// `load_shed` is the automatic relief switch (see `driver::RpcReliefState`):
+/// while it is set, the window collapses to a single block with a single request
+/// in flight no matter how large the configured batch is. That is the whole point
+/// of shedding — a node that just failed to serve a block must be asked for one
+/// block at a time (with the escalating per-attempt timeout), never for a fresh
+/// fan-out of concurrent multi-megabyte fetches.
 pub fn plan_fetch_window(
     current_height: BlockHeight,
     rpc_tip: BlockHeight,
     settings: &WorkerConfig,
+    load_shed: bool,
 ) -> Result<Option<FetchWindow>, IngestionError> {
     if settings.fetch_batch_size == 0 {
         return Err(IngestionError::EmptyFetchBatch);
@@ -2189,14 +2209,22 @@ pub fn plan_fetch_window(
         return Ok(None);
     }
 
+    let batch_size = if load_shed {
+        1
+    } else {
+        settings.effective_fetch_batch_size()
+    };
     let to_height = next_height
-        .saturating_add(settings.effective_fetch_batch_size().saturating_sub(1))
+        .saturating_add(batch_size.saturating_sub(1))
         .min(target_tip);
 
     let block_count = to_height.saturating_sub(next_height).saturating_add(1);
-    let concurrency = settings
-        .effective_fetch_concurrency()
-        .min(block_count as usize);
+    let requested_concurrency = if load_shed {
+        1
+    } else {
+        settings.effective_fetch_concurrency()
+    };
+    let concurrency = requested_concurrency.min(block_count as usize);
 
     Ok(Some(FetchWindow {
         from_height: BlockHeight::new(next_height),
@@ -2233,8 +2261,12 @@ mod tests {
     fn fetch_window_is_bounded_by_batch_and_tip() {
         // Worker fetch fan-out must stay bounded so catch-up sync does not turn
         // one lagging range into unbounded RPC pressure.
-        let window =
-            plan_fetch_window(BlockHeight::new(10), BlockHeight::new(25), &worker_config());
+        let window = plan_fetch_window(
+            BlockHeight::new(10),
+            BlockHeight::new(25),
+            &worker_config(),
+            false,
+        );
 
         assert!(matches!(
             window,
@@ -2253,7 +2285,8 @@ mod tests {
         let mut settings = worker_config();
         settings.height_limit = Some(12);
 
-        let window = plan_fetch_window(BlockHeight::new(10), BlockHeight::new(25), &settings);
+        let window =
+            plan_fetch_window(BlockHeight::new(10), BlockHeight::new(25), &settings, false);
 
         assert!(matches!(
             window,
@@ -2267,8 +2300,12 @@ mod tests {
 
     #[test]
     fn fetch_window_is_empty_when_cursor_reached_tip() {
-        let window =
-            plan_fetch_window(BlockHeight::new(25), BlockHeight::new(25), &worker_config());
+        let window = plan_fetch_window(
+            BlockHeight::new(25),
+            BlockHeight::new(25),
+            &worker_config(),
+            false,
+        );
 
         assert!(matches!(window, Ok(None)));
     }
@@ -2283,7 +2320,8 @@ mod tests {
         settings.fetch_concurrency = 6;
         settings.project_concurrency = 6;
 
-        let window = plan_fetch_window(BlockHeight::new(10), BlockHeight::new(25), &settings);
+        let window =
+            plan_fetch_window(BlockHeight::new(10), BlockHeight::new(25), &settings, false);
 
         assert!(matches!(
             window,
@@ -2294,6 +2332,51 @@ mod tests {
             })) if from_height.value() == 11 && to_height.value() == 11
         ));
         assert_eq!(settings.effective_project_concurrency(), 1);
+    }
+
+    #[test]
+    fn automatic_load_shedding_overrides_the_configured_fan_out() {
+        // The wedge this prevents: a node that just failed on a 100+ MB block gets
+        // the SAME window again — `fetch_concurrency` concurrent giant fetches —
+        // because the configured batch size never adapts. While shedding, the
+        // window must collapse to one block and one in-flight request no matter
+        // what the config says.
+        let mut settings = worker_config();
+        settings.sync_mode = explorer_config::WorkerSyncMode::Normal;
+        settings.fetch_batch_size = 1000;
+        settings.fetch_concurrency = 6;
+
+        let shedding = plan_fetch_window(
+            BlockHeight::new(8_736_256),
+            BlockHeight::new(8_827_221),
+            &settings,
+            true,
+        );
+        assert!(matches!(
+            shedding,
+            Ok(Some(FetchWindow {
+                from_height,
+                to_height,
+                concurrency: 1,
+            })) if from_height.value() == 8_736_257 && to_height.value() == 8_736_257
+        ));
+
+        // Same inputs without shedding keep the configured throughput, so recovery
+        // returns to full speed rather than crawling one block per pass forever.
+        let normal = plan_fetch_window(
+            BlockHeight::new(8_736_256),
+            BlockHeight::new(8_827_221),
+            &settings,
+            false,
+        );
+        assert!(matches!(
+            normal,
+            Ok(Some(FetchWindow {
+                from_height,
+                to_height,
+                concurrency: 6,
+            })) if from_height.value() == 8_736_257 && to_height.value() == 8_737_256
+        ));
     }
 
     #[test]
