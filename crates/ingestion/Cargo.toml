@@ -22,5 +22,10 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# Paused clock, so the shutdown-aware backoff is tested without waiting out a real
+# five-minute relief wait.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

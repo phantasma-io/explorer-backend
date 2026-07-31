@@ -6,7 +6,24 @@
 use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{Notify, watch};
+
+/// Wait out `backoff`, unless shutdown arrives first; returns true when it did.
+///
+/// Every backoff in the worker loop must be interruptible. A bare `sleep` leaves the
+/// worker deaf to Ctrl+C and SIGTERM for the whole wait, and once a wait grows past
+/// an orchestrator's stop grace period that means the process is hard-killed instead
+/// of stopped.
+async fn wait_or_shutdown(backoff: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    if backoff.is_zero() {
+        return false;
+    }
+    tokio::select! {
+        _ = sleep(backoff) => false,
+        _ = shutdown.changed() => true,
+    }
+}
 
 /// Record a per-token NFT metadata fetch failure. A permanent RPC error (e.g.
 /// `getNFT` "ID not found") would otherwise recur every maintenance cycle because
@@ -2001,9 +2018,11 @@ impl BlockIngestionDriver {
                     );
                     // Back off on repeated failures (e.g. the RPC node is down) so we
                     // neither hammer it nor log-spam; capped, on top of the poll tick.
-                    let backoff_secs = u64::from(consecutive_sync_failures.min(6)) * 5;
-                    if backoff_secs > 0 {
-                        sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    let backoff =
+                        Duration::from_secs(u64::from(consecutive_sync_failures.min(6)) * 5);
+                    if wait_or_shutdown(backoff, &mut shutdown_signal).await {
+                        info!("worker shutdown signal received during the failure backoff");
+                        break;
                     }
                 }
             }
@@ -2455,4 +2474,42 @@ async fn fetch_address_balances(
     }
 
     Ok(balances)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shutdown must cut a backoff short. A worker that sits out a multi-minute
+    /// wait after the signal outlives the stop grace period of every orchestrator
+    /// we deploy under: it is killed rather than stopped.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_a_pending_backoff() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        assert!(
+            shutdown_tx.send(true).is_ok(),
+            "the receiver is still alive"
+        );
+
+        assert!(
+            wait_or_shutdown(Duration::from_secs(300), &mut shutdown_rx).await,
+            "a pending shutdown must end the wait immediately"
+        );
+    }
+
+    /// Without a shutdown the wait runs to completion, so the backoff still does its
+    /// job of keeping the worker off a struggling node.
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_without_shutdown_runs_to_completion() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let backoff = Duration::from_secs(300);
+        let started = tokio::time::Instant::now();
+        assert!(!wait_or_shutdown(backoff, &mut shutdown_rx).await);
+        assert!(started.elapsed() >= backoff);
+
+        // A zero backoff is not a wait at all — it must not park the loop on a
+        // channel that may never change.
+        assert!(!wait_or_shutdown(Duration::ZERO, &mut shutdown_rx).await);
+    }
 }
