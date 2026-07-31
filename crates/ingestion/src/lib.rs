@@ -1461,13 +1461,20 @@ fn event_to_projection(
         event_kind.as_str(),
         "Custom" | "Custom_V2" | "LeaderboardCreate" | "ValidatorSwitch"
     ) {
-        // Self-describing contract events. The node collapses ABI-declared
-        // contract events (whose on-chain kind byte collides with a native kind,
-        // e.g. marketplace.AuctionCreated on byte 68) to kind "Custom_V2" and
-        // carries the real ABI event name in `name`. Preserve that name so the
-        // API and UI can label the event by its real name; the payload stays
-        // opaque (kept in raw_data, no native decoder is applied).
-        event_name = non_empty_string(&event.name);
+        // Opaque kinds: the payload keeps the InitPayload shape, the bytes stay
+        // in raw_data, and no native decoder is applied (C# parity).
+        //
+        // Only "Custom_V2" carries a name worth storing. The node collapses
+        // ABI-declared contract events (whose on-chain kind byte collides with a
+        // native kind, e.g. marketplace.AuctionCreated on byte 68) to that kind
+        // and puts the real ABI event name in `name`, so the API and UI can label
+        // the event properly. For the other three kinds the node echoes the kind
+        // itself: storing that would duplicate what
+        // `COALESCE(event_name, event_kind.name)` already yields on read, and
+        // would hand the node a way to silently relabel a native kind in the API.
+        if event_kind.as_str() == "Custom_V2" {
+            event_name = non_empty_string(&event.name);
+        }
     } else {
         payload_json = serde_json::json!({
             "address": &event.address,
@@ -3087,8 +3094,10 @@ mod tests {
                     .and_then(|v| v.get("data"))
                     .is_none()
             );
-            // A nameless legacy Custom event echoes its name field verbatim.
-            assert_eq!(events[1].event_name.as_deref(), Some("Custom"));
+            // A legacy Custom event only echoes its own kind in `name`. Storing
+            // that would duplicate what the read-side COALESCE already produces,
+            // so the column stays NULL for every kind except Custom_V2.
+            assert!(events[1].event_name.is_none());
             assert_eq!(events[2].event_kind, "Custom_V2");
             assert!(
                 events[2]
