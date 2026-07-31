@@ -362,9 +362,14 @@ pub struct AddressBalanceUpsert {
 }
 
 /// The balance-sync projection of one account. Carries only what the new
-/// lightweight account endpoints provide: name, stake and balance rows. The
-/// legacy `validator`/`storage`/`avatar` fields were dead gen2 leftovers the
-/// gen3 RPC hardcoded for every address, and are no longer written.
+/// lightweight account endpoints provide: name, stake and balance rows.
+///
+/// The legacy `validator`/`storage`/`avatar` fields are no longer written — the
+/// gen3 RPC does not supply them and hardcodes them on the endpoints that still
+/// echo them. Their COLUMNS stay: in the zero state they hold gen1/gen2 account
+/// state that no live source can reproduce (3,459 distinct `storage_available`
+/// values, 32 distinct `storage_used`, 3 distinct avatars, and the 4 addresses
+/// marked `Primary` validators). They are simply frozen at those values now.
 #[derive(Debug, Clone)]
 pub struct AddressAccountUpsert {
     pub address_id: i32,
