@@ -1394,7 +1394,15 @@ impl BlockIngestionDriver {
                         }
                     }
                 }
-                Err(error) => return Err(error.into()),
+                // A one-address chunk cannot be narrowed down further, and
+                // re-issuing the call that just failed would only double the load.
+                // It still must not fail the whole pass: whether a fetch failure
+                // costs one address or every address in the batch would otherwise
+                // depend on nothing but where the chunk boundary happened to fall.
+                Err(error) => warn!(
+                    %error,
+                    "account info fetch failed for a single-address chunk; keeping it dirty"
+                ),
             }
         }
 
