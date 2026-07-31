@@ -673,6 +673,16 @@ impl BlockIngestionDriver {
         }
     }
 
+    /// RPC-heavy maintenance families stand down while the block loop is shedding
+    /// load: a node that cannot serve a block must not be asked for balances,
+    /// metadata, supplies or debug traces at the same time (C# gates its balance
+    /// and failed-tx syncs on relief mode for the same reason). Purely local work
+    /// (the Soul-Masters curve) and third-party APIs (CoinGecko, 22series) are
+    /// deliberately left running — they put no load on our node.
+    fn rpc_maintenance_paused(&self) -> bool {
+        self.relief.is_active()
+    }
+
     // Zero-state protection (network-agnostic by design). The gen2 base — `main`
     // heights at or below the boundary — is the shared, immutable foundation for
     // EVERY network: mainnet, devnet, and testnet all restore the same zero-state
@@ -2482,6 +2492,9 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
+            if self.rpc_maintenance_paused() {
+                continue;
+            }
             match self.sync_dirty_balances_once().await {
                 Ok(balance_report) if balance_report.updated_accounts > 0 => info!(
                     "synced balances accounts={} reset_dirty={} dirty_before={} lag={}",
@@ -2543,6 +2556,9 @@ impl BlockIngestionDriver {
                 _ = shutdown.changed() => return,
             }
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            if self.rpc_maintenance_paused() {
                 continue;
             }
             match self.sync_token_supplies_once().await {
@@ -2636,6 +2652,9 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
+            if self.rpc_maintenance_paused() {
+                continue;
+            }
             match self.sync_contract_upgrade_methods_once().await {
                 Ok(upgrade_report)
                     if upgrade_report.inserted_methods > 0
@@ -2690,6 +2709,9 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
+            if self.rpc_maintenance_paused() {
+                continue;
+            }
             match self.sync_nft_rpc_metadata_once().await {
                 Ok(nft_report) if nft_report.updated_nfts > 0 => info!(
                     "synced NFT RPC metadata selected={} fetched={} updated={} lag={}",
@@ -2721,6 +2743,9 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
+            if self.rpc_maintenance_paused() {
+                continue;
+            }
             match self.sync_series_rpc_metadata_once().await {
                 Ok(series_report) if series_report.updated_series > 0 => info!(
                     "synced series RPC metadata selected={} fetched={} updated={} lag={}",
@@ -2750,6 +2775,9 @@ impl BlockIngestionDriver {
                 _ = shutdown.changed() => return,
             }
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            if self.rpc_maintenance_paused() {
                 continue;
             }
             match self.sync_failed_transaction_debug_comments_once().await {
