@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
+use tokio::task::AbortHandle;
 
 /// Committed blocks required, without a stall in between, before the worker
 /// leaves load-shed mode. Recovery is deliberately conservative so one lucky
@@ -833,6 +834,10 @@ impl BlockIngestionDriver {
             .max(concurrency as u64);
 
         let mut tasks: JoinSet<(u64, Result<SdkBlockResult, IngestionError>)> = JoinSet::new();
+        // Abort handles of the in-flight fetches, keyed by height, so the look-ahead
+        // above a failed height can be cancelled instead of downloading tens of
+        // megabytes that are guaranteed to be discarded (see `record_fetched`).
+        let mut in_flight: BTreeMap<u64, AbortHandle> = BTreeMap::new();
         let mut ready: BTreeMap<u64, SdkBlockResult> = BTreeMap::new();
         let mut next_to_spawn = from;
         let mut next_to_write = from;
@@ -853,12 +858,13 @@ impl BlockIngestionDriver {
             {
                 let driver = self.clone();
                 let height = BlockHeight::new(next_to_spawn);
-                tasks.spawn(async move {
+                let handle = tasks.spawn(async move {
                     (
                         height.value(),
                         driver.fetch_decoded_block_for_projection(height).await,
                     )
                 });
+                in_flight.insert(next_to_spawn, handle);
                 next_to_spawn += 1;
             }
 
@@ -869,7 +875,7 @@ impl BlockIngestionDriver {
             // batched instead of paying an await per block; when fetch is the
             // bottleneck `ready` stays near-empty and fetch overlaps the writes.
             while let Some(joined) = tasks.try_join_next() {
-                Self::record_fetched(&mut ready, &mut fetch_error, joined?);
+                Self::record_fetched(&mut ready, &mut fetch_error, &mut in_flight, joined)?;
             }
 
             // Write every block that is now contiguous from the cursor, in order.
@@ -915,7 +921,7 @@ impl BlockIngestionDriver {
             // The next contiguous block is not fetched yet — block until one more
             // in-flight fetch finishes, then loop back to spawn/harvest/write.
             if let Some(joined) = tasks.join_next().await {
-                Self::record_fetched(&mut ready, &mut fetch_error, joined?);
+                Self::record_fetched(&mut ready, &mut fetch_error, &mut in_flight, joined)?;
             }
         }
 
@@ -968,12 +974,27 @@ impl BlockIngestionDriver {
     /// Record a completed block fetch from the pipeline: buffer a fetched block
     /// for the writer, or remember the LOWEST failed height so the writer stops
     /// there with a gap-free committed prefix below it.
+    ///
+    /// On a failure it also aborts every fetch still running for a HIGHER height.
+    /// Those blocks can no longer be committed in this pass (the cursor advances
+    /// contiguously, so the gap blocks them) and their payloads would be decoded
+    /// and thrown away — on the 100+ MB blocks that is exactly the pointless load
+    /// that pushes a struggling node over the edge.
+    ///
+    /// Deliberate cancellations surface as cancelled joins and are not failures;
+    /// any other join error is a real task panic and is propagated.
     fn record_fetched(
         ready: &mut BTreeMap<u64, SdkBlockResult>,
         fetch_error: &mut Option<(u64, IngestionError)>,
-        joined: (u64, Result<SdkBlockResult, IngestionError>),
-    ) {
-        let (height, result) = joined;
+        in_flight: &mut BTreeMap<u64, AbortHandle>,
+        joined: Result<(u64, Result<SdkBlockResult, IngestionError>), tokio::task::JoinError>,
+    ) -> Result<(), IngestionError> {
+        let (height, result) = match joined {
+            Ok(joined) => joined,
+            Err(join_error) if join_error.is_cancelled() => return Ok(()),
+            Err(join_error) => return Err(join_error.into()),
+        };
+        in_flight.remove(&height);
         match result {
             Ok(block) => {
                 ready.insert(height, block);
@@ -984,10 +1005,14 @@ impl BlockIngestionDriver {
                     None => true,
                 };
                 if supersedes {
+                    for (_, handle) in in_flight.split_off(&height) {
+                        handle.abort();
+                    }
                     *fetch_error = Some((height, error));
                 }
             }
         }
+        Ok(())
     }
 
     pub async fn mark_all_balances_dirty_once(
