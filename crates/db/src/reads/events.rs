@@ -450,6 +450,26 @@ pub async fn market_event_usd_prices(
 
 /// Load the token rows used to enrich event payloads, by uppercase symbol. The
 /// API builds the per-symbol JSON map from these rows.
+/// Reads one event's stored payload, for the endpoints that serve a part of it on
+/// demand instead of shipping the whole thing with every event row.
+pub async fn event_payload_by_id(
+    executor: impl sqlx::PgExecutor<'_>,
+    event_id: i32,
+) -> Result<Option<Value>, DbError> {
+    let payload = sqlx::query_scalar::<_, Option<Value>>(
+        r#"
+        SELECT event.payload_json
+        FROM events event
+        WHERE event.id = $1
+        "#,
+    )
+    .bind(event_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(payload.flatten())
+}
+
 pub async fn list_event_tokens_by_symbols(
     executor: impl sqlx::PgExecutor<'_>,
     symbols: &[String],

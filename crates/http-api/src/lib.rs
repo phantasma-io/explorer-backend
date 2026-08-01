@@ -17,11 +17,11 @@ use explorer_db::{
     TransactionFilter, TransactionOrderBy, TransactionPage, address_id_by_address, block_detail,
     chain_ids_by_name, check_health, circulating_soul_supply, count_chains,
     count_contract_method_histories, count_event_kinds, count_history_prices, count_oracles,
-    count_platforms, list_addresses, list_blocks, list_chains, list_contract_method_histories,
-    list_contracts, list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
-    list_events_by_address, list_events_by_transaction_ids, list_events_global,
-    list_history_prices, list_nfts, list_oracles, list_organizations, list_platforms,
-    list_rejected_transaction_candidates, list_series, list_signatures,
+    count_platforms, event_payload_by_id, list_addresses, list_blocks, list_chains,
+    list_contract_method_histories, list_contracts, list_event_kinds, list_event_kinds_with_events,
+    list_event_tokens_by_symbols, list_events_by_address, list_events_by_transaction_ids,
+    list_events_global, list_history_prices, list_nfts, list_oracles, list_organizations,
+    list_platforms, list_rejected_transaction_candidates, list_series, list_signatures,
     list_soul_masters_monthlies, list_staking_dailies, list_tokens, list_transaction_occurrences,
     list_transactions_by_block_ids, list_transactions_for_address_timeline,
     list_transactions_for_filtered_address, list_transactions_global, new_address_dailies,
@@ -103,7 +103,8 @@ impl ApiState {
         transactions,
         transaction_by_hash,
         transaction_by_block_index,
-        events
+        events,
+        event_resolution_calls
     ),
     components(schemas(
         AddressRefResponse,
@@ -115,6 +116,7 @@ impl ApiState {
         EventResponse,
         HealthResponse,
         RawBlockResponse,
+        ResolutionCallListResponse,
         SignatureResponse,
         TransactionDetailResponse,
         TransactionListResponse,
@@ -223,6 +225,21 @@ struct BlockListQuery {
 struct BlockListResponse {
     total_results: Option<i64>,
     blocks: Vec<BlockResponse>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionCallListQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// One page of a special resolution's calls, each with the decoded arguments the event
+/// response leaves out.
+#[derive(Debug, Serialize, ToSchema)]
+struct ResolutionCallListResponse {
+    total_results: i64,
+    calls: Vec<Value>,
     next_cursor: Option<String>,
 }
 
@@ -1292,6 +1309,10 @@ pub fn router(state: ApiState, rate_limiter: RateLimiter) -> Router {
         .route("/api/v1/transactions", get(transactions))
         .route("/api/v1/transactions/{hash}", get(transaction_by_hash))
         .route("/api/v1/events", get(events))
+        .route(
+            "/api/v1/events/{id}/resolution-calls",
+            get(event_resolution_calls),
+        )
         .route("/health", get(health))
         .route("/version", get(version))
         // Innermost layer: turn a handler panic into a logged 500 instead of a
@@ -1416,6 +1437,88 @@ mod tests {
 
         assert!(parsed_signature.verify(&message_bytes, [&keys.address()]));
         Ok(())
+    }
+
+    #[test]
+    fn special_resolution_travels_without_its_arguments_or_a_second_copy() {
+        // A stored repair resolution reaches 43 MB, almost all of it call arguments that
+        // no list or detail view renders — and the payload used to travel twice, once as
+        // the typed field and once as the escaped `payload_json` string. The event
+        // response must carry neither: the counts stay, the arguments move to
+        // /api/v1/events/{id}/resolution-calls.
+        let payload = serde_json::json!({
+            "event_kind": "SpecialResolution",
+            "chain": "main",
+            "special_resolution_event": {
+                "resolution_id": "44",
+                "description": "Repair",
+                "calls": [{
+                    "module": "phantasma_vm",
+                    "module_id": 2,
+                    "method": "RepairSeries",
+                    "method_id": 15,
+                    "arguments": { "supplementsCount": "9600" },
+                    "calls": []
+                }]
+            }
+        });
+
+        let fields =
+            build_event_data_fields("SpecialResolution", Some(&payload), None, &HashMap::new());
+        assert!(fields.special_resolution_event.is_some());
+        let Some(resolution) = fields.special_resolution_event else {
+            return;
+        };
+
+        assert_eq!(resolution.get("calls_total"), Some(&serde_json::json!(1)));
+        let call = &resolution["calls"][0];
+        assert_eq!(call.get("method"), Some(&serde_json::json!("RepairSeries")));
+        assert_eq!(
+            call.get("arguments"),
+            None,
+            "arguments must not travel inline"
+        );
+        assert_eq!(call.get("has_arguments"), Some(&serde_json::json!(true)));
+
+        let stripped = payload_json_without_special_resolution(&payload);
+        assert_eq!(stripped.get("special_resolution_event"), None);
+        assert_eq!(stripped.get("chain"), Some(&serde_json::json!("main")));
+    }
+
+    #[test]
+    fn special_resolution_calls_are_capped_inline() {
+        // A repair resolution can carry thousands of calls; the inline list is capped so
+        // one event cannot turn a list endpoint into a multi-megabyte answer, while
+        // `calls_total` still reports the real number.
+        let calls = (0..SPECIAL_RESOLUTION_INLINE_CALLS + 25)
+            .map(|index| {
+                serde_json::json!({
+                    "module": "token",
+                    "method": "TransferFungible",
+                    "method_id": index,
+                    "arguments": { "amount": "1" }
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "special_resolution_event": { "resolution_id": "44", "calls": calls }
+        });
+
+        let fields =
+            build_event_data_fields("SpecialResolution", Some(&payload), None, &HashMap::new());
+        assert!(fields.special_resolution_event.is_some());
+        let Some(resolution) = fields.special_resolution_event else {
+            return;
+        };
+
+        assert_eq!(
+            resolution.get("calls_total"),
+            Some(&serde_json::json!(SPECIAL_RESOLUTION_INLINE_CALLS + 25))
+        );
+        assert_eq!(
+            resolution["calls"].as_array().map(Vec::len),
+            Some(SPECIAL_RESOLUTION_INLINE_CALLS)
+        );
     }
 
     #[test]

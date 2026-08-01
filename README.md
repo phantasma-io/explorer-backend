@@ -139,6 +139,14 @@ every token — measured on devnet, `getTokens(false)` is 35 KB against 1.34 MB 
 rewrites it. The values keep their VM shape, so a scalar is a string while an array or
 a struct is stored as itself; `/api/v1/tokens?with_metadata=1` returns them.
 
+### Special-resolution calls
+
+A governance repair resolution can carry thousands of calls and tens of megabytes of
+decoded arguments in one event. Event responses therefore report `calls_total` and
+inline only the first 50 calls without their arguments; the full list is served a page
+at a time by `GET /api/v1/events/{id}/resolution-calls`, the only route that returns the
+arguments.
+
 ## Parity Tooling
 
 `explorer-parity` compares two Explorer databases by semantic digest, ignoring

@@ -1121,6 +1121,60 @@ pub(crate) async fn rejected_transactions(
 
 #[utoipa::path(
     get,
+    path = "/api/v1/events/{id}/resolution-calls",
+    tag = "events",
+    params(
+        ("id" = i32, Path, description = "Event id."),
+        ("limit" = Option<i64>, Query, description = "Calls per page (1-100, default 50)."),
+        ("cursor" = Option<String>, Query, description = "Offset cursor from the previous page.")
+    ),
+    responses(
+        (status = 200, description = "One page of the resolution's calls, with their decoded arguments.", body = ResolutionCallListResponse),
+        (status = 404, description = "The event is not a special resolution.", body = ErrorResponse),
+        (status = 500, description = "Database error.", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn event_resolution_calls(
+    State(state): State<ApiState>,
+    Path(event_id): Path<i32>,
+    Query(query): Query<ResolutionCallListQuery>,
+) -> Result<Json<ResolutionCallListResponse>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let offset = OffsetCursor::parse_optional(query.cursor)?;
+
+    // The calls live inside the event's own stored payload, so this pages an array
+    // instead of querying rows: a resolution is a single event, and its calls are not a
+    // table of their own. Only this route ships their decoded arguments.
+    let payload = event_payload_by_id(&state.pool, event_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("event {event_id} has no stored payload")))?;
+    let calls = payload
+        .get("special_resolution_event")
+        .and_then(|resolution| resolution.get("calls"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("event {event_id} is not a special resolution"))
+        })?;
+
+    let offset_index = usize::try_from(offset).unwrap_or(usize::MAX);
+    let page = calls
+        .iter()
+        .skip(offset_index)
+        .take(usize::try_from(limit).unwrap_or_default())
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_cursor = (offset_index.saturating_add(page.len()) < calls.len())
+        .then(|| OffsetCursor(offset + page.len() as i64).encode());
+
+    Ok(Json(ResolutionCallListResponse {
+        total_results: calls.len() as i64,
+        calls: page,
+        next_cursor,
+    }))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/raw-blocks/{height}",
     tag = "blocks",
     params(("height" = u64, Path, description = "Block height.")),

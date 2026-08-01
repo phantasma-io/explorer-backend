@@ -734,6 +734,8 @@ pub(crate) fn event_from_row(
     let payload_json = if with_event_data {
         payload_value
             .as_ref()
+            .map(payload_json_without_special_resolution)
+            .as_ref()
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| {
@@ -777,6 +779,97 @@ pub(crate) fn event_from_row(
     })
 }
 
+/// Top-level calls a special resolution shows inline in an event response.
+///
+/// A repair resolution carries thousands of them, so a list endpoint would otherwise
+/// turn one event into a multi-megabyte answer. The real count travels as `calls_total`
+/// and `/api/v1/events/{id}/resolution-calls` serves the rest.
+pub(crate) const SPECIAL_RESOLUTION_INLINE_CALLS: usize = 50;
+
+/// The stored payload minus the special-resolution data.
+///
+/// `payload_json` is the raw fallback a client shows when no typed field exists; for a
+/// special resolution the typed field is right there in the same response, so repeating
+/// the whole payload as an escaped string doubled the answer — 43 MB twice for the worst
+/// stored resolution.
+pub(crate) fn payload_json_without_special_resolution(payload: &Value) -> Value {
+    let Some(object) = payload.as_object() else {
+        return payload.clone();
+    };
+    if !object.contains_key("special_resolution_event") {
+        return payload.clone();
+    }
+    let mut kept = serde_json::Map::new();
+    for (key, value) in object {
+        if key != "special_resolution_event" {
+            kept.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(kept)
+}
+
+/// Projects a stored special-resolution payload for an event response: the call list is
+/// capped at every level and the decoded arguments are left out.
+///
+/// The arguments are the entire weight of these payloads — one stored resolution holds
+/// 43 MB of them — and no view renders them inline, so shipping them with every event
+/// was pure transfer cost. `has_arguments` says whether a call has any, `calls_total`
+/// keeps the real counts visible, and the dedicated endpoint serves the full calls with
+/// their arguments a page at a time.
+fn project_special_resolution(payload: &Value) -> Value {
+    let Some(object) = payload.as_object() else {
+        return payload.clone();
+    };
+    let mut projected = serde_json::Map::new();
+    for key in ["resolution_id", "description"] {
+        if let Some(value) = object.get(key) {
+            projected.insert(key.to_owned(), value.clone());
+        }
+    }
+    let calls = object.get("calls").and_then(Value::as_array);
+    projected.insert(
+        "calls_total".to_owned(),
+        Value::from(calls.map_or(0, Vec::len)),
+    );
+    projected.insert(
+        "calls".to_owned(),
+        Value::Array(project_resolution_calls(calls.map_or(&[], Vec::as_slice))),
+    );
+    Value::Object(projected)
+}
+
+fn project_resolution_calls(calls: &[Value]) -> Vec<Value> {
+    calls
+        .iter()
+        .take(SPECIAL_RESOLUTION_INLINE_CALLS)
+        .map(|call| {
+            let Some(object) = call.as_object() else {
+                return call.clone();
+            };
+            let mut projected = serde_json::Map::new();
+            for key in ["module", "module_id", "method", "method_id"] {
+                if let Some(value) = object.get(key) {
+                    projected.insert(key.to_owned(), value.clone());
+                }
+            }
+            projected.insert(
+                "has_arguments".to_owned(),
+                Value::Bool(object.contains_key("arguments")),
+            );
+            let nested = object.get("calls").and_then(Value::as_array);
+            projected.insert(
+                "calls_total".to_owned(),
+                Value::from(nested.map_or(0, Vec::len)),
+            );
+            projected.insert(
+                "calls".to_owned(),
+                Value::Array(project_resolution_calls(nested.map_or(&[], Vec::as_slice))),
+            );
+            Value::Object(projected)
+        })
+        .collect()
+}
+
 pub(crate) fn build_event_data_fields(
     event_kind: &str,
     payload: Option<&Value>,
@@ -804,7 +897,7 @@ pub(crate) fn build_event_data_fields(
         fields.governance_chain_config_event = Some(value.clone());
     }
     if let Some(value) = payload.get("special_resolution_event") {
-        fields.special_resolution_event = Some(value.clone());
+        fields.special_resolution_event = Some(project_special_resolution(value));
     }
     if let Some(value) = payload.get("hash_event") {
         fields.hash_event = Some(value.clone());
