@@ -1532,6 +1532,34 @@ impl BlockIngestionDriver {
         })
     }
 
+    /// Refreshes `tokens.metadata` from the node's extended token answer.
+    ///
+    /// Kept apart from the supply sync because the extended answer also carries every
+    /// series of every token and is two orders of magnitude larger; metadata only moves
+    /// when a governance call rewrites it, so a slow tick is enough.
+    pub async fn sync_token_metadata_once(
+        &self,
+    ) -> Result<TokenMetadataSyncReport, IngestionError> {
+        let tokens = self.rpc.get_tokens(true).await?;
+        let metadata = tokens
+            .iter()
+            .filter_map(token_result_to_metadata_upsert)
+            .collect::<Vec<_>>();
+
+        let mut transaction = self.pool.begin().await?;
+        let chain_id = explorer_db::resolve_chain_id(&mut transaction, &self.chain.chain).await?;
+        let updated_tokens =
+            explorer_db::update_token_metadata(&mut transaction, chain_id, &metadata).await?;
+        transaction.commit().await?;
+
+        Ok(TokenMetadataSyncReport {
+            configured_nexus: self.chain.nexus.to_string(),
+            chain: self.chain.chain.to_string(),
+            fetched_tokens: tokens.len(),
+            updated_tokens,
+        })
+    }
+
     /// Refreshes token prices from CoinGecko, mirroring the C# `Price.CoinGecko` plugin. It does
     /// two things: a live `/simple/price` refresh of `tokens.price_*`, then resumes the daily USD
     /// history backfill into
@@ -2451,6 +2479,12 @@ impl BlockIngestionDriver {
             let driver = self.clone();
             let lag = lag.clone();
             let shutdown = shutdown.clone();
+            tasks.spawn(async move { driver.run_token_metadata_maintenance(lag, shutdown).await });
+        }
+        {
+            let driver = self.clone();
+            let lag = lag.clone();
+            let shutdown = shutdown.clone();
             tasks.spawn(async move { driver.run_token_price_maintenance(lag, shutdown).await });
         }
         {
@@ -2589,6 +2623,37 @@ impl BlockIngestionDriver {
                 ),
                 Ok(_) => {}
                 Err(error) => warn!(%error, "token supply sync failed"),
+            }
+        }
+    }
+
+    async fn run_token_metadata_maintenance(
+        &self,
+        lag: Arc<AtomicU64>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut ticker = interval(std::time::Duration::from_secs(
+            TOKEN_METADATA_SYNC_INTERVAL_SECONDS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
+                continue;
+            }
+            if self.rpc_maintenance_paused() {
+                continue;
+            }
+            match self.sync_token_metadata_once().await {
+                Ok(report) if report.updated_tokens > 0 => info!(
+                    "synced token metadata fetched={} updated={}",
+                    report.fetched_tokens, report.updated_tokens
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(%error, "token metadata sync failed"),
             }
         }
     }

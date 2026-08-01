@@ -41,13 +41,15 @@ impl TokenOrderBy {
 }
 
 /// Filter + scope for a tokens query. `q` must already be in the caller's
-/// `%...%` form; `with_logo` toggles the embedded logos JSON in the projection.
+/// `%...%` form; `with_logo` and `with_metadata` toggle the embedded logos JSON
+/// and the token's on-chain metadata in the projection.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenFilter<'a> {
     pub chain_id: i32,
     pub symbol: Option<&'a str>,
     pub q: Option<&'a str>,
     pub with_logo: bool,
+    pub with_metadata: bool,
 }
 
 /// List tokens for a chain, filtered by exact symbol and/or a free `q` substring
@@ -102,7 +104,8 @@ pub async fn list_tokens(
                 FROM token_logos logo
                 JOIN token_logo_types logo_type ON logo_type.id = logo.token_logo_type_id
                 WHERE logo.token_id = token.id
-            ) ELSE NULL END AS token_logos_json
+            ) ELSE NULL END AS token_logos_json,
+            CASE WHEN $7::boolean THEN token.metadata ELSE NULL END AS metadata_json
         FROM tokens token
         WHERE token.chain_id = $1
           AND ($2::text IS NULL OR token.symbol = $2)
@@ -119,6 +122,7 @@ pub async fn list_tokens(
         .bind(filter.with_logo)
         .bind(limit)
         .bind(offset)
+        .bind(filter.with_metadata)
         .fetch_all(executor)
         .await?;
 

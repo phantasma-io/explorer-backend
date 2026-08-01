@@ -409,19 +409,21 @@ pub(crate) async fn tokens(
     let q = empty_to_none(query.q).map(|value| format!("%{value}%"));
     let with_price = query.with_price == Some(1);
     let with_logo = query.with_logo == Some(1);
+    let with_metadata = query.with_metadata == Some(1);
 
     let filter = TokenFilter {
         chain_id,
         symbol: symbol.as_deref(),
         q: q.as_deref(),
         with_logo,
+        with_metadata,
     };
     let rows = list_tokens(&state.pool, &filter, order_by, direction, limit + 1, offset).await?;
 
     let (rows, next_cursor) = trim_offset_rows(rows, limit, offset)?;
     let tokens = rows
         .iter()
-        .map(|row| token_from_row(row, with_price, with_logo))
+        .map(|row| token_from_row(row, with_price, with_logo, with_metadata))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(TokenListResponse {
         total_results: None,

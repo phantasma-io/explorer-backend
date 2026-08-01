@@ -126,11 +126,18 @@ for `entering RPC load-shed mode` / `leaving RPC load-shed mode` in the worker l
 ### Near-tip maintenance
 
 Once caught up to the tip, the worker also runs best-effort maintenance from the same
-config: token-supply refresh, dirty address-balance refresh, current stake snapshots,
-failed-transaction `debug_comment` recovery, CoinGecko token prices, and off-chain
-TTRS NFT metadata. Each can be run once for inspection with the matching
+config: token-supply refresh, token metadata, dirty address-balance refresh, current
+stake snapshots, failed-transaction `debug_comment` recovery, CoinGecko token prices,
+and off-chain TTRS NFT metadata. Each can be run once for inspection with the matching
 `just worker-local-*` recipe or `--*-sync-once` worker flag (`explorer-worker --help`
 lists them all).
+
+Token metadata runs on its own slow tick (10 minutes) instead of with the per-minute
+supply refresh: it needs the extended token answer, which also carries every series of
+every token — measured on devnet, `getTokens(false)` is 35 KB against 1.34 MB for
+`getTokens(true)` — while the metadata itself only changes when a governance call
+rewrites it. The values keep their VM shape, so a scalar is a string while an array or
+a struct is stored as itself; `/api/v1/tokens?with_metadata=1` returns them.
 
 ## Parity Tooling
 

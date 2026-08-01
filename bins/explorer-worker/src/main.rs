@@ -6,8 +6,8 @@ use explorer_ingestion::{
     BalanceDirtyMarkReport, BalanceSyncReport, BlockIngestionDriver, ContractRpcMetadataSyncReport,
     ContractStringEventSideEffectSyncReport, ContractUpgradeMethodSyncReport,
     FailedTransactionDebugSyncReport, NftRpcMetadataSyncReport, SeriesRpcMetadataSyncReport,
-    StartupProbe, SyncBatchReport, TokenPriceSyncReport, TokenSupplySyncReport,
-    TtrsOffchainSyncReport,
+    StartupProbe, SyncBatchReport, TokenMetadataSyncReport, TokenPriceSyncReport,
+    TokenSupplySyncReport, TtrsOffchainSyncReport,
 };
 use explorer_rpc::PhantasmaSdkClient;
 use std::path::PathBuf;
@@ -46,6 +46,9 @@ struct Args {
     /// Run one token supply sync batch and exit.
     #[arg(long, env = "EXPLORER_WORKER_TOKEN_SUPPLY_SYNC_ONCE")]
     token_supply_sync_once: bool,
+    /// Run one token metadata sync batch and exit.
+    #[arg(long, env = "EXPLORER_WORKER_TOKEN_METADATA_SYNC_ONCE")]
+    token_metadata_sync_once: bool,
     /// Run one token price sync (live CoinGecko prices + daily history) and exit.
     #[arg(long, env = "EXPLORER_WORKER_TOKEN_PRICE_SYNC_ONCE")]
     token_price_sync_once: bool,
@@ -137,6 +140,10 @@ async fn main() -> anyhow::Result<()> {
     } else if args.token_supply_sync_once {
         let report = driver.sync_token_supplies_once().await?;
         log_token_supply_sync_batch(&report);
+        return Ok(());
+    } else if args.token_metadata_sync_once {
+        let report = driver.sync_token_metadata_once().await?;
+        log_token_metadata_sync_batch(&report);
         return Ok(());
     } else if args.token_price_sync_once {
         let report = driver.sync_token_prices_once().await?;
@@ -305,6 +312,13 @@ fn log_contract_upgrade_method_sync_batch(report: &ContractUpgradeMethodSyncRepo
 fn log_token_supply_sync_batch(report: &TokenSupplySyncReport) {
     info!(
         "synced token supplies fetched={} updated={}",
+        report.fetched_tokens, report.updated_tokens
+    );
+}
+
+fn log_token_metadata_sync_batch(report: &TokenMetadataSyncReport) {
+    info!(
+        "synced token metadata fetched={} updated={}",
         report.fetched_tokens, report.updated_tokens
     );
 }

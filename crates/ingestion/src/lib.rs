@@ -4,8 +4,8 @@ use explorer_db::{
     ContractRpcMetadataCandidate, ContractRpcMetadataUpsert, ContractStringEventSideEffectReport,
     ContractUpgradeMethodCandidate, ContractUpgradeMethodUpsert, DirtyAddress, EventSource,
     EventUpsert, NftRpcMetadataCandidate, NftRpcMetadataUpsert, RawBlockRecord,
-    SeriesRpcMetadataCandidate, SeriesRpcMetadataUpsert, TokenSupplyUpsert, TransactionRecord,
-    TransactionSignatureUpsert, TransactionUpsert,
+    SeriesRpcMetadataCandidate, SeriesRpcMetadataUpsert, TokenMetadataUpsert, TokenSupplyUpsert,
+    TransactionRecord, TransactionSignatureUpsert, TransactionUpsert,
 };
 use explorer_domain::{BlockHeight, ChainName, MAIN_ZERO_STATE_BOUNDARY_HEIGHT};
 use explorer_rpc::{
@@ -53,6 +53,11 @@ const BALANCE_FETCH_CONCURRENCY: usize = 8;
 const BALANCE_MAX_PAGES: usize = 1000;
 const STAKE_PROJECTION_INTERVAL_SECONDS: u64 = 30;
 const TOKEN_SUPPLY_SYNC_INTERVAL_SECONDS: u64 = 60;
+/// Token metadata is read from the extended token answer, which also carries every
+/// series of every token: measured on devnet, `getTokens(false)` is 35 KB while
+/// `getTokens(true)` is 1.34 MB. Metadata only changes through a governance call, so it
+/// gets its own slow tick instead of riding on the per-minute supply sync.
+const TOKEN_METADATA_SYNC_INTERVAL_SECONDS: u64 = 600;
 const CONTRACT_RPC_METADATA_SYNC_INTERVAL_SECONDS: u64 = 300;
 const CONTRACT_RPC_METADATA_STALE_SECONDS: i64 = 30 * 60;
 const CONTRACT_RPC_METADATA_SYNC_BATCH_SIZE: i64 = 1_000;
@@ -184,6 +189,14 @@ pub struct ContractUpgradeMethodSyncReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenSupplySyncReport {
+    pub configured_nexus: String,
+    pub chain: String,
+    pub fetched_tokens: usize,
+    pub updated_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenMetadataSyncReport {
     pub configured_nexus: String,
     pub chain: String,
     pub fetched_tokens: usize,
@@ -604,6 +617,18 @@ fn token_result_to_supply_upsert(token: &SdkTokenResult) -> TokenSupplyUpsert {
         burned_supply: format_token_amount(&burned_supply_raw, decimals),
         burned_supply_raw,
     }
+}
+
+/// The token's on-chain metadata, or `None` when the answer carried no metadata field
+/// at all — which is what a non-extended token answer looks like, and is not the same
+/// as a token that genuinely has none.
+fn token_result_to_metadata_upsert(token: &SdkTokenResult) -> Option<TokenMetadataUpsert> {
+    let symbol = non_empty_string(&token.symbol)?;
+    let properties = token.metadata.as_ref()?;
+    Some(TokenMetadataUpsert {
+        symbol,
+        metadata: Value::Object(token_properties_to_metadata(properties)),
+    })
 }
 
 fn contract_result_to_rpc_metadata_upsert(

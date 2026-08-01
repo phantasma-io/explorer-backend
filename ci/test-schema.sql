@@ -1096,7 +1096,8 @@ CREATE TABLE public.tokens (
     mintable boolean DEFAULT false NOT NULL,
     name text,
     carbon_token_schemas bytea,
-    carbon_id bigint
+    carbon_id bigint,
+    metadata jsonb
 );
 
 

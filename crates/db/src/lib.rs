@@ -401,6 +401,15 @@ pub struct TokenSupplyUpsert {
     pub burned_supply_raw: String,
 }
 
+/// A token's on-chain metadata as the node answers it: one JSON object whose values
+/// keep their VM shape (a scalar is a string, an array stays an array, a struct stays
+/// an object).
+#[derive(Debug, Clone)]
+pub struct TokenMetadataUpsert {
+    pub symbol: String,
+    pub metadata: Value,
+}
+
 /// Live token price in every fiat currency the explorer serves. `None` fields are
 /// left untouched on update so an unavailable fiat pairing never clobbers a good one.
 #[derive(Debug, Clone)]
@@ -1028,6 +1037,50 @@ pub async fn update_token_supplies(
     .bind(&max_supply_raws)
     .bind(&burned_supplies)
     .bind(&burned_supply_raws)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Refreshes `tokens.metadata` from the node's current answer.
+///
+/// The node reports metadata as live state, not history: a key removed on chain is
+/// simply absent from the next answer, so the column is replaced rather than merged —
+/// merging would keep resurrecting keys the chain no longer has. Tokens the node does
+/// not answer for are left untouched, so a token that only exists in the historical
+/// zero state keeps its NULL instead of being blanked.
+pub async fn update_token_metadata(
+    conn: &mut PgConnection,
+    chain_id: i32,
+    metadata: &[TokenMetadataUpsert],
+) -> Result<u64, DbError> {
+    if metadata.is_empty() {
+        return Ok(0);
+    }
+
+    let symbols = metadata
+        .iter()
+        .map(|token| token.symbol.clone())
+        .collect::<Vec<_>>();
+    let values = metadata
+        .iter()
+        .map(|token| token.metadata.to_string())
+        .collect::<Vec<_>>();
+
+    let result = sqlx::query(
+        r#"
+        UPDATE tokens token
+        SET metadata = desired.metadata
+        FROM UNNEST($2::text[], $3::jsonb[]) AS desired(symbol, metadata)
+        WHERE token.chain_id = $1
+          AND token.symbol = desired.symbol
+          AND token.metadata IS DISTINCT FROM desired.metadata
+        "#,
+    )
+    .bind(chain_id)
+    .bind(&symbols)
+    .bind(&values)
     .execute(&mut *conn)
     .await?;
 

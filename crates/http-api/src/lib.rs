@@ -237,6 +237,7 @@ struct TokenListQuery {
     chain: Option<String>,
     with_price: Option<i32>,
     with_logo: Option<i32>,
+    with_metadata: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,6 +282,10 @@ struct TokenResponse {
     script_raw: Option<String>,
     price: Option<PriceResponse>,
     token_logos: Option<Vec<TokenLogoResponse>>,
+    /// The token's on-chain metadata, present only with `with_metadata=1`. Values keep
+    /// their VM shape: a scalar is a string, an array stays an array, a struct stays an
+    /// object.
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]

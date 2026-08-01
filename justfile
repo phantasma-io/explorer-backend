@@ -71,6 +71,10 @@ worker-local-token-supply-sync:
     ./target/release/explorer-worker --config config/local-sync.toml --token-supply-sync-once
 
 [group('run')]
+worker-local-token-metadata-sync:
+    ./target/release/explorer-worker --config config/local-sync.toml --token-metadata-sync-once
+
+[group('run')]
 worker-local-failed-tx-debug-sync:
     ./target/release/explorer-worker --config config/local-sync.toml --failed-tx-debug-sync-once
 

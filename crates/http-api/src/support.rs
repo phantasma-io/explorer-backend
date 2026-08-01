@@ -57,6 +57,7 @@ pub(crate) fn token_from_row(
     row: &PgRow,
     with_price: bool,
     with_logo: bool,
+    with_metadata: bool,
 ) -> Result<TokenResponse, ApiError> {
     let max_supply_raw = row.get::<Option<String>, _>("max_supply_raw");
     Ok(TokenResponse {
@@ -95,6 +96,9 @@ pub(crate) fn token_from_row(
         } else {
             None
         },
+        metadata: with_metadata
+            .then(|| row.get::<Option<Value>, _>("metadata_json"))
+            .flatten(),
     })
 }
 
