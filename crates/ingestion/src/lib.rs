@@ -32,6 +32,10 @@ use tracing::{error, info, warn};
 const LEGACY_UNLIMITED_GAS_RAW: &str = "18446744073709551615";
 const LEGACY_GAS_TOKEN_SYMBOL: &str = "KCAL";
 const SPECIAL_RESOLUTION_REFETCH_ATTEMPTS: usize = 25;
+/// Block size above which an incomplete extended payload is no longer chased by
+/// refetching the whole block. Ordinary blocks are kilobytes; the ones that carry a
+/// repair resolution are 100+ MB, and the node cannot serve those repeatedly.
+const EXTENDED_PAYLOAD_REFETCH_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 const SPECIAL_RESOLUTION_REFETCH_DELAY_MS: u64 = 50;
 const BALANCE_SYNC_LAG_THRESHOLD: u64 = 50;
 const BALANCE_SYNC_CHUNK_SIZE: usize = 100;
@@ -1016,6 +1020,7 @@ fn transaction_events_to_projections(
             height: 0,
             field: "height",
         })?;
+    warn_unmodeled_extended_events(block_height, tx_index, transaction);
     let mut extended_context = TxExtendedEventContext::from_transaction(transaction);
     let mut events = Vec::with_capacity(transaction.events.len() + 1);
     let mut has_legacy_special_resolution = false;
@@ -1176,7 +1181,8 @@ fn transaction_has_incomplete_special_resolution(transaction: &SdkTransactionRes
         return false;
     };
 
-    special_resolution_payload(&extended.data).is_none()
+    matches!(extended.data, SdkEventData::SpecialResolution(_))
+        && special_resolution_payload(&extended.data).is_none()
 }
 
 fn transaction_has_incomplete_token_create(transaction: &SdkTransactionResult) -> bool {
@@ -1196,7 +1202,8 @@ fn transaction_has_incomplete_token_create(transaction: &SdkTransactionResult) -
         return false;
     };
 
-    token_create_payload(&extended.data).is_none()
+    matches!(extended.data, SdkEventData::TokenCreate(_))
+        && token_create_payload(&extended.data).is_none()
 }
 
 fn transaction_has_incomplete_token_series_create(transaction: &SdkTransactionResult) -> bool {
@@ -1208,7 +1215,87 @@ fn transaction_has_incomplete_token_series_create(transaction: &SdkTransactionRe
         return false;
     };
 
-    token_series_create_payload(&extended.data).is_none()
+    matches!(extended.data, SdkEventData::TokenSeriesCreate(_))
+        && token_series_create_payload(&extended.data).is_none()
+}
+
+/// The extended-event kinds this build carries a typed shape for. A payload of one of
+/// these that still arrives untyped means the node answers a shape newer than our SDK.
+const MODELED_EXTENDED_EVENT_KINDS: [&str; 6] = [
+    "TokenCreate",
+    "TokenSeriesCreate",
+    "OrderCreated",
+    "OrderCancelled",
+    "OrderFilled",
+    "SpecialResolution",
+];
+
+/// Reports extended payloads this build could not type.
+///
+/// Decoding is total — an unmodeled payload is kept verbatim and ingestion continues —
+/// so nothing here is fatal and nothing is dropped. It still has to be visible: an
+/// untyped payload under a modeled kind, or a call whose module and method this build
+/// does not know, both mean the node moved ahead of our SDK. Kinds outside the modeled
+/// set are normal (`TokenMint`, which the node stopped emitting in December 2025, is the
+/// common one) and stay quiet, and unrecognised calls are counted rather than logged one
+/// by one: a single repair resolution can carry thousands.
+fn warn_unmodeled_extended_events(
+    block_height: u64,
+    tx_index: usize,
+    transaction: &SdkTransactionResult,
+) {
+    for event in &transaction.extended_events {
+        if event.data.as_unknown().is_some()
+            && MODELED_EXTENDED_EVENT_KINDS
+                .iter()
+                .any(|kind| event.kind.eq_ignore_ascii_case(kind))
+        {
+            warn!(
+                block_height,
+                tx_index,
+                event_kind = %event.kind,
+                "extended event payload does not match the shape this build models; stored verbatim"
+            );
+            continue;
+        }
+
+        let Some(resolution) = event.data.as_special_resolution() else {
+            continue;
+        };
+        let mut unrecognized = Vec::new();
+        collect_unrecognized_calls(&resolution.calls, &mut unrecognized);
+        if let Some((module, method)) = unrecognized.first() {
+            warn!(
+                block_height,
+                tx_index,
+                resolution_id = resolution.resolution_id,
+                unrecognized_calls = unrecognized.len(),
+                first_module = %module,
+                first_method = %method,
+                "special resolution carries calls this build does not model; arguments stored verbatim"
+            );
+        }
+    }
+}
+
+/// Collects the module/method pairs of every call whose arguments stayed untyped,
+/// walking nested resolutions as well.
+fn collect_unrecognized_calls<'a>(
+    calls: &'a [SdkSpecialResolutionCall],
+    unrecognized: &mut Vec<(&'a str, &'a str)>,
+) {
+    for call in calls {
+        if call
+            .arguments
+            .as_ref()
+            .is_some_and(|arguments| arguments.as_unrecognized().is_some())
+        {
+            unrecognized.push((call.module.as_str(), call.method.as_str()));
+        }
+        if let Some(nested) = &call.calls {
+            collect_unrecognized_calls(nested, unrecognized);
+        }
+    }
 }
 
 /// The usable payload of a `SpecialResolution` extended event, or `None` when the node
@@ -3711,6 +3798,46 @@ mod tests {
                 .special_resolution
                 .is_none()
         );
+    }
+
+    #[test]
+    fn does_not_chase_an_extended_payload_this_build_cannot_type() {
+        // A payload that does not match the modeled shape — here `decimals` arriving as
+        // text, the way a node newer than our SDK would answer — is kept verbatim by the
+        // SDK and must NOT be treated as an incomplete payload: refetching cannot change
+        // it, and the block would be refused after twenty-five tries, stalling the sync
+        // on every block carrying that event.
+        let transaction = SdkTransactionResult {
+            hash: "TX".to_owned(),
+            events: vec![SdkEventResult {
+                address: "PADDR".to_owned(),
+                contract: "token".to_owned(),
+                kind: "TokenCreate".to_owned(),
+                name: "TokenCreate".to_owned(),
+                data: "04464C414700046D61696E".to_owned(),
+            }],
+            extended_events: vec![extended_event(
+                "PADDR",
+                "token",
+                "TokenCreate",
+                serde_json::json!({
+                    "symbol": "FLAG",
+                    "maxSupply": "100000000",
+                    "decimals": "eight",
+                    "isNonFungible": false,
+                    "carbonTokenId": 42,
+                    "metadata": {}
+                }),
+            )],
+            ..Default::default()
+        };
+
+        assert!(
+            transaction.extended_events[0].data.as_unknown().is_some(),
+            "the fixture must be a payload the SDK could not type"
+        );
+        assert!(!transaction_has_incomplete_token_create(&transaction));
+        assert!(!transaction_has_incomplete_extended_payload(&transaction));
     }
 
     #[test]

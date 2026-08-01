@@ -346,11 +346,21 @@ impl BlockIngestionDriver {
         height: BlockHeight,
     ) -> Result<SdkBlockResult, IngestionError> {
         let mut last_incomplete_payload = None;
+        let mut max_attempts = SPECIAL_RESOLUTION_REFETCH_ATTEMPTS;
         for attempt in 1..=SPECIAL_RESOLUTION_REFETCH_ATTEMPTS {
             let payload = self
                 .rpc
                 .get_block_by_height_payload(&self.chain.chain, height)
                 .await?;
+            // Re-requesting a whole block is only affordable while the block is small.
+            // The repair blocks are the 100+ MB special-resolution ones, and asking the
+            // node for one of those twenty-five times is what drove it into OOM
+            // (chain note `rpc-oom-huge-block-getblock-2026-07-30`). Above the ceiling
+            // the per-transaction repair below is the only path tried, and if that fails
+            // the loud refusal is better than hammering the node.
+            if attempt == 1 && payload.byte_len > EXTENDED_PAYLOAD_REFETCH_MAX_BLOCK_BYTES {
+                max_attempts = 1;
+            }
             let mut block = decode_block_result(payload.raw_value)?;
             // A block can carry more than one incomplete extended payload; repair
             // each one, re-scanning after every fix, before projecting — rather than
@@ -376,7 +386,7 @@ impl BlockIngestionDriver {
                 break incomplete;
             };
 
-            if attempt < SPECIAL_RESOLUTION_REFETCH_ATTEMPTS {
+            if attempt < max_attempts {
                 warn!(
                     height = height.value(),
                     tx_index = unresolved.tx_index,
