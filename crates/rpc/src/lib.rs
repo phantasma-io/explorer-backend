@@ -3,10 +3,15 @@ use explorer_domain::{BlockHeight, ChainName};
 pub use phantasma_sdk::{
     AccountInfoResult as SdkAccountInfoResult, BalanceResult as SdkBalanceResult,
     BlockResult as SdkBlockResult, ContractResult as SdkContractResult,
-    CursorPaginatedResult as SdkCursorPaginatedResult, EventExResult as SdkEventExResult,
-    EventResult as SdkEventResult, TokenDataResult as SdkTokenDataResult,
-    TokenPropertyResult as SdkTokenPropertyResult, TokenResult as SdkTokenResult,
+    CursorPaginatedResult as SdkCursorPaginatedResult, EventData as SdkEventData,
+    EventExResult as SdkEventExResult, EventResult as SdkEventResult,
+    SpecialResolutionArguments as SdkSpecialResolutionArguments,
+    SpecialResolutionCall as SdkSpecialResolutionCall,
+    SpecialResolutionData as SdkSpecialResolutionData, TokenCreateData as SdkTokenCreateData,
+    TokenDataResult as SdkTokenDataResult, TokenPropertyResult as SdkTokenPropertyResult,
+    TokenResult as SdkTokenResult, TokenSeriesCreateData as SdkTokenSeriesCreateData,
     TokenSeriesResult as SdkTokenSeriesResult, TransactionResult as SdkTransactionResult,
+    VmValue as SdkVmValue,
 };
 use phantasma_sdk::{PhantasmaError, PhantasmaRpc, RpcCallResult};
 use serde::de::DeserializeOwned;
@@ -625,7 +630,7 @@ mod tests {
             }) if series_id == "123"
                 && owner_address == "Powner"
                 && metadata.first().is_some_and(|property| {
-                    property.key == "name" && property.value == "Series name"
+                    property.key == "name" && property.value.as_text() == Some("Series name")
                 })
         ));
     }
@@ -664,7 +669,7 @@ mod tests {
                 && series == "123"
                 && creator_address == "Pcreator"
                 && properties.first().is_some_and(|property| {
-                    property.key == "name" && property.value == "NFT name"
+                    property.key == "name" && property.value.as_text() == Some("NFT name")
                 })
         ));
     }

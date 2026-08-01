@@ -10,8 +10,10 @@ use explorer_db::{
 use explorer_domain::{BlockHeight, ChainName, MAIN_ZERO_STATE_BOUNDARY_HEIGHT};
 use explorer_rpc::{
     PhantasmaSdkClient, RpcError, SdkAccountInfoResult, SdkBalanceResult, SdkBlockResult,
-    SdkContractResult, SdkEventResult, SdkTokenDataResult, SdkTokenPropertyResult, SdkTokenResult,
-    SdkTokenSeriesResult, SdkTransactionResult, decode_block_result,
+    SdkContractResult, SdkEventData, SdkEventExResult, SdkEventResult, SdkSpecialResolutionCall,
+    SdkSpecialResolutionData, SdkTokenCreateData, SdkTokenDataResult, SdkTokenPropertyResult,
+    SdkTokenResult, SdkTokenSeriesCreateData, SdkTokenSeriesResult, SdkTransactionResult,
+    SdkVmValue, decode_block_result,
 };
 use phantasma_sdk::{
     Address, BinaryReader, CarbonSerializable, ChainConfig as CarbonChainConfig, GasConfig,
@@ -852,23 +854,56 @@ fn series_error_to_metadata_upsert(
     }
 }
 
+/// Stores each property under its own key, keeping the value's real VM shape.
+///
+/// A property value is a scalar, an array, or a struct, recursively. Flattening the
+/// non-scalars back into a string would put a JSON document inside a JSON string —
+/// exactly the shape the node stopped answering — and would make the value
+/// unrenderable and unfilterable. The metadata columns are already `jsonb`, so the
+/// real shape needs no schema change. An empty scalar is dropped, as before; an empty
+/// array or struct is a real answer and is kept.
 fn token_properties_to_metadata(properties: &[SdkTokenPropertyResult]) -> Map<String, Value> {
     let mut metadata = Map::new();
     for property in properties {
-        insert_metadata_string(
+        if property.value.as_text().is_some_and(str::is_empty) {
+            continue;
+        }
+        insert_metadata_value(
             &mut metadata,
             &property.key,
-            non_empty_string(&property.value),
+            vm_value_to_json(&property.value),
         );
     }
     metadata
 }
 
+/// Maps a VM value onto JSON: a scalar is a string (chain numbers are big integers and
+/// the node renders them as decimal strings), an array is an array, a struct is an object
+/// whose field names are the chain's own — the node does not rename dictionary keys.
+fn vm_value_to_json(value: &SdkVmValue) -> Value {
+    match value {
+        SdkVmValue::Text(text) => Value::String(text.clone()),
+        SdkVmValue::Items(items) => Value::Array(items.iter().map(vm_value_to_json).collect()),
+        SdkVmValue::Fields(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), vm_value_to_json(field)))
+                .collect(),
+        ),
+    }
+}
+
+/// Returns a property's value only when it is a scalar.
+///
+/// Every caller feeds a text column (`nfts.name`, `series.image`, ...) or a numeric
+/// parse, and an array or struct has no faithful string form: serializing one into those
+/// columns would be a lie. The complete value stays available in the stored metadata.
 fn token_property_value(properties: &[SdkTokenPropertyResult], key: &str) -> Option<String> {
     properties
         .iter()
         .find(|property| property.key.eq_ignore_ascii_case(key))
-        .and_then(|property| non_empty_string(&property.value))
+        .and_then(|property| property.value.as_text())
+        .and_then(non_empty_string)
 }
 
 fn parse_i32_clamped(value: &str) -> Option<i32> {
@@ -909,6 +944,15 @@ fn insert_metadata_string(metadata: &mut Map<String, Value>, key: &str, value: O
     let Some(value) = value.and_then(|value| non_empty_string(&value)) else {
         return;
     };
+    insert_metadata_value(metadata, key, Value::String(value));
+}
+
+/// Inserts one metadata entry, replacing any key that differs only in case.
+///
+/// Chain metadata is written by contracts, so the same logical key can arrive as `Name`
+/// and `name` in one answer; keeping both would show the reader two versions of the same
+/// field. The last one answered wins, under its own casing.
+fn insert_metadata_value(metadata: &mut Map<String, Value>, key: &str, value: Value) {
     let Some(key) = non_empty_string(key) else {
         return;
     };
@@ -919,7 +963,7 @@ fn insert_metadata_string(metadata: &mut Map<String, Value>, key: &str, value: O
     {
         metadata.remove(&existing_key);
     }
-    metadata.insert(key, Value::String(value));
+    metadata.insert(key, value);
 }
 
 fn normalize_rpc_image_url(url: Option<String>) -> Option<String> {
@@ -1013,7 +1057,7 @@ fn transaction_events_to_projections(
     let mut next_synthetic_event_index = transaction.events.len();
 
     if !has_legacy_special_resolution
-        && let Some(special_resolution) = extended_context.special_resolution.as_ref()
+        && let Some(special_resolution) = extended_context.special_resolution
     {
         let synthetic_index = next_synthetic_event_index;
         next_synthetic_event_index += 1;
@@ -1022,12 +1066,7 @@ fn transaction_events_to_projections(
             contract: "governance".to_owned(),
             kind: "SpecialResolution".to_owned(),
             name: "SpecialResolution".to_owned(),
-            data: special_resolution_raw_data(
-                block_height,
-                tx_index,
-                synthetic_index,
-                special_resolution,
-            )?,
+            data: special_resolution_raw_data(special_resolution),
         };
         events.push(event_to_projection(
             block_height,
@@ -1045,16 +1084,10 @@ fn transaction_events_to_projections(
     {
         let synthetic_index = next_synthetic_event_index;
         let synthetic_event = SdkEventResult {
-            address: token_series_create
-                .get("owner")
-                .and_then(Value::as_str)
-                .unwrap_or(&transaction.gas_payer)
-                .to_owned(),
-            contract: token_series_create
-                .get("symbol")
-                .and_then(Value::as_str)
-                .unwrap_or("token")
-                .to_owned(),
+            address: non_empty_string(&token_series_create.owner)
+                .unwrap_or_else(|| transaction.gas_payer.clone()),
+            contract: non_empty_string(&token_series_create.symbol)
+                .unwrap_or_else(|| "token".to_owned()),
             kind: "TokenSeriesCreate".to_owned(),
             name: "TokenSeriesCreate".to_owned(),
             data: String::new(),
@@ -1143,7 +1176,7 @@ fn transaction_has_incomplete_special_resolution(transaction: &SdkTransactionRes
         return false;
     };
 
-    !special_resolution_payload_is_complete(&extended.data)
+    special_resolution_payload(&extended.data).is_none()
 }
 
 fn transaction_has_incomplete_token_create(transaction: &SdkTransactionResult) -> bool {
@@ -1163,7 +1196,7 @@ fn transaction_has_incomplete_token_create(transaction: &SdkTransactionResult) -
         return false;
     };
 
-    !token_create_payload_is_complete(&extended.data)
+    token_create_payload(&extended.data).is_none()
 }
 
 fn transaction_has_incomplete_token_series_create(transaction: &SdkTransactionResult) -> bool {
@@ -1175,11 +1208,41 @@ fn transaction_has_incomplete_token_series_create(transaction: &SdkTransactionRe
         return false;
     };
 
-    !token_series_create_payload_is_complete(&extended.data)
+    token_series_create_payload(&extended.data).is_none()
 }
 
-fn special_resolution_payload_is_complete(data: &Value) -> bool {
-    data.get("resolutionId").is_some() && data.get("calls").and_then(Value::as_array).is_some()
+/// The usable payload of a `SpecialResolution` extended event, or `None` when the node
+/// answered a shell.
+///
+/// The node's endpoint cache used to re-serialize `data` as `{"valueKind":"Object"}`
+/// (chain note `json-rpc-cache-extended-event-data-bug-2026-05-20`). Serde ignores the
+/// unknown field and every modeled field defaults, so a shell types cleanly into an
+/// all-default struct — an id of zero is the signal, since the chain never issues
+/// resolution 0. Re-requesting the transaction returns the real payload, which is why
+/// this condition is worth repairing.
+///
+/// `calls` is deliberately NOT part of the test: an empty call list cannot be told apart
+/// from an absent one after typing, and treating it as a shell would refetch a block
+/// twenty-five times and then refuse it outright — a far worse failure than storing a
+/// resolution with no calls.
+fn special_resolution_payload(data: &SdkEventData) -> Option<&SdkSpecialResolutionData> {
+    data.as_special_resolution()
+        .filter(|resolution| resolution.resolution_id != 0)
+}
+
+/// The usable payload of a `TokenCreate` extended event, or `None` for a shell. A real
+/// token always has a symbol; every other field has a legitimate zero value (decimals 0,
+/// max supply "0" for an infinite token, no metadata).
+fn token_create_payload(data: &SdkEventData) -> Option<&SdkTokenCreateData> {
+    data.as_token_create()
+        .filter(|token_create| !token_create.symbol.is_empty())
+}
+
+/// The usable payload of a `TokenSeriesCreate` extended event, or `None` for a shell. A
+/// real series always carries both its symbol and its owner.
+fn token_series_create_payload(data: &SdkEventData) -> Option<&SdkTokenSeriesCreateData> {
+    data.as_token_series_create()
+        .filter(|series| !series.symbol.is_empty() && !series.owner.is_empty())
 }
 
 fn legacy_event_kind_name(event: &SdkEventResult) -> String {
@@ -1192,41 +1255,27 @@ fn is_numeric_legacy_event_kind(event_kind: &str) -> bool {
     !event_kind.is_empty() && event_kind.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn token_create_payload_is_complete(data: &Value) -> bool {
-    data.get("symbol").and_then(Value::as_str).is_some()
-        && data.get("maxSupply").is_some()
-        && data.get("decimals").is_some()
-        && data.get("isNonFungible").and_then(Value::as_bool).is_some()
-        && data.get("carbonTokenId").is_some()
-        && data.get("metadata").and_then(Value::as_object).is_some()
-}
-
-fn token_series_create_payload_is_complete(data: &Value) -> bool {
-    data.get("symbol").and_then(Value::as_str).is_some()
-        && data.get("seriesId").is_some()
-        && data.get("maxMint").is_some()
-        && data.get("maxSupply").is_some()
-        && data.get("owner").and_then(Value::as_str).is_some()
-        && data.get("carbonTokenId").is_some()
-        && data.get("carbonSeriesId").is_some()
-        && data.get("metadata").and_then(Value::as_object).is_some()
-}
-
-fn token_mint_payload_is_complete(data: &Value) -> bool {
-    data.get("symbol").and_then(Value::as_str).is_some()
-        && data.get("tokenId").is_some()
-        && data.get("mintNumber").is_some()
-        && data.get("carbonTokenId").is_some()
-        && data.get("carbonSeriesId").is_some()
-        && data.get("carbonInstanceId").is_some()
+/// `TokenMint` has no modeled shape: the node stopped emitting that extended event on
+/// 2025-12-08 and the SDK deliberately does not port `TokenMintData`, so the payload
+/// arrives verbatim in [`SdkEventData::Unknown`]. Blocks between the zero-state boundary
+/// and that date still carry it, so a forward resync must keep reading it as raw JSON.
+fn token_mint_payload(data: &SdkEventData) -> Option<&Value> {
+    data.as_unknown().filter(|data| {
+        data.get("symbol").and_then(Value::as_str).is_some()
+            && data.get("tokenId").is_some()
+            && data.get("mintNumber").is_some()
+            && data.get("carbonTokenId").is_some()
+            && data.get("carbonSeriesId").is_some()
+            && data.get("carbonInstanceId").is_some()
+    })
 }
 
 #[derive(Debug, Default)]
 struct TxExtendedEventContext<'a> {
-    special_resolution: Option<Value>,
-    token_create: Option<Value>,
+    special_resolution: Option<&'a SdkSpecialResolutionData>,
+    token_create: Option<&'a SdkTokenCreateData>,
     token_create_consumed: bool,
-    token_series_create: Option<&'a Value>,
+    token_series_create: Option<&'a SdkTokenSeriesCreateData>,
     token_mint: Option<&'a Value>,
 }
 
@@ -1235,22 +1284,17 @@ impl<'a> TxExtendedEventContext<'a> {
         let events = &transaction.extended_events;
         let special_resolution = events
             .iter()
-            .find(|event| {
-                event.kind.eq_ignore_ascii_case("SpecialResolution")
-                    && special_resolution_payload_is_complete(&event.data)
-            })
-            .map(|event| event.data.clone());
+            .filter(|event| event.kind.eq_ignore_ascii_case("SpecialResolution"))
+            .find_map(|event| special_resolution_payload(&event.data));
         let token_create = token_create_payload_from_extended_events(events);
         let token_series_create = events
             .iter()
             .find(|event| event.kind.eq_ignore_ascii_case("TokenSeriesCreate"))
-            .map(|event| &event.data)
-            .filter(|data| token_series_create_payload_is_complete(data));
+            .and_then(|event| token_series_create_payload(&event.data));
         let token_mint = events
             .iter()
             .find(|event| event.kind.eq_ignore_ascii_case("TokenMint"))
-            .map(|event| &event.data)
-            .filter(|data| token_mint_payload_is_complete(data));
+            .and_then(|event| token_mint_payload(&event.data));
 
         Self {
             special_resolution,
@@ -1261,8 +1305,9 @@ impl<'a> TxExtendedEventContext<'a> {
         }
     }
 
-    fn take_token_create_for_event(&mut self) -> Option<&Value> {
-        if self.token_create_consumed || self.token_create.is_none() {
+    fn take_token_create_for_event(&mut self) -> Option<&'a SdkTokenCreateData> {
+        let token_create = self.token_create?;
+        if self.token_create_consumed {
             return None;
         }
 
@@ -1271,7 +1316,7 @@ impl<'a> TxExtendedEventContext<'a> {
         // is applied, later TokenCreate rows in the same transaction are
         // left as raw compatibility envelopes even when their raw symbol differs.
         self.token_create_consumed = true;
-        self.token_create.as_ref()
+        Some(token_create)
     }
 }
 
@@ -1417,7 +1462,7 @@ fn event_to_projection(
                 build_governance_chain_config_payload(&chain_config);
         }
     } else if event_kind == "SpecialResolution" {
-        if let Some(special_resolution) = extended_context.special_resolution.as_ref() {
+        if let Some(special_resolution) = extended_context.special_resolution {
             payload_json["special_resolution_event"] =
                 build_special_resolution_payload(special_resolution);
         }
@@ -1429,15 +1474,7 @@ fn event_to_projection(
         }
     } else if event_kind == "TokenSeriesCreate" {
         if let Some(token_series_create) = extended_context.token_series_create {
-            if let Some(series_id) = token_series_create
-                .get("seriesId")
-                .and_then(json_scalar_to_string)
-                .or_else(|| {
-                    token_series_create
-                        .get("carbonSeriesId")
-                        .and_then(json_scalar_to_string)
-                })
-            {
+            if let Some(series_id) = token_series_identity(token_series_create) {
                 token_id = Some(series_id.clone());
                 payload_json["token_id"] = serde_json::json!(series_id);
             }
@@ -1775,13 +1812,12 @@ fn decode_carbon_event_or_default<T: CarbonSerializable + Default>(
 }
 
 fn token_create_payload_from_extended_events(
-    events: &[explorer_rpc::SdkEventExResult],
-) -> Option<Value> {
+    events: &[SdkEventExResult],
+) -> Option<&SdkTokenCreateData> {
     events
         .iter()
         .find(|event| event.kind.eq_ignore_ascii_case("TokenCreate"))
-        .map(|event| event.data.clone())
-        .filter(token_create_payload_is_complete)
+        .and_then(|event| token_create_payload(&event.data))
 }
 
 #[cfg(test)]
@@ -1876,52 +1912,55 @@ fn build_governance_chain_config_payload(config: &CarbonChainConfig) -> Value {
     })
 }
 
-fn build_special_resolution_payload(data: &Value) -> Value {
+fn build_special_resolution_payload(data: &SdkSpecialResolutionData) -> Value {
     let mut payload = Map::new();
-    if let Some(resolution_id) = data.get("resolutionId").and_then(json_scalar_to_string) {
-        payload.insert("resolution_id".to_owned(), Value::String(resolution_id));
-    }
-    if let Some(description) = data.get("description").and_then(Value::as_str) {
-        payload.insert(
-            "description".to_owned(),
-            Value::String(description.to_owned()),
-        );
+    payload.insert(
+        "resolution_id".to_owned(),
+        Value::String(data.resolution_id.to_string()),
+    );
+    if let Some(description) = &data.description {
+        payload.insert("description".to_owned(), Value::String(description.clone()));
     }
     payload.insert(
         "calls".to_owned(),
-        build_special_resolution_calls(data.get("calls")),
+        build_special_resolution_calls(&data.calls),
     );
     Value::Object(payload)
 }
 
-fn build_special_resolution_calls(calls: Option<&Value>) -> Value {
-    let Some(calls) = calls.and_then(Value::as_array) else {
-        return Value::Array(Vec::new());
-    };
-
+fn build_special_resolution_calls(calls: &[SdkSpecialResolutionCall]) -> Value {
     Value::Array(
         calls
             .iter()
             .map(|call| {
                 let mut payload = Map::new();
-                if let Some(module) = call.get("module").and_then(Value::as_str) {
-                    payload.insert("module".to_owned(), Value::String(module.to_owned()));
+                if !call.module.is_empty() {
+                    payload.insert("module".to_owned(), Value::String(call.module.clone()));
                 }
-                if let Some(module_id) = call.get("moduleId") {
-                    payload.insert("module_id".to_owned(), module_id.clone());
+                // Written unconditionally: 0 is a real id on this chain (module
+                // `governance`, method `TransferFungible`), so it cannot double as
+                // "absent", and the SDK's own rule — a missing id reads as 0 — is what
+                // every consumer of this payload already sees. The names above stay the
+                // display key; an older node that omits the ids leaves zeros here.
+                payload.insert("module_id".to_owned(), Value::from(call.module_id));
+                if !call.method.is_empty() {
+                    payload.insert("method".to_owned(), Value::String(call.method.clone()));
                 }
-                if let Some(method) = call.get("method").and_then(Value::as_str) {
-                    payload.insert("method".to_owned(), Value::String(method.to_owned()));
-                }
-                if let Some(method_id) = call.get("methodId") {
-                    payload.insert("method_id".to_owned(), method_id.clone());
-                }
-                if let Some(arguments) = call.get("arguments") {
-                    payload.insert("arguments".to_owned(), arguments.clone());
+                payload.insert("method_id".to_owned(), Value::from(call.method_id));
+                if let Some(arguments) = &call.arguments {
+                    // Arguments keep the node's own camelCase field names: they are the
+                    // shape every other SDK and the frontend already read, and a third
+                    // naming convention here would buy nothing. Serializing plain data
+                    // with string keys cannot fail; degrading to null rather than losing
+                    // the whole call is still the safer branch.
+                    payload.insert(
+                        "arguments".to_owned(),
+                        serde_json::to_value(arguments).unwrap_or(Value::Null),
+                    );
                 }
                 payload.insert(
                     "calls".to_owned(),
-                    build_special_resolution_calls(call.get("calls")),
+                    build_special_resolution_calls(call.calls.as_deref().unwrap_or_default()),
                 );
                 Value::Object(payload)
             })
@@ -1929,63 +1968,71 @@ fn build_special_resolution_calls(calls: Option<&Value>) -> Value {
     )
 }
 
-fn build_token_create_payload(data: &Value) -> Value {
+fn build_token_create_payload(data: &SdkTokenCreateData) -> Value {
     let mut payload = Map::new();
-    let metadata = data.get("metadata").cloned().unwrap_or(Value::Null);
-
-    if let Some(symbol) = data.get("symbol").and_then(Value::as_str) {
-        payload.insert("symbol".to_owned(), Value::String(symbol.to_owned()));
+    if !data.symbol.is_empty() {
+        payload.insert("symbol".to_owned(), Value::String(data.symbol.clone()));
     }
-    if let Some(max_supply) = data.get("maxSupply").and_then(json_scalar_to_string) {
-        payload.insert("max_supply".to_owned(), Value::String(max_supply));
-    }
-    if let Some(decimals) = data.get("decimals").and_then(json_scalar_to_string) {
-        payload.insert("decimals".to_owned(), Value::String(decimals));
-    }
-    if let Some(is_non_fungible) = data.get("isNonFungible").and_then(Value::as_bool) {
-        payload.insert("is_non_fungible".to_owned(), Value::Bool(is_non_fungible));
-    }
-    if let Some(carbon_token_id) = data.get("carbonTokenId").and_then(json_scalar_to_string) {
-        payload.insert("carbon_token_id".to_owned(), Value::String(carbon_token_id));
-    }
-    payload.insert("metadata".to_owned(), metadata);
-    Value::Object(payload)
-}
-
-fn build_token_series_create_payload(data: &Value) -> Value {
-    let mut payload = Map::new();
-    if let Some(symbol) = data.get("symbol").and_then(Value::as_str) {
-        payload.insert("token".to_owned(), Value::String(symbol.to_owned()));
-    }
-    let series_id = data
-        .get("seriesId")
-        .and_then(json_scalar_to_string)
-        .or_else(|| data.get("carbonSeriesId").and_then(json_scalar_to_string));
-    if let Some(series_id) = series_id {
-        payload.insert("series_id".to_owned(), Value::String(series_id));
-    }
-    if let Some(max_mint) = data.get("maxMint").and_then(json_scalar_to_string) {
-        payload.insert("max_mint".to_owned(), Value::String(max_mint));
-    }
-    if let Some(max_supply) = data.get("maxSupply").and_then(json_scalar_to_string) {
-        payload.insert("max_supply".to_owned(), Value::String(max_supply));
-    }
-    if let Some(owner) = data.get("owner").and_then(Value::as_str) {
-        payload.insert("owner".to_owned(), Value::String(owner.to_owned()));
-    }
-    if let Some(carbon_token_id) = data.get("carbonTokenId").and_then(json_scalar_to_string) {
-        payload.insert("carbon_token_id".to_owned(), Value::String(carbon_token_id));
-    }
-    if let Some(carbon_series_id) = data.get("carbonSeriesId").and_then(json_scalar_to_string) {
+    if !data.max_supply.is_empty() {
         payload.insert(
-            "carbon_series_id".to_owned(),
-            Value::String(carbon_series_id),
+            "max_supply".to_owned(),
+            Value::String(data.max_supply.clone()),
         );
     }
     payload.insert(
-        "metadata".to_owned(),
-        data.get("metadata").cloned().unwrap_or(Value::Null),
+        "decimals".to_owned(),
+        Value::String(data.decimals.to_string()),
     );
+    payload.insert(
+        "is_non_fungible".to_owned(),
+        Value::Bool(data.is_non_fungible),
+    );
+    // Carbon ids are 1-based identities, so a zero means the payload did not carry one
+    // and the key stays out — unlike decimals and the fungibility flag above, whose zero
+    // and false are real answers.
+    if data.carbon_token_id != 0 {
+        payload.insert(
+            "carbon_token_id".to_owned(),
+            Value::String(data.carbon_token_id.to_string()),
+        );
+    }
+    payload.insert("metadata".to_owned(), string_map_to_json(&data.metadata));
+    Value::Object(payload)
+}
+
+fn build_token_series_create_payload(data: &SdkTokenSeriesCreateData) -> Value {
+    let mut payload = Map::new();
+    if !data.symbol.is_empty() {
+        payload.insert("token".to_owned(), Value::String(data.symbol.clone()));
+    }
+    if let Some(series_id) = token_series_identity(data) {
+        payload.insert("series_id".to_owned(), Value::String(series_id));
+    }
+    payload.insert(
+        "max_mint".to_owned(),
+        Value::String(data.max_mint.to_string()),
+    );
+    payload.insert(
+        "max_supply".to_owned(),
+        Value::String(data.max_supply.to_string()),
+    );
+    if !data.owner.is_empty() {
+        payload.insert("owner".to_owned(), Value::String(data.owner.clone()));
+    }
+    // See build_token_create_payload: a zero Carbon id means the payload carried none.
+    if data.carbon_token_id != 0 {
+        payload.insert(
+            "carbon_token_id".to_owned(),
+            Value::String(data.carbon_token_id.to_string()),
+        );
+    }
+    if data.carbon_series_id != 0 {
+        payload.insert(
+            "carbon_series_id".to_owned(),
+            Value::String(data.carbon_series_id.to_string()),
+        );
+    }
+    payload.insert("metadata".to_owned(), string_map_to_json(&data.metadata));
     Value::Object(payload)
 }
 
@@ -2034,19 +2081,28 @@ fn build_token_mint_extended_payload(data: &Value) -> Value {
     Value::Object(payload)
 }
 
-fn special_resolution_raw_data(
-    block_height: u64,
-    tx_index: usize,
-    event_index: usize,
-    data: &Value,
-) -> Result<String, IngestionError> {
-    let resolution_id = data
-        .get("resolutionId")
-        .and_then(json_scalar_to_u64)
-        .ok_or_else(|| {
-            legacy_event_decode_error(block_height, tx_index, event_index, "SpecialResolution")
-        })?;
-    Ok(encode_hex_upper(resolution_id.to_le_bytes()))
+/// The id a series is known by: its Phantasma series id, or the Carbon id when the
+/// payload predates it. `None` only for a payload that carries neither.
+fn token_series_identity(data: &SdkTokenSeriesCreateData) -> Option<String> {
+    non_empty_string(&data.series_id)
+        .or_else(|| (data.carbon_series_id != 0).then(|| data.carbon_series_id.to_string()))
+}
+
+/// The node renders extended-event metadata to a string-to-string map — that field did
+/// NOT become a VM value — so it maps straight onto JSON.
+fn string_map_to_json(metadata: &BTreeMap<String, String>) -> Value {
+    Value::Object(
+        metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect(),
+    )
+}
+
+/// The compatibility `data` blob of a synthesized legacy SpecialResolution event: the
+/// resolution id in the same little-endian encoding the chain writes.
+fn special_resolution_raw_data(data: &SdkSpecialResolutionData) -> String {
+    encode_hex_upper(data.resolution_id.to_le_bytes())
 }
 
 fn json_scalar_to_string(value: &Value) -> Option<String> {
@@ -2054,14 +2110,6 @@ fn json_scalar_to_string(value: &Value) -> Option<String> {
         Value::String(value) => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
         Value::Bool(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn json_scalar_to_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(value) => value.as_u64(),
-        Value::String(value) => value.parse().ok(),
         _ => None,
     }
 }
@@ -2252,8 +2300,24 @@ fn duration_millis_u64(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use explorer_rpc::SdkEventExResult;
     use std::time::Duration;
+
+    /// Builds an extended event the way the RPC layer does — by deserializing the wire
+    /// object, so the SDK's own `kind` dispatch decides the payload type. Assembling the
+    /// typed variant by hand would test the fixture instead of the dispatch, and would
+    /// hide the shell payloads these tests exist to catch.
+    fn extended_event(address: &str, contract: &str, kind: &str, data: Value) -> SdkEventExResult {
+        // Decoding an extended event is total by design, so a fixture cannot fail to
+        // deserialize; the default keeps the helper free of the unwrap the repo lints
+        // against.
+        serde_json::from_value(serde_json::json!({
+            "address": address,
+            "contract": contract,
+            "kind": kind,
+            "data": data,
+        }))
+        .unwrap_or_default()
+    }
 
     fn worker_config() -> WorkerConfig {
         WorkerConfig {
@@ -2611,6 +2675,85 @@ mod tests {
         assert_eq!(balance_dirty_batch_size(30_000), 700);
     }
 
+    /// An NFT answer with the given properties, everything else at a fixed shape, so a
+    /// property test states only the property under test.
+    fn nft_with_properties(properties: Vec<SdkTokenPropertyResult>) -> SdkTokenDataResult {
+        SdkTokenDataResult {
+            id: "123".to_owned(),
+            series: "456".to_owned(),
+            chain_name: "main".to_owned(),
+            owner_address: "Powner".to_owned(),
+            creator_address: "Pcreator".to_owned(),
+            status: "Transferable".to_owned(),
+            properties,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stores_a_non_scalar_property_in_its_real_shape() {
+        // A property value is a VM value: scalar, array or struct, recursively. The
+        // stored metadata must keep that shape — flattening it into a string would put a
+        // JSON document inside a JSON string, which is what the node stopped answering.
+        let nft = nft_with_properties(vec![
+            SdkTokenPropertyResult {
+                key: "name".to_owned(),
+                value: "RPC NFT".into(),
+            },
+            SdkTokenPropertyResult {
+                key: "_ia".to_owned(),
+                value: SdkVmValue::Items(vec![SdkVmValue::Fields(BTreeMap::from([
+                    ("mul".to_owned(), SdkVmValue::text("25")),
+                    ("div".to_owned(), SdkVmValue::text("10000")),
+                    (
+                        "who".to_owned(),
+                        SdkVmValue::Items(vec![SdkVmValue::text("64D5")]),
+                    ),
+                ]))]),
+            },
+        ]);
+
+        let upsert = nft_result_to_metadata_upsert("TEST", &nft);
+        assert!(upsert.is_some());
+        let Some(upsert) = upsert else {
+            return;
+        };
+
+        assert_eq!(
+            upsert.metadata.get("_ia"),
+            Some(&serde_json::json!([{ "mul": "25", "div": "10000", "who": ["64D5"] }])),
+            "an array of structs must survive as an array of structs"
+        );
+        assert_eq!(
+            upsert.metadata.get("name"),
+            Some(&serde_json::json!("RPC NFT")),
+            "a scalar property stays a plain string"
+        );
+    }
+
+    #[test]
+    fn keeps_a_non_scalar_property_out_of_the_text_columns() {
+        // `nfts.name` is a text column. A struct or array value has no faithful string
+        // form, so the column must stay empty rather than carry a serialized document;
+        // the complete value is still reachable through the stored metadata.
+        let nft = nft_with_properties(vec![SdkTokenPropertyResult {
+            key: "name".to_owned(),
+            value: SdkVmValue::Items(vec![SdkVmValue::text("first"), SdkVmValue::text("second")]),
+        }]);
+
+        let upsert = nft_result_to_metadata_upsert("TEST", &nft);
+        assert!(upsert.is_some());
+        let Some(upsert) = upsert else {
+            return;
+        };
+
+        assert_eq!(upsert.name, None);
+        assert_eq!(
+            upsert.metadata.get("name"),
+            Some(&serde_json::json!(["first", "second"]))
+        );
+    }
+
     #[test]
     fn nft_rpc_metadata_upsert_uses_rpc_properties_without_rom_decode() {
         let nft = SdkTokenDataResult {
@@ -2630,15 +2773,15 @@ mod tests {
             properties: vec![
                 SdkTokenPropertyResult {
                     key: "name".to_owned(),
-                    value: "RPC NFT".to_owned(),
+                    value: "RPC NFT".into(),
                 },
                 SdkTokenPropertyResult {
                     key: "imageURL".to_owned(),
-                    value: "//cdn.example/nft.png".to_owned(),
+                    value: "//cdn.example/nft.png".into(),
                 },
                 SdkTokenPropertyResult {
                     key: "Created".to_owned(),
-                    value: "1800123456".to_owned(),
+                    value: "1800123456".into(),
                 },
             ],
         };
@@ -2698,15 +2841,15 @@ mod tests {
             metadata: vec![
                 SdkTokenPropertyResult {
                     key: "name".to_owned(),
-                    value: "RPC Series".to_owned(),
+                    value: "RPC Series".into(),
                 },
                 SdkTokenPropertyResult {
                     key: "imageURL".to_owned(),
-                    value: "//cdn.example/series.png".to_owned(),
+                    value: "//cdn.example/series.png".into(),
                 },
                 SdkTokenPropertyResult {
                     key: "mode".to_owned(),
-                    value: "1".to_owned(),
+                    value: "1".into(),
                 },
             ],
         };
@@ -2852,11 +2995,11 @@ mod tests {
                 name: "TokenMint".to_owned(),
                 data: "044B43414C02E900046D61696E".to_owned(),
             }],
-            extended_events: vec![SdkEventExResult {
-                address: "PADDR".to_owned(),
-                contract: "token".to_owned(),
-                kind: "TokenMint".to_owned(),
-                data: serde_json::json!({
+            extended_events: vec![extended_event(
+                "PADDR",
+                "token",
+                "TokenMint",
+                serde_json::json!({
                     "symbol": "KCAL",
                     "tokenId": "233",
                     "seriesId": "7",
@@ -2866,7 +3009,7 @@ mod tests {
                     "carbonInstanceId": 3,
                     "owner": "PADDR"
                 }),
-            }],
+            )],
             ..Default::default()
         };
         let transaction_record = TransactionRecord {
@@ -3181,11 +3324,11 @@ mod tests {
                 name: "SpecialResolution".to_owned(),
                 data: "0100000000000000".to_owned(),
             }],
-            extended_events: vec![SdkEventExResult {
-                address: "PADDR".to_owned(),
-                contract: "governance".to_owned(),
-                kind: "SpecialResolution".to_owned(),
-                data: serde_json::json!({
+            extended_events: vec![extended_event(
+                "PADDR",
+                "governance",
+                "SpecialResolution",
+                serde_json::json!({
                     "resolutionId": 1,
                     "description": "Special",
                     "calls": [{
@@ -3196,7 +3339,7 @@ mod tests {
                         "arguments": { "gas_fee_query": "10" }
                     }]
                 }),
-            }],
+            )],
             ..Default::default()
         };
         let transaction_record = TransactionRecord {
@@ -3525,12 +3668,12 @@ mod tests {
                 name: "SpecialResolution".to_owned(),
                 data: "0103040872656E74616C496403020100".to_owned(),
             }],
-            extended_events: vec![SdkEventExResult {
-                address: "PADDR".to_owned(),
-                contract: "saturnrental".to_owned(),
-                kind: "SpecialResolution".to_owned(),
-                data: serde_json::json!({ "valueKind": "Object" }),
-            }],
+            extended_events: vec![extended_event(
+                "PADDR",
+                "saturnrental",
+                "SpecialResolution",
+                serde_json::json!({ "valueKind": "Object" }),
+            )],
             ..Default::default()
         };
 
@@ -3553,12 +3696,12 @@ mod tests {
                 name: "SpecialResolution".to_owned(),
                 data: "0100000000000000".to_owned(),
             }],
-            extended_events: vec![SdkEventExResult {
-                address: "PADDR".to_owned(),
-                contract: "governance".to_owned(),
-                kind: "SpecialResolution".to_owned(),
-                data: serde_json::json!({ "valueKind": "Object" }),
-            }],
+            extended_events: vec![extended_event(
+                "PADDR",
+                "governance",
+                "SpecialResolution",
+                serde_json::json!({ "valueKind": "Object" }),
+            )],
             ..Default::default()
         };
 
@@ -3581,12 +3724,12 @@ mod tests {
                 name: "SpecialResolution".to_owned(),
                 data: "2100000000000000".to_owned(),
             }],
-            extended_events: vec![SdkEventExResult {
-                address: "PADDR".to_owned(),
-                contract: "token".to_owned(),
-                kind: "TokenSeriesCreate".to_owned(),
-                data: serde_json::json!({ "valueKind": "Object" }),
-            }],
+            extended_events: vec![extended_event(
+                "PADDR",
+                "token",
+                "TokenSeriesCreate",
+                serde_json::json!({ "valueKind": "Object" }),
+            )],
             ..Default::default()
         };
 
@@ -3625,11 +3768,11 @@ mod tests {
                 name: "TokenCreate".to_owned(),
                 data: "065348414D414E0100046D61696E".to_owned(),
             }],
-            extended_events: vec![SdkEventExResult {
-                address: "PADDR".to_owned(),
-                contract: "token".to_owned(),
-                kind: "TokenCreate".to_owned(),
-                data: serde_json::json!({
+            extended_events: vec![extended_event(
+                "PADDR",
+                "token",
+                "TokenCreate",
+                serde_json::json!({
                     "symbol": "SHAMAN",
                     "maxSupply": "100",
                     "decimals": 0,
@@ -3640,7 +3783,7 @@ mod tests {
                         "url": "https://en.wikipedia.org/wiki/Shamanism"
                     }
                 }),
-            }],
+            )],
             ..Default::default()
         };
         let transaction_record = TransactionRecord {
@@ -3741,11 +3884,11 @@ mod tests {
                 },
             ],
             extended_events: vec![
-                SdkEventExResult {
-                    address: "PTAZ".to_owned(),
-                    contract: "token".to_owned(),
-                    kind: "TokenCreate".to_owned(),
-                    data: serde_json::json!({
+                extended_event(
+                    "PTAZ",
+                    "token",
+                    "TokenCreate",
+                    serde_json::json!({
                         "symbol": "TAZ",
                         "maxSupply": "0",
                         "decimals": 9,
@@ -3753,12 +3896,12 @@ mod tests {
                         "carbonTokenId": 51,
                         "metadata": { "name": "Transplanetary Artificial Zenith" }
                     }),
-                },
-                SdkEventExResult {
-                    address: "PBAD".to_owned(),
-                    contract: "token".to_owned(),
-                    kind: "TokenCreate".to_owned(),
-                    data: serde_json::json!({
+                ),
+                extended_event(
+                    "PBAD",
+                    "token",
+                    "TokenCreate",
+                    serde_json::json!({
                         "symbol": "BADZEROQ",
                         "maxSupply": "0",
                         "decimals": 8,
@@ -3766,7 +3909,7 @@ mod tests {
                         "carbonTokenId": 312,
                         "metadata": { "name": "BADZEROQ token semantics V2 probe" }
                     }),
-                },
+                ),
             ],
             ..Default::default()
         };
@@ -3824,17 +3967,31 @@ mod tests {
     fn token_create_payload_matches_csharp_event_shape() {
         // Token table flags are derived by the DB side-effect. The event JSON
         // itself must stay compatible with C# API/parity payloads.
-        let payload = build_token_create_payload(&serde_json::json!({
-            "symbol": "FLAG",
-            "name": "Top Level Name",
-            "maxSupply": "100000000",
-            "decimals": 8,
-            "isNonFungible": false,
-            "metadata": {
-                "token_name": "Flag Token",
-                "token_flags": "Fungible|Transferable|Finite|Divisible|Burnable"
-            }
-        }));
+        let event = extended_event(
+            "PADDR",
+            "token",
+            "TokenCreate",
+            serde_json::json!({
+                "symbol": "FLAG",
+                "name": "Top Level Name",
+                "maxSupply": "100000000",
+                "decimals": 8,
+                "isNonFungible": false,
+                "metadata": {
+                    "token_name": "Flag Token",
+                    "token_flags": "Fungible|Transferable|Finite|Divisible|Burnable"
+                }
+            }),
+        );
+        let token_create = token_create_payload(&event.data);
+        assert!(
+            token_create.is_some(),
+            "the fixture must decode into the modeled TokenCreate shape"
+        );
+        let Some(token_create) = token_create else {
+            return;
+        };
+        let payload = build_token_create_payload(token_create);
 
         assert_eq!(
             payload,
@@ -3878,11 +4035,11 @@ mod tests {
             timestamp: 1767146140,
             state: "Halt".to_owned(),
             events: Vec::new(),
-            extended_events: vec![SdkEventExResult {
-                address: "POWNER".to_owned(),
-                contract: "token".to_owned(),
-                kind: "TokenSeriesCreate".to_owned(),
-                data: serde_json::json!({
+            extended_events: vec![extended_event(
+                "POWNER",
+                "token",
+                "TokenSeriesCreate",
+                serde_json::json!({
                     "symbol": "POPIMEW",
                     "seriesId": "78420994489752471120082872831289854578636467435124725846496638966668030965675",
                     "maxMint": 0,
@@ -3896,7 +4053,7 @@ mod tests {
                         "rom": ""
                     }
                 }),
-            }],
+            )],
             ..Default::default()
         };
         let transaction_record = TransactionRecord {

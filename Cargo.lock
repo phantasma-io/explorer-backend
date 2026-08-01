@@ -1532,9 +1532,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phantasma-sdk"
-version = "1.7.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c82ba0b91d42c40dab6fba28f6c1ed13c204eee1193a5f907310cd3615d4c234"
+checksum = "77a8123ada9c7155d7d150d747121d80f42e31abf0bb637aa1b4be8c3aa0daed"
 dependencies = [
  "async-trait",
  "base64",
