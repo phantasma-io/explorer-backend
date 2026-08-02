@@ -94,6 +94,31 @@ fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>) {
     (q_like, q_height)
 }
 
+/// Renders the event-kind predicate with the ids INLINED as literals.
+///
+/// The ids come from our own `event_kinds` table (i32, resolved by
+/// [`super::event_kind_ids_by_name`]), so there is nothing to escape. They are literals
+/// rather than a bound parameter on purpose, and this is the whole point of the fragment:
+/// a bound `event_kind_id = ANY($n)` is invisible to the planner when PostgreSQL builds a
+/// GENERIC plan for a cached statement, so it stops seeking `IX_Events_EventKindId_ID`
+/// and walks the ordering backwards instead — which never finishes for a kind with fewer
+/// rows than one page. Measured on the live database under `force_generic_plan`: the
+/// bound array times out, an OR of bound scalars times out, and the inlined form answers
+/// in 16 ms off an index-only scan. Dropping the `IS NULL` guard alone does not help.
+///
+/// `Some(&[])` means the requested name matched no kind, which must match no rows — not
+/// every row.
+fn event_kind_predicate(column: &str, ids: Option<&[i32]>) -> String {
+    match ids {
+        None => String::new(),
+        Some([]) => "          AND FALSE\n".to_owned(),
+        Some(ids) => {
+            let list = ids.iter().map(i32::to_string).collect::<Vec<_>>().join(",");
+            format!("          AND {column} = ANY('{{{list}}}'::integer[])\n")
+        }
+    }
+}
+
 /// Global event list scoped to one chain (no address filter), seek-paged.
 /// Fetches `limit + 1` rows so the API can detect a following page.
 pub async fn list_events_global(
@@ -159,40 +184,50 @@ pub async fn list_events_global(
         LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
         LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
         WHERE ($1::integer IS NULL OR event.chain_id = $1)
-          AND ($3::text IS NULL OR tx.hash = $3)
+{kind_predicate}{kind_partial_predicate}          AND ($3::text IS NULL OR tx.hash = $3)
           AND ($4::bigint IS NULL OR block.height = $4)
-          AND ($5::integer[] IS NULL OR event.event_kind_id = ANY($5))
-          AND ($6::text IS NULL OR $6 = 'legacy')
-          AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
-          AND ($11::integer IS NULL OR event.id = $11)
-          AND ($12::text IS NULL OR tx.hash ILIKE $12 OR block.hash ILIKE $12 OR block.height = $13 OR event_kind.name ILIKE $12 OR address.address ILIKE $12 OR address.address_name ILIKE $12 OR contract.hash ILIKE $12 OR contract.name ILIKE $12 OR contract.symbol ILIKE $12 OR event.token_id ILIKE $12)
-          AND ($14::bool OR NOT event.nsfw)
-          AND ($15::bool OR NOT event.blacklisted)
-          AND ($16::text IS NULL OR event.token_id = $16)
-          AND ($17::text IS NULL OR block.hash = $17)
-          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
-          AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
-          AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
-          AND ($21::integer[] IS NULL OR event.event_kind_id = ANY($21))
-          AND ($22::text IS NULL OR nft.name ILIKE $22)
-          AND ($23::text IS NULL OR nft.description ILIKE $23)
-          AND ($24::text IS NULL OR address.address ILIKE $24 OR address.address_name ILIKE $24 OR address.user_name ILIKE $24)
+          AND ($5::text IS NULL OR $5 = 'legacy')
+          AND ($6::text IS NULL OR contract.hash = $6 OR contract.name = $6 OR contract.symbol = $6)
+          AND ($10::integer IS NULL OR event.id = $10)
+          AND ($11::text IS NULL OR tx.hash ILIKE $11 OR block.hash ILIKE $11 OR block.height = $12 OR event_kind.name ILIKE $11 OR address.address ILIKE $11 OR address.address_name ILIKE $11 OR contract.hash ILIKE $11 OR contract.name ILIKE $11 OR contract.symbol ILIKE $11 OR event.token_id ILIKE $11)
+          AND ($13::bool OR NOT event.nsfw)
+          AND ($14::bool OR NOT event.blacklisted)
+          AND ($15::text IS NULL OR event.token_id = $15)
+          AND ($16::text IS NULL OR block.hash = $16)
+          AND ($17::bigint IS NULL OR event.timestamp_unix_seconds <= $17)
+          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds >= $18)
+          AND ($19::bigint IS NULL OR event.date_unix_seconds = $19)
+          AND ($20::text IS NULL OR nft.name ILIKE $20)
+          AND ($21::text IS NULL OR nft.description ILIKE $21)
+          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22 OR address.user_name ILIKE $22)
           AND (
-              $8::bigint IS NULL
-              OR {column} {op} $8
-              OR ({column} = $8 AND event.id {op} $9)
+              $7::bigint IS NULL
+              OR {column} {op} $7
+              OR ({column} = $7 AND event.id {op} $8)
           )
         ORDER BY {column} {dir}, event.id {dir}
-        LIMIT $10
+        LIMIT $9
         "#,
         column = page.order_by.column(),
+        kind_predicate = event_kind_predicate("event.event_kind_id", filter.event_kind_ids),
+        kind_partial_predicate =
+            event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
     );
+    // Not cached as a prepared statement, so PostgreSQL plans it with the real parameter
+    // values every time. A cached statement eventually gets a GENERIC plan — built
+    // without knowing any parameter — and these queries carry ~25 optional filters as
+    // `($n IS NULL OR <predicate>)` guards that a generic plan cannot reason about.
+    // Measured under `force_generic_plan` on the live database: the same statement is
+    // fast for a rare kind and takes 20-30 s for a high-volume one, purely from losing
+    // the cursor and limit values at plan time. Re-planning costs about a millisecond
+    // here. A pool-wide `plan_cache_mode = force_custom_plan` was tried in June 2026 and
+    // reverted: ineffective on sqlx pools, and it made `events?address` take five minutes.
     let rows = sqlx::query(&sql)
+        .persistent(false)
         .bind(chain_id)
         .bind(chain_name)
         .bind(filter.transaction_hash)
         .bind(filter.block_height)
-        .bind(filter.event_kind_ids)
         .bind(filter.event_source)
         .bind(filter.contract)
         .bind(page.cursor_sort_value)
@@ -208,7 +243,6 @@ pub async fn list_events_global(
         .bind(filter.date_less)
         .bind(filter.date_greater)
         .bind(filter.date_day)
-        .bind(filter.event_kind_partial_ids)
         .bind(filter.nft_name_partial)
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
@@ -286,42 +320,52 @@ pub async fn list_events_by_address(
         LEFT JOIN series series ON series.id = nft.series_id
         LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
         LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
-        WHERE ($6::integer IS NOT NULL OR chain.name = $1)
-          AND ($2::text IS NULL OR tx.hash = $2)
+        WHERE ($5::integer IS NOT NULL OR chain.name = $1)
+{kind_predicate}{kind_partial_predicate}          AND ($2::text IS NULL OR tx.hash = $2)
           AND ($3::bigint IS NULL OR block.height = $3)
-          AND ($4::integer[] IS NULL OR event.event_kind_id = ANY($4))
-          AND ($5::text IS NULL OR $5 = 'legacy')
-          AND ($6::integer IS NULL OR event.address_id = $6 OR event.target_address_id = $6)
-          AND ($25::integer IS NULL OR event.chain_id = $25)
-          AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
-          AND ($11::integer IS NULL OR event.id = $11)
-          AND ($12::text IS NULL OR tx.hash ILIKE $12 OR block.hash ILIKE $12 OR block.height = $13 OR event_kind.name ILIKE $12 OR address.address ILIKE $12 OR target_address.address ILIKE $12 OR address.address_name ILIKE $12 OR contract.hash ILIKE $12 OR contract.name ILIKE $12 OR contract.symbol ILIKE $12 OR event.token_id ILIKE $12)
-          AND ($14::bool OR NOT event.nsfw)
-          AND ($15::bool OR NOT event.blacklisted)
-          AND ($16::text IS NULL OR event.token_id = $16)
-          AND ($17::text IS NULL OR block.hash = $17)
-          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
-          AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
-          AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
-          AND ($21::integer[] IS NULL OR event.event_kind_id = ANY($21))
-          AND ($22::text IS NULL OR nft.name ILIKE $22)
-          AND ($23::text IS NULL OR nft.description ILIKE $23)
-          AND ($24::text IS NULL OR address.address ILIKE $24 OR address.address_name ILIKE $24 OR address.user_name ILIKE $24)
+          AND ($4::text IS NULL OR $4 = 'legacy')
+          AND ($5::integer IS NULL OR event.address_id = $5 OR event.target_address_id = $5)
+          AND ($23::integer IS NULL OR event.chain_id = $23)
+          AND ($6::text IS NULL OR contract.hash = $6 OR contract.name = $6 OR contract.symbol = $6)
+          AND ($10::integer IS NULL OR event.id = $10)
+          AND ($11::text IS NULL OR tx.hash ILIKE $11 OR block.hash ILIKE $11 OR block.height = $12 OR event_kind.name ILIKE $11 OR address.address ILIKE $11 OR target_address.address ILIKE $11 OR address.address_name ILIKE $11 OR contract.hash ILIKE $11 OR contract.name ILIKE $11 OR contract.symbol ILIKE $11 OR event.token_id ILIKE $11)
+          AND ($13::bool OR NOT event.nsfw)
+          AND ($14::bool OR NOT event.blacklisted)
+          AND ($15::text IS NULL OR event.token_id = $15)
+          AND ($16::text IS NULL OR block.hash = $16)
+          AND ($17::bigint IS NULL OR event.timestamp_unix_seconds <= $17)
+          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds >= $18)
+          AND ($19::bigint IS NULL OR event.date_unix_seconds = $19)
+          AND ($20::text IS NULL OR nft.name ILIKE $20)
+          AND ($21::text IS NULL OR nft.description ILIKE $21)
+          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22 OR address.user_name ILIKE $22)
           AND (
-              $8::bigint IS NULL
-              OR {column} {op} $8
-              OR ({column} = $8 AND event.id {op} $9)
+              $7::bigint IS NULL
+              OR {column} {op} $7
+              OR ({column} = $7 AND event.id {op} $8)
           )
         ORDER BY {column} {dir}, event.id {dir}
-        LIMIT $10
+        LIMIT $9
         "#,
         column = page.order_by.column(),
+        kind_predicate = event_kind_predicate("event.event_kind_id", filter.event_kind_ids),
+        kind_partial_predicate =
+            event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
     );
+    // Not cached as a prepared statement, so PostgreSQL plans it with the real parameter
+    // values every time. A cached statement eventually gets a GENERIC plan — built
+    // without knowing any parameter — and these queries carry ~25 optional filters as
+    // `($n IS NULL OR <predicate>)` guards that a generic plan cannot reason about.
+    // Measured under `force_generic_plan` on the live database: the same statement is
+    // fast for a rare kind and takes 20-30 s for a high-volume one, purely from losing
+    // the cursor and limit values at plan time. Re-planning costs about a millisecond
+    // here. A pool-wide `plan_cache_mode = force_custom_plan` was tried in June 2026 and
+    // reverted: ineffective on sqlx pools, and it made `events?address` take five minutes.
     let rows = sqlx::query(&sql)
+        .persistent(false)
         .bind(chain_name)
         .bind(filter.transaction_hash)
         .bind(filter.block_height)
-        .bind(filter.event_kind_ids)
         .bind(filter.event_source)
         .bind(address_id)
         .bind(filter.contract)
@@ -338,7 +382,6 @@ pub async fn list_events_by_address(
         .bind(filter.date_less)
         .bind(filter.date_greater)
         .bind(filter.date_day)
-        .bind(filter.event_kind_partial_ids)
         .bind(filter.nft_name_partial)
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
