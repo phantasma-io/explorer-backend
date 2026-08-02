@@ -2564,6 +2564,61 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn event_kind_name_resolves_to_every_chain_that_defines_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The kind dimension is unique per (chain_id, name), so one name exists once per
+        // chain — `Inflation` is a different id on `main` than on `main-generation-1`.
+        // Event filters run on these ids, so the resolver has to return all of them or a
+        // filter would silently hide one chain's events. An unknown name must resolve to
+        // an empty set, which makes the filter match nothing instead of everything.
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        let main_id = resolve_chain_id(&mut transaction, &ChainName::new("main")?).await?;
+        let gen1_id =
+            resolve_chain_id(&mut transaction, &ChainName::new("main-generation-1")?).await?;
+        assert_ne!(main_id, gen1_id);
+
+        let suffix = Uuid::now_v7().simple().to_string();
+        let name = format!("RstKind{}", &suffix[..8]);
+        let on_main = upsert_event_kind_id(&mut transaction, main_id, &name).await?;
+        let on_gen1 = upsert_event_kind_id(&mut transaction, gen1_id, &name).await?;
+        assert_ne!(
+            on_main, on_gen1,
+            "the same name on two chains must be two rows"
+        );
+
+        let mut resolved = event_kind_ids_by_name(&mut *transaction, &name).await?;
+        resolved.sort_unstable();
+        let mut expected = vec![on_main, on_gen1];
+        expected.sort_unstable();
+        assert_eq!(resolved, expected);
+
+        let partial =
+            event_kind_ids_by_name_like(&mut *transaction, &format!("%{}%", &suffix[..8])).await?;
+        assert_eq!(
+            partial.len(),
+            2,
+            "the substring filter sees both chains too"
+        );
+
+        let unknown = event_kind_ids_by_name(&mut *transaction, "RstKindThatDoesNotExist").await?;
+        assert!(
+            unknown.is_empty(),
+            "an unknown kind must resolve to nothing, not to every kind"
+        );
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
     // CI guard: the db-integration tests self-skip when EXPLORER_TEST_DATABASE_URL
     // is unset, which is convenient locally but dangerous in CI (they would pass
     // without ever exercising the database). CI sets EXPLORER_REQUIRE_DB_TESTS=1,

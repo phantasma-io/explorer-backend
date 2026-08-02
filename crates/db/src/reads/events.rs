@@ -58,7 +58,10 @@ pub struct EventPage {
 pub struct EventFilter<'a> {
     pub transaction_hash: Option<&'a str>,
     pub block_height: Option<i64>,
-    pub event_kind: Option<&'a str>,
+    /// Kind ids the event must have, already resolved from the requested name (see
+    /// [`super::event_kind_ids_by_name`]). An empty slice matches nothing, which is the
+    /// honest answer for a name no chain defines.
+    pub event_kind_ids: Option<&'a [i32]>,
     pub event_source: Option<&'a str>,
     pub contract: Option<&'a str>,
     pub q: Option<&'a str>,
@@ -73,7 +76,7 @@ pub struct EventFilter<'a> {
     pub date_greater: Option<i64>,
     pub date_day: Option<i64>,
     /// `%value%` LIKE forms for the partial filters (C# `.Contains`).
-    pub event_kind_partial: Option<&'a str>,
+    pub event_kind_partial_ids: Option<&'a [i32]>,
     pub nft_name_partial: Option<&'a str>,
     pub nft_description_partial: Option<&'a str>,
     pub address_partial: Option<&'a str>,
@@ -158,7 +161,7 @@ pub async fn list_events_global(
         WHERE ($1::integer IS NULL OR event.chain_id = $1)
           AND ($3::text IS NULL OR tx.hash = $3)
           AND ($4::bigint IS NULL OR block.height = $4)
-          AND ($5::text IS NULL OR event_kind.name = $5)
+          AND ($5::integer[] IS NULL OR event.event_kind_id = ANY($5))
           AND ($6::text IS NULL OR $6 = 'legacy')
           AND ($7::text IS NULL OR contract.hash = $7 OR contract.name = $7 OR contract.symbol = $7)
           AND ($11::integer IS NULL OR event.id = $11)
@@ -170,7 +173,7 @@ pub async fn list_events_global(
           AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
           AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
           AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
-          AND ($21::text IS NULL OR event_kind.name ILIKE $21)
+          AND ($21::integer[] IS NULL OR event.event_kind_id = ANY($21))
           AND ($22::text IS NULL OR nft.name ILIKE $22)
           AND ($23::text IS NULL OR nft.description ILIKE $23)
           AND ($24::text IS NULL OR address.address ILIKE $24 OR address.address_name ILIKE $24 OR address.user_name ILIKE $24)
@@ -189,7 +192,7 @@ pub async fn list_events_global(
         .bind(chain_name)
         .bind(filter.transaction_hash)
         .bind(filter.block_height)
-        .bind(filter.event_kind)
+        .bind(filter.event_kind_ids)
         .bind(filter.event_source)
         .bind(filter.contract)
         .bind(page.cursor_sort_value)
@@ -205,7 +208,7 @@ pub async fn list_events_global(
         .bind(filter.date_less)
         .bind(filter.date_greater)
         .bind(filter.date_day)
-        .bind(filter.event_kind_partial)
+        .bind(filter.event_kind_partial_ids)
         .bind(filter.nft_name_partial)
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
@@ -286,7 +289,7 @@ pub async fn list_events_by_address(
         WHERE ($6::integer IS NOT NULL OR chain.name = $1)
           AND ($2::text IS NULL OR tx.hash = $2)
           AND ($3::bigint IS NULL OR block.height = $3)
-          AND ($4::text IS NULL OR event_kind.name = $4)
+          AND ($4::integer[] IS NULL OR event.event_kind_id = ANY($4))
           AND ($5::text IS NULL OR $5 = 'legacy')
           AND ($6::integer IS NULL OR event.address_id = $6 OR event.target_address_id = $6)
           AND ($25::integer IS NULL OR event.chain_id = $25)
@@ -300,7 +303,7 @@ pub async fn list_events_by_address(
           AND ($18::bigint IS NULL OR event.timestamp_unix_seconds <= $18)
           AND ($19::bigint IS NULL OR event.timestamp_unix_seconds >= $19)
           AND ($20::bigint IS NULL OR event.date_unix_seconds = $20)
-          AND ($21::text IS NULL OR event_kind.name ILIKE $21)
+          AND ($21::integer[] IS NULL OR event.event_kind_id = ANY($21))
           AND ($22::text IS NULL OR nft.name ILIKE $22)
           AND ($23::text IS NULL OR nft.description ILIKE $23)
           AND ($24::text IS NULL OR address.address ILIKE $24 OR address.address_name ILIKE $24 OR address.user_name ILIKE $24)
@@ -318,7 +321,7 @@ pub async fn list_events_by_address(
         .bind(chain_name)
         .bind(filter.transaction_hash)
         .bind(filter.block_height)
-        .bind(filter.event_kind)
+        .bind(filter.event_kind_ids)
         .bind(filter.event_source)
         .bind(address_id)
         .bind(filter.contract)
@@ -335,7 +338,7 @@ pub async fn list_events_by_address(
         .bind(filter.date_less)
         .bind(filter.date_greater)
         .bind(filter.date_day)
-        .bind(filter.event_kind_partial)
+        .bind(filter.event_kind_partial_ids)
         .bind(filter.nft_name_partial)
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)

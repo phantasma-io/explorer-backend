@@ -38,6 +38,50 @@ impl EventKindOrderBy {
     }
 }
 
+/// Resolves an event-kind name to every id that carries it.
+///
+/// The dimension is scoped per chain (`UNIQUE (chain_id, name)`), so one name
+/// legitimately exists once per chain — `Inflation` is id 30 on `main` and id 92 on
+/// `main-generation-1` — and a filter has to match all of them.
+///
+/// Event lists filter on these ids rather than joining `event_kinds` and comparing the
+/// name, because the joined-name form cannot use `IX_Events_EventKindId_ID`: the planner
+/// falls back to walking the primary key backwards and, for a kind with fewer rows than
+/// the page size, that means scanning all 76M events before it can answer at all.
+pub async fn event_kind_ids_by_name(
+    executor: impl sqlx::PgExecutor<'_>,
+    name: &str,
+) -> Result<Vec<i32>, DbError> {
+    let ids = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT id FROM event_kinds WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(ids)
+}
+
+/// Resolves an event-kind `%substring%` pattern to the ids it matches. Same reason as
+/// [`event_kind_ids_by_name`]: the dimension is tiny, the fact table is not.
+pub async fn event_kind_ids_by_name_like(
+    executor: impl sqlx::PgExecutor<'_>,
+    pattern: &str,
+) -> Result<Vec<i32>, DbError> {
+    let ids = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT id FROM event_kinds WHERE name ILIKE $1
+        "#,
+    )
+    .bind(pattern)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(ids)
+}
+
 /// List distinct event-kind names (grouped), optionally scoped to a chain and
 /// filtered by exact name, ordered by the chosen key then name. The caller
 /// passes `limit + 1` to detect a following page.

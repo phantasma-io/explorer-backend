@@ -1577,10 +1577,22 @@ pub(crate) async fn load_events(
         ))
     })?;
     let direction = parse_sort_direction(query.order_direction.as_deref())?;
+    // The kind dimension is resolved to ids here so the list query can seek on
+    // IX_Events_EventKindId_ID. Comparing the joined name instead made the planner walk
+    // the primary key backwards, which never finishes for a kind that has fewer events
+    // than one page.
+    let event_kind_ids = match event_kind.as_deref() {
+        Some(name) => Some(event_kind_ids_by_name(&state.pool, name).await?),
+        None => None,
+    };
+    let event_kind_partial_ids = match event_kind_partial.as_deref() {
+        Some(pattern) => Some(event_kind_ids_by_name_like(&state.pool, pattern).await?),
+        None => None,
+    };
     let filter = EventFilter {
         transaction_hash: transaction_hash.as_deref(),
         block_height: query.block_height,
-        event_kind: event_kind.as_deref(),
+        event_kind_ids: event_kind_ids.as_deref(),
         event_source: event_source.as_deref(),
         contract: contract.as_deref(),
         q: q.as_deref(),
@@ -1592,7 +1604,7 @@ pub(crate) async fn load_events(
         date_less,
         date_greater,
         date_day,
-        event_kind_partial: event_kind_partial.as_deref(),
+        event_kind_partial_ids: event_kind_partial_ids.as_deref(),
         nft_name_partial: nft_name_partial.as_deref(),
         nft_description_partial: nft_description_partial.as_deref(),
         address_partial: address_partial.as_deref(),
