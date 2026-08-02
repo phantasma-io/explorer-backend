@@ -1639,7 +1639,14 @@ pub(crate) async fn load_events(
         // gen1 / non-main events for transaction_hash/block_hash lookups, leaving
         // legacy transaction pages with an empty narrative and no events.
         let chain_name = chain.as_deref().unwrap_or_else(|| state.chain.as_str());
-        list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
+        // The kind-seek path takes one page per kind id through the kind index instead of
+        // walking the global ordering. That walk is what dies when a kind's rows are
+        // clustered away from where it starts, which on this chain is the normal case.
+        if filter.kind_seek_applies(order_by) {
+            list_events_by_kind_seek(&state.pool, chain_filter_id, &filter, &page).await?
+        } else {
+            list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
+        }
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, "event")?;

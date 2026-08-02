@@ -94,6 +94,61 @@ fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>) {
     (q_like, q_height)
 }
 
+/// Columns every event-list answer projects, after `event.id` and the cursor value.
+/// Shared so the general list and the kind-seek path below cannot drift apart.
+const EVENT_LIST_PROJECTION: &str = r#"            event.event_index,
+            'legacy'::text AS event_source,
+            COALESCE(chain.name, $2::text) AS chain_name,
+            event.timestamp_unix_seconds,
+            block.hash AS block_hash,
+            tx.hash AS transaction_hash,
+            event_kind.name AS event_kind,
+            COALESCE(event.event_name, event_kind.name) AS event_name,
+            address.address,
+            address.address_name,
+            contract.hash AS contract_hash,
+            contract.name AS contract_name,
+            contract.symbol AS contract_symbol,
+            contract.hash AS raw_contract,
+            event.token_id,
+            event.payload_json,
+            event.raw_data,
+            CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
+                'description', nft.description, 'name', nft.name,
+                'imageURL', nft.image, 'videoURL', nft.video, 'infoURL', nft.info_url,
+                'rom', nft.rom, 'ram', nft.ram,
+                'mint_date', nft.mint_date_unix_seconds::text,
+                'mint_number', nft.mint_number::text, 'metadata', nft.metadata
+            ) END AS nft_metadata_json,
+            CASE WHEN series.id IS NOT NULL THEN jsonb_build_object(
+                'id', series.id, 'series_id', series.series_id, 'creator', series_creator.address,
+                'created_unix_seconds', series.series_created_unix_seconds,
+                'current_supply', series.current_supply, 'max_supply', series.max_supply,
+                'mode_name', series_mode.mode_name, 'name', series.name,
+                'description', series.description, 'image', series.image,
+                'royalties', series.royalties::text, 'type', series.type,
+                'attr_type_1', series.attr_type_1, 'attr_value_1', series.attr_value_1,
+                'attr_type_2', series.attr_type_2, 'attr_value_2', series.attr_value_2,
+                'attr_type_3', series.attr_type_3, 'attr_value_3', series.attr_value_3,
+                'metadata', series.metadata
+            ) END AS series_json
+"#;
+
+/// The presentation joins behind that projection. `events` is the driving table in the
+/// general list; the kind-seek path joins it back by id after the rows are chosen.
+const EVENT_LIST_JOINS: &str = r#"        FROM events event
+        JOIN transactions tx ON tx.id = event.transaction_id
+        JOIN blocks block ON block.id = tx.block_id
+        JOIN chains chain ON chain.id = event.chain_id
+        JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
+        LEFT JOIN addresses address ON address.id = event.address_id
+        LEFT JOIN contracts contract ON contract.id = event.contract_id
+        LEFT JOIN nfts nft ON nft.id = event.nft_id
+        LEFT JOIN series series ON series.id = nft.series_id
+        LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
+        LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
+"#;
+
 /// Renders the event-kind predicate with the ids INLINED as literals.
 ///
 /// The ids come from our own `event_kinds` table (i32, resolved by
@@ -136,53 +191,8 @@ pub async fn list_events_global(
         SELECT
             event.id,
             {column}::bigint AS cursor_sort_value,
-            event.event_index,
-            'legacy'::text AS event_source,
-            COALESCE(chain.name, $2::text) AS chain_name,
-            event.timestamp_unix_seconds,
-            block.hash AS block_hash,
-            tx.hash AS transaction_hash,
-            event_kind.name AS event_kind,
-            COALESCE(event.event_name, event_kind.name) AS event_name,
-            address.address,
-            address.address_name,
-            contract.hash AS contract_hash,
-            contract.name AS contract_name,
-            contract.symbol AS contract_symbol,
-            contract.hash AS raw_contract,
-            event.token_id,
-            event.payload_json,
-            event.raw_data,
-            CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
-                'description', nft.description, 'name', nft.name,
-                'imageURL', nft.image, 'videoURL', nft.video, 'infoURL', nft.info_url,
-                'rom', nft.rom, 'ram', nft.ram,
-                'mint_date', nft.mint_date_unix_seconds::text,
-                'mint_number', nft.mint_number::text, 'metadata', nft.metadata
-            ) END AS nft_metadata_json,
-            CASE WHEN series.id IS NOT NULL THEN jsonb_build_object(
-                'id', series.id, 'series_id', series.series_id, 'creator', series_creator.address,
-                'created_unix_seconds', series.series_created_unix_seconds,
-                'current_supply', series.current_supply, 'max_supply', series.max_supply,
-                'mode_name', series_mode.mode_name, 'name', series.name,
-                'description', series.description, 'image', series.image,
-                'royalties', series.royalties::text, 'type', series.type,
-                'attr_type_1', series.attr_type_1, 'attr_value_1', series.attr_value_1,
-                'attr_type_2', series.attr_type_2, 'attr_value_2', series.attr_value_2,
-                'attr_type_3', series.attr_type_3, 'attr_value_3', series.attr_value_3,
-                'metadata', series.metadata
-            ) END AS series_json
-        FROM events event
-        JOIN transactions tx ON tx.id = event.transaction_id
-        JOIN blocks block ON block.id = tx.block_id
-        JOIN chains chain ON chain.id = event.chain_id
-        JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
-        LEFT JOIN addresses address ON address.id = event.address_id
-        LEFT JOIN contracts contract ON contract.id = event.contract_id
-        LEFT JOIN nfts nft ON nft.id = event.nft_id
-        LEFT JOIN series series ON series.id = nft.series_id
-        LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
-        LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
+{projection}
+{joins}
         WHERE ($1::integer IS NULL OR event.chain_id = $1)
 {kind_predicate}{kind_partial_predicate}          AND ($3::text IS NULL OR tx.hash = $3)
           AND ($4::bigint IS NULL OR block.height = $4)
@@ -209,6 +219,8 @@ pub async fn list_events_global(
         LIMIT $9
         "#,
         column = page.order_by.column(),
+        projection = EVENT_LIST_PROJECTION,
+        joins = EVENT_LIST_JOINS,
         kind_predicate = event_kind_predicate("event.event_kind_id", filter.event_kind_ids),
         kind_partial_predicate =
             event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
@@ -544,4 +556,263 @@ pub async fn list_event_tokens_by_symbols(
     .await?;
 
     Ok(rows)
+}
+
+/// Whether the kind-seek path below can answer this filter.
+///
+/// It pre-selects rows from `events` alone, so every active filter must live on that
+/// table; a filter that needs one of the presentation joins (a transaction hash, a
+/// contract, `q`, an NFT name) would be applied only AFTER each branch took its page,
+/// and the answer could come back short. Ordering by block height is excluded for the
+/// same reason: the sort key itself comes from a join.
+impl EventFilter<'_> {
+    pub fn kind_seek_applies(&self, order_by: EventOrderBy) -> bool {
+        let kind_ids_are_selective = matches!(self.event_kind_ids, Some(ids) if !ids.is_empty());
+        let joined_filters_absent = self.transaction_hash.is_none()
+            && self.block_height.is_none()
+            && self.block_hash.is_none()
+            && self.contract.is_none()
+            && self.q.is_none()
+            && self.nft_name_partial.is_none()
+            && self.nft_description_partial.is_none()
+            && self.address_partial.is_none()
+            && self.event_kind_partial_ids.is_none();
+
+        kind_ids_are_selective
+            && joined_filters_absent
+            && !matches!(order_by, EventOrderBy::BlockHeight)
+    }
+}
+
+/// Event list for one or more kind ids, seeking each kind separately.
+///
+/// The general list walks the `event.id` (or timestamp) ordering and keeps rows whose
+/// kind matches. That works only while matches are near where the walk starts, and on
+/// this chain they are not: `event_kind_id` is strongly clustered because gen1, gen2 and
+/// gen3 wrote different kinds in different id ranges. Measured on the live database,
+/// `CrownRewards` — 6.7M rows, none of them in the newest 13M ids — takes 7 s descending
+/// while its ascending page answers in 17 ms, and a kind with a hundred rows can die in
+/// the ascending direction for the mirror-image reason. The planner is not wrong about
+/// how many rows match, it is wrong about where they are, so no amount of statistics or
+/// inlining fixes it.
+///
+/// This takes one page per kind id through `IX_Events_EventKindId_ID` /
+/// `IX_Events_EventKind_Chain_Timestamp_Id`, which are ordered by exactly what each
+/// branch asks for, then merges and re-limits. A row in the true page must be in its own
+/// kind's page, so the merged result is identical to the general query's; the work is
+/// bounded by `limit + 1` per kind whatever the direction and wherever the rows live.
+pub async fn list_events_by_kind_seek(
+    executor: impl sqlx::PgExecutor<'_>,
+    chain_id: Option<i32>,
+    filter: &EventFilter<'_>,
+    page: &EventPage,
+) -> Result<Vec<PgRow>, DbError> {
+    let dir = page.direction.as_sql();
+    let op = page.direction.cursor_operator();
+    let sort_column = match page.order_by {
+        EventOrderBy::Id => "candidate.id",
+        EventOrderBy::Date => "candidate.timestamp_unix_seconds",
+        // Excluded by `kind_seek_applies`; the sort key would come from a join.
+        EventOrderBy::BlockHeight => "candidate.id",
+    };
+    let branches = filter
+        .event_kind_ids
+        .unwrap_or_default()
+        .iter()
+        .map(|kind_id| {
+            format!(
+                r#"
+        (
+            SELECT candidate.id, {sort_column}::bigint AS sort_value
+            FROM events candidate
+            WHERE candidate.event_kind_id = {kind_id}
+              AND ($1::integer IS NULL OR candidate.chain_id = $1)
+              AND ($4::integer IS NULL OR candidate.id = $4)
+              AND ($5::bool OR NOT candidate.nsfw)
+              AND ($6::bool OR NOT candidate.blacklisted)
+              AND ($7::text IS NULL OR candidate.token_id = $7)
+              AND ($8::bigint IS NULL OR candidate.timestamp_unix_seconds <= $8)
+              AND ($9::bigint IS NULL OR candidate.timestamp_unix_seconds >= $9)
+              AND ($10::bigint IS NULL OR candidate.date_unix_seconds = $10)
+              AND (
+                  $2::bigint IS NULL
+                  OR {sort_column} {op} $2
+                  OR ({sort_column} = $2 AND candidate.id {op} $3)
+              )
+            ORDER BY {sort_column} {dir}, candidate.id {dir}
+            LIMIT $11
+        )"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n        UNION ALL");
+
+    let sql = format!(
+        r#"
+        WITH picked AS ({branches})
+        SELECT
+            event.id,
+            picked.sort_value AS cursor_sort_value,
+{projection}
+        FROM picked
+        JOIN events event ON event.id = picked.id
+        JOIN transactions tx ON tx.id = event.transaction_id
+        JOIN blocks block ON block.id = tx.block_id
+        JOIN chains chain ON chain.id = event.chain_id
+        JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
+        LEFT JOIN addresses address ON address.id = event.address_id
+        LEFT JOIN contracts contract ON contract.id = event.contract_id
+        LEFT JOIN nfts nft ON nft.id = event.nft_id
+        LEFT JOIN series series ON series.id = nft.series_id
+        LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
+        LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
+        ORDER BY picked.sort_value {dir}, event.id {dir}
+        LIMIT $11
+        "#,
+        projection = EVENT_LIST_PROJECTION,
+    );
+
+    let rows = sqlx::query(&sql)
+        .persistent(false)
+        .bind(chain_id)
+        .bind(page.cursor_sort_value)
+        .bind(page.cursor_id)
+        .bind(filter.event_id)
+        .bind(filter.show_nsfw)
+        .bind(filter.show_blacklisted)
+        .bind(filter.token_id)
+        .bind(filter.date_less)
+        .bind(filter.date_greater)
+        .bind(filter.date_day)
+        .bind(page.limit + 1)
+        .fetch_all(executor)
+        .await?;
+
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod kind_seek_tests {
+    use super::*;
+
+    fn kind_filter(ids: &[i32]) -> EventFilter<'_> {
+        EventFilter {
+            event_kind_ids: Some(ids),
+            ..EventFilter::default()
+        }
+    }
+
+    #[test]
+    fn kind_seek_needs_kind_ids_to_seek_with() {
+        // Without a kind filter there is nothing to seek per kind, and an empty id set is
+        // already answered by `AND FALSE` in the general query.
+        assert!(kind_filter(&[30, 92]).kind_seek_applies(EventOrderBy::Id));
+        assert!(!kind_filter(&[]).kind_seek_applies(EventOrderBy::Id));
+        assert!(!EventFilter::default().kind_seek_applies(EventOrderBy::Id));
+    }
+
+    #[test]
+    fn kind_seek_refuses_filters_it_cannot_apply_before_the_limit() {
+        // The seek path takes `limit + 1` rows per kind from `events` alone. A filter that
+        // needs one of the presentation joins would only be applied after that cut, so the
+        // page could come back short — those must fall back to the general query.
+        let ids = [30, 92];
+        for (name, filter) in [
+            (
+                "transaction_hash",
+                EventFilter {
+                    transaction_hash: Some("TX"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "block_height",
+                EventFilter {
+                    block_height: Some(1),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "block_hash",
+                EventFilter {
+                    block_hash: Some("B"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "contract",
+                EventFilter {
+                    contract: Some("SOUL"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "q",
+                EventFilter {
+                    q: Some("SOUL"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "nft_name",
+                EventFilter {
+                    nft_name_partial: Some("%a%"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "nft_description",
+                EventFilter {
+                    nft_description_partial: Some("%a%"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "address_partial",
+                EventFilter {
+                    address_partial: Some("%P%"),
+                    ..kind_filter(&ids)
+                },
+            ),
+            (
+                "kind_partial",
+                EventFilter {
+                    event_kind_partial_ids: Some(&ids),
+                    ..kind_filter(&ids)
+                },
+            ),
+        ] {
+            assert!(
+                !filter.kind_seek_applies(EventOrderBy::Id),
+                "{name} needs a join, so the seek path must not claim it"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_seek_refuses_ordering_that_lives_on_a_join() {
+        // Block height comes from `blocks`, so a per-kind index cannot deliver that order.
+        assert!(kind_filter(&[30]).kind_seek_applies(EventOrderBy::Id));
+        assert!(kind_filter(&[30]).kind_seek_applies(EventOrderBy::Date));
+        assert!(!kind_filter(&[30]).kind_seek_applies(EventOrderBy::BlockHeight));
+    }
+
+    #[test]
+    fn kind_seek_keeps_filters_that_live_on_events() {
+        // These are inside the per-kind branch, so they must NOT push the query onto the
+        // general path — that is where the timeouts live.
+        let ids = [30];
+        let filter = EventFilter {
+            event_id: Some(7),
+            token_id: Some("1"),
+            show_nsfw: true,
+            show_blacklisted: true,
+            date_less: Some(2),
+            date_greater: Some(1),
+            date_day: Some(3),
+            chain_id: Some(1),
+            ..kind_filter(&ids)
+        };
+        assert!(filter.kind_seek_applies(EventOrderBy::Date));
+    }
 }
