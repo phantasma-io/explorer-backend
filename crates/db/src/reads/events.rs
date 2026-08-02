@@ -603,7 +603,7 @@ impl EventFilter<'_> {
 /// bounded by `limit + 1` per kind whatever the direction and wherever the rows live.
 pub async fn list_events_by_kind_seek(
     executor: impl sqlx::PgExecutor<'_>,
-    chain_id: Option<i32>,
+    chain_ids: &[i32],
     filter: &EventFilter<'_>,
     page: &EventPage,
 ) -> Result<Vec<PgRow>, DbError> {
@@ -615,19 +615,44 @@ pub async fn list_events_by_kind_seek(
         // Excluded by `kind_seek_applies`; the sort key would come from a join.
         EventOrderBy::BlockHeight => "candidate.id",
     };
-    let branches = filter
-        .event_kind_ids
-        .unwrap_or_default()
+    // One branch per kind id, and per chain as well when the sort key is the timestamp:
+    // the only index carrying it is `(event_kind_id, chain_id, timestamp_unix_seconds, id)`,
+    // so leaving `chain_id` unbound puts a gap in the middle of the prefix and the branch
+    // cannot seek in timestamp order at all. Pinning the chain per branch completes the
+    // prefix. There are two chains, so this stays a handful of branches.
+    let scopes: Vec<(i32, Option<i32>)> = match page.order_by {
+        EventOrderBy::Date => filter
+            .event_kind_ids
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|kind_id| {
+                chain_ids
+                    .iter()
+                    .map(move |chain_id| (*kind_id, Some(*chain_id)))
+            })
+            .collect(),
+        _ => filter
+            .event_kind_ids
+            .unwrap_or_default()
+            .iter()
+            .map(|kind_id| (*kind_id, None))
+            .collect(),
+    };
+    let branches = scopes
         .iter()
-        .map(|kind_id| {
+        .map(|(kind_id, chain_id)| {
+            let chain_predicate = match chain_id {
+                Some(chain_id) => format!("              AND candidate.chain_id = {chain_id}\n"),
+                None => "              AND ($1::integer IS NULL OR candidate.chain_id = $1)\n"
+                    .to_owned(),
+            };
             format!(
                 r#"
         (
             SELECT candidate.id, {sort_column}::bigint AS sort_value
             FROM events candidate
             WHERE candidate.event_kind_id = {kind_id}
-              AND ($1::integer IS NULL OR candidate.chain_id = $1)
-              AND ($4::integer IS NULL OR candidate.id = $4)
+{chain_predicate}              AND ($4::integer IS NULL OR candidate.id = $4)
               AND ($5::bool OR NOT candidate.nsfw)
               AND ($6::bool OR NOT candidate.blacklisted)
               AND ($7::text IS NULL OR candidate.token_id = $7)
@@ -674,7 +699,7 @@ pub async fn list_events_by_kind_seek(
 
     let rows = sqlx::query(&sql)
         .persistent(false)
-        .bind(chain_id)
+        .bind(filter.chain_id)
         .bind(page.cursor_sort_value)
         .bind(page.cursor_id)
         .bind(filter.event_id)

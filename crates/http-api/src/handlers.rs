@@ -1643,7 +1643,13 @@ pub(crate) async fn load_events(
         // walking the global ordering. That walk is what dies when a kind's rows are
         // clustered away from where it starts, which on this chain is the normal case.
         if filter.kind_seek_applies(order_by) {
-            list_events_by_kind_seek(&state.pool, chain_filter_id, &filter, &page).await?
+            // Ordering by timestamp needs the chain pinned per branch, so hand the seek
+            // every chain when the request did not scope to one.
+            let seek_chain_ids = match chain_filter_id {
+                Some(chain_id) => vec![chain_id],
+                None => all_chain_ids(&state.pool).await?,
+            };
+            list_events_by_kind_seek(&state.pool, &seek_chain_ids, &filter, &page).await?
         } else {
             list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
         }

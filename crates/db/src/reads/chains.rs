@@ -66,6 +66,17 @@ pub async fn count_chains(
 /// Resolve a chain name to its id(s), capped at 2 so the API can detect an
 /// ambiguous match. Returns an empty vec when the chain is unknown; the API
 /// maps 0 -> 404, exactly 1 -> ok, more than 1 -> 500.
+/// Every chain id, for readers that must fan a query out per chain — the timestamp
+/// index is `(event_kind_id, chain_id, timestamp_unix_seconds, id)`, so a branch that
+/// leaves `chain_id` unbound has a gap in the middle of the prefix and cannot seek.
+pub async fn all_chain_ids(executor: impl sqlx::PgExecutor<'_>) -> Result<Vec<i32>, DbError> {
+    let ids = sqlx::query_scalar::<_, i32>("SELECT id FROM chains ORDER BY id")
+        .fetch_all(executor)
+        .await?;
+
+    Ok(ids)
+}
+
 pub async fn chain_ids_by_name(
     executor: impl sqlx::PgExecutor<'_>,
     chain: &str,
