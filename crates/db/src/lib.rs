@@ -952,6 +952,12 @@ pub async fn reconcile_stake_memberships(
     Ok(())
 }
 
+/// Refreshes the supply columns of the tokens the node answered for.
+///
+/// Only rows whose values actually differ are written. Supplies barely move, so without
+/// that guard the minute-cadence sync rewrote every token row on every pass — pure write
+/// amplification, and it also made the caller's "log only when something changed" check
+/// fire every single minute, because `rows_affected` counted rewrites, not changes.
 pub async fn update_token_supplies(
     conn: &mut PgConnection,
     chain_id: i32,
@@ -1026,6 +1032,23 @@ pub async fn update_token_supplies(
         )
         WHERE token.chain_id = $1
           AND token.symbol = desired.symbol
+          AND (
+                token.current_supply,
+                token.carbon_id,
+                token.current_supply_raw,
+                token.max_supply,
+                token.max_supply_raw,
+                token.burned_supply,
+                token.burned_supply_raw
+              ) IS DISTINCT FROM (
+                desired.current_supply,
+                COALESCE(desired.carbon_id, token.carbon_id),
+                desired.current_supply_raw,
+                desired.max_supply,
+                desired.max_supply_raw,
+                desired.burned_supply,
+                desired.burned_supply_raw
+              )
         "#,
     )
     .bind(chain_id)
@@ -2448,6 +2471,97 @@ mod tests {
         // The migration runner is normally launched from the workspace root in
         // local/dev containers, so the default path should stay simple.
         assert_eq!(default_migrations_dir(), PathBuf::from("migrations"));
+    }
+
+    #[tokio::test]
+    async fn token_supply_sync_writes_only_what_changed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The supply sync runs every minute against a token set that barely moves. It
+        // must touch a row only when a value really differs: otherwise every pass
+        // rewrites the whole token table, and `rows_affected` stops meaning "changed",
+        // which is exactly what the caller logs on.
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        let chain_id = resolve_chain_id(&mut transaction, &ChainName::new("main")?).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let symbol = format!("RSTSUP{}", &suffix[..8]);
+        let contract_id = upsert_contract_id(&mut transaction, chain_id, &symbol).await?;
+        let owner_id =
+            upsert_address_id(&mut transaction, chain_id, &format!("PTESTOWNER{suffix}")).await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (
+                symbol, fungible, transferable, finite, divisible, fuel, stakable, fiat,
+                swappable, burnable, decimals, current_supply, max_supply, burned_supply,
+                address_id, owner_id, price_usd, price_eur, price_gbp, price_jpy,
+                price_cad, price_aud, price_cny, price_rub, chain_id, contract_id,
+                burned_supply_raw, current_supply_raw, max_supply_raw, mintable, name
+            )
+            VALUES (
+                $1, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, 8,
+                '0', '0', '0', $2, $2, 0, 0, 0, 0, 0, 0, 0, 0, $3, $4,
+                '0', '0', '0', TRUE, $1
+            )
+            "#,
+        )
+        .bind(&symbol)
+        .bind(owner_id)
+        .bind(chain_id)
+        .bind(contract_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let supply = TokenSupplyUpsert {
+            symbol: symbol.clone(),
+            carbon_id: Some(4242),
+            current_supply: "10".to_owned(),
+            current_supply_raw: "1000000000".to_owned(),
+            max_supply: "20".to_owned(),
+            max_supply_raw: "2000000000".to_owned(),
+            burned_supply: "1".to_owned(),
+            burned_supply_raw: "100000000".to_owned(),
+        };
+
+        let first =
+            update_token_supplies(&mut transaction, chain_id, std::slice::from_ref(&supply))
+                .await?;
+        assert_eq!(first, 1, "the first sync must write the new supply");
+
+        let second =
+            update_token_supplies(&mut transaction, chain_id, std::slice::from_ref(&supply))
+                .await?;
+        assert_eq!(
+            second, 0,
+            "an unchanged answer must not rewrite the row a second time"
+        );
+
+        let moved = TokenSupplyUpsert {
+            current_supply: "11".to_owned(),
+            current_supply_raw: "1100000000".to_owned(),
+            ..supply
+        };
+        let third = update_token_supplies(&mut transaction, chain_id, &[moved]).await?;
+        assert_eq!(third, 1, "a real supply change must still be written");
+
+        let stored = sqlx::query_scalar::<_, String>(
+            "SELECT current_supply_raw FROM tokens WHERE chain_id = $1 AND symbol = $2",
+        )
+        .bind(chain_id)
+        .bind(&symbol)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(stored, "1100000000");
+
+        transaction.rollback().await?;
+        Ok(())
     }
 
     // CI guard: the db-integration tests self-skip when EXPLORER_TEST_DATABASE_URL
