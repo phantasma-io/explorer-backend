@@ -404,7 +404,6 @@ rows AS (
         OFFSET 0
     ) event ON TRUE
     JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
-                                   AND event_kind.chain_id = event.chain_id
     LEFT JOIN addresses address ON address.id = event.address_id
     LEFT JOIN addresses target_address ON target_address.id = event.target_address_id
     LEFT JOIN contracts contract ON contract.id = event.contract_id
@@ -575,7 +574,6 @@ rows AS (
         OFFSET 0
     ) event ON TRUE
     JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
-                                   AND event_kind.chain_id = event.chain_id
     LEFT JOIN addresses address ON address.id = event.address_id
     LEFT JOIN addresses target_address ON target_address.id = event.target_address_id
     LEFT JOIN contracts contract ON contract.id = event.contract_id

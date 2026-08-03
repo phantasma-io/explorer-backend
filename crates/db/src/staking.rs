@@ -625,7 +625,6 @@ async fn load_stake_snapshot_events(
         FROM events event
         JOIN event_kinds event_kind
           ON event_kind.id = event.event_kind_id
-         AND event_kind.chain_id = event.chain_id
         JOIN transactions tx
           ON tx.id = event.transaction_id
         JOIN blocks block

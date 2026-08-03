@@ -58,16 +58,18 @@ pub struct EventPage {
 pub struct EventFilter<'a> {
     pub transaction_hash: Option<&'a str>,
     pub block_height: Option<i64>,
-    /// Kind ids the event must have, already resolved from the requested name (see
-    /// [`super::event_kind_ids_by_name`]). An empty slice matches nothing, which is the
-    /// honest answer for a name no chain defines.
-    pub event_kind_ids: Option<&'a [i32]>,
+    /// The kind id the event must have, resolved from the requested name (see
+    /// [`super::event_kind_id_by_name`]). `None` means no kind filter; a name that
+    /// matches no kind never reaches here — the handler answers it without a query.
+    pub event_kind_id: Option<i32>,
     pub event_source: Option<&'a str>,
     pub contract: Option<&'a str>,
     pub q: Option<&'a str>,
     pub event_id: Option<i32>,
-    /// Show NSFW / blacklisted events. Default false → excluded (C# parity: the
-    /// `with_nsfw`/`with_blacklisted` toggles default to 0 = hide).
+    /// Kept for the public `with_nsfw` / `with_blacklisted` query params. The flags now
+    /// live only on `nfts`, where they belong: `events` carried a copy that no row ever
+    /// set in 76M events, and every event of a flagged NFT is reachable through its
+    /// `nft_id`.
     pub show_nsfw: bool,
     pub show_blacklisted: bool,
     pub token_id: Option<&'a str>,
@@ -95,7 +97,7 @@ fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>) {
 }
 
 /// Columns every event-list answer projects, after `event.id` and the cursor value.
-/// Shared so the general list and the kind-seek path below cannot drift apart.
+/// Shared by both list variants so they cannot drift apart.
 const EVENT_LIST_PROJECTION: &str = r#"            event.event_index,
             'legacy'::text AS event_source,
             COALESCE(chain.name, $2::text) AS chain_name,
@@ -134,8 +136,7 @@ const EVENT_LIST_PROJECTION: &str = r#"            event.event_index,
             ) END AS series_json
 "#;
 
-/// The presentation joins behind that projection. `events` is the driving table in the
-/// general list; the kind-seek path joins it back by id after the rows are chosen.
+/// The presentation joins behind that projection.
 const EVENT_LIST_JOINS: &str = r#"        FROM events event
         JOIN transactions tx ON tx.id = event.transaction_id
         JOIN blocks block ON block.id = tx.block_id
@@ -149,13 +150,28 @@ const EVENT_LIST_JOINS: &str = r#"        FROM events event
         LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
 "#;
 
-/// Renders the event-kind predicate with the ids INLINED as literals.
+/// Renders the exact event-kind predicate.
+///
+/// When a kind is requested the planner sees a bare `event.event_kind_id = $n`, which it
+/// can drive `IX_Events_EventKindId_Timestamp_Id` with even in a GENERIC plan; the
+/// `($n IS NULL OR …)` guard form cannot, because a plan built without the value has to
+/// assume the filter might not apply. When no kind is requested the parameter is still
+/// referenced — as a predicate that is simply true — so the placeholder numbering and the
+/// bind count stay the same in both shapes.
+fn event_kind_id_predicate(column: &str, placeholder: &str, kind_id: Option<i32>) -> String {
+    match kind_id {
+        Some(_) => format!("          AND {column} = {placeholder}\n"),
+        None => format!("          AND ({placeholder}::integer IS NULL)\n"),
+    }
+}
+
+/// Renders the SUBSTRING event-kind predicate with the ids inlined as literals.
 ///
 /// The ids come from our own `event_kinds` table (i32, resolved by
-/// [`super::event_kind_ids_by_name`]), so there is nothing to escape. They are literals
+/// [`super::event_kind_ids_by_name_like`]), so there is nothing to escape. They are literals
 /// rather than a bound parameter on purpose, and this is the whole point of the fragment:
 /// a bound `event_kind_id = ANY($n)` is invisible to the planner when PostgreSQL builds a
-/// GENERIC plan for a cached statement, so it stops seeking `IX_Events_EventKindId_ID`
+/// GENERIC plan for a cached statement, so it stops seeking the kind index
 /// and walks the ordering backwards instead — which never finishes for a kind with fewer
 /// rows than one page. Measured on the live database under `force_generic_plan`: the
 /// bound array times out, an OR of bound scalars times out, and the inlined form answers
@@ -200,13 +216,15 @@ pub async fn list_events_global(
           AND ($6::text IS NULL OR contract.hash = $6 OR contract.name = $6 OR contract.symbol = $6)
           AND ($10::integer IS NULL OR event.id = $10)
           AND ($11::text IS NULL OR tx.hash ILIKE $11 OR block.hash ILIKE $11 OR block.height = $12 OR event_kind.name ILIKE $11 OR address.address ILIKE $11 OR address.address_name ILIKE $11 OR contract.hash ILIKE $11 OR contract.name ILIKE $11 OR contract.symbol ILIKE $11 OR event.token_id ILIKE $11)
-          AND ($13::bool OR NOT event.nsfw)
-          AND ($14::bool OR NOT event.blacklisted)
           AND ($15::text IS NULL OR event.token_id = $15)
           AND ($16::text IS NULL OR block.hash = $16)
           AND ($17::bigint IS NULL OR event.timestamp_unix_seconds <= $17)
           AND ($18::bigint IS NULL OR event.timestamp_unix_seconds >= $18)
-          AND ($19::bigint IS NULL OR event.date_unix_seconds = $19)
+          AND (
+              $19::bigint IS NULL
+              OR (event.timestamp_unix_seconds >= $19
+                  AND event.timestamp_unix_seconds < $19 + 86400)
+          )
           AND ($20::text IS NULL OR nft.name ILIKE $20)
           AND ($21::text IS NULL OR nft.description ILIKE $21)
           AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22 OR address.user_name ILIKE $22)
@@ -221,7 +239,8 @@ pub async fn list_events_global(
         column = page.order_by.column(),
         projection = EVENT_LIST_PROJECTION,
         joins = EVENT_LIST_JOINS,
-        kind_predicate = event_kind_predicate("event.event_kind_id", filter.event_kind_ids),
+        kind_predicate =
+            event_kind_id_predicate("event.event_kind_id", "$23", filter.event_kind_id),
         kind_partial_predicate =
             event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
     );
@@ -248,8 +267,8 @@ pub async fn list_events_global(
         .bind(filter.event_id)
         .bind(q_like.as_deref())
         .bind(q_height)
-        .bind(filter.show_nsfw)
-        .bind(filter.show_blacklisted)
+        .bind(false)
+        .bind(false)
         .bind(filter.token_id)
         .bind(filter.block_hash)
         .bind(filter.date_less)
@@ -258,6 +277,7 @@ pub async fn list_events_global(
         .bind(filter.nft_name_partial)
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
+        .bind(filter.event_kind_id)
         .fetch_all(executor)
         .await?;
 
@@ -341,13 +361,15 @@ pub async fn list_events_by_address(
           AND ($6::text IS NULL OR contract.hash = $6 OR contract.name = $6 OR contract.symbol = $6)
           AND ($10::integer IS NULL OR event.id = $10)
           AND ($11::text IS NULL OR tx.hash ILIKE $11 OR block.hash ILIKE $11 OR block.height = $12 OR event_kind.name ILIKE $11 OR address.address ILIKE $11 OR target_address.address ILIKE $11 OR address.address_name ILIKE $11 OR contract.hash ILIKE $11 OR contract.name ILIKE $11 OR contract.symbol ILIKE $11 OR event.token_id ILIKE $11)
-          AND ($13::bool OR NOT event.nsfw)
-          AND ($14::bool OR NOT event.blacklisted)
           AND ($15::text IS NULL OR event.token_id = $15)
           AND ($16::text IS NULL OR block.hash = $16)
           AND ($17::bigint IS NULL OR event.timestamp_unix_seconds <= $17)
           AND ($18::bigint IS NULL OR event.timestamp_unix_seconds >= $18)
-          AND ($19::bigint IS NULL OR event.date_unix_seconds = $19)
+          AND (
+              $19::bigint IS NULL
+              OR (event.timestamp_unix_seconds >= $19
+                  AND event.timestamp_unix_seconds < $19 + 86400)
+          )
           AND ($20::text IS NULL OR nft.name ILIKE $20)
           AND ($21::text IS NULL OR nft.description ILIKE $21)
           AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22 OR address.user_name ILIKE $22)
@@ -360,7 +382,8 @@ pub async fn list_events_by_address(
         LIMIT $9
         "#,
         column = page.order_by.column(),
-        kind_predicate = event_kind_predicate("event.event_kind_id", filter.event_kind_ids),
+        kind_predicate =
+            event_kind_id_predicate("event.event_kind_id", "$24", filter.event_kind_id),
         kind_partial_predicate =
             event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
     );
@@ -387,8 +410,8 @@ pub async fn list_events_by_address(
         .bind(filter.event_id)
         .bind(q_like.as_deref())
         .bind(q_height)
-        .bind(filter.show_nsfw)
-        .bind(filter.show_blacklisted)
+        .bind(false)
+        .bind(false)
         .bind(filter.token_id)
         .bind(filter.block_hash)
         .bind(filter.date_less)
@@ -556,288 +579,4 @@ pub async fn list_event_tokens_by_symbols(
     .await?;
 
     Ok(rows)
-}
-
-/// Whether the kind-seek path below can answer this filter.
-///
-/// It pre-selects rows from `events` alone, so every active filter must live on that
-/// table; a filter that needs one of the presentation joins (a transaction hash, a
-/// contract, `q`, an NFT name) would be applied only AFTER each branch took its page,
-/// and the answer could come back short. Ordering by block height is excluded for the
-/// same reason: the sort key itself comes from a join.
-impl EventFilter<'_> {
-    pub fn kind_seek_applies(&self, order_by: EventOrderBy) -> bool {
-        let kind_ids_are_selective = matches!(self.event_kind_ids, Some(ids) if !ids.is_empty());
-        let joined_filters_absent = self.transaction_hash.is_none()
-            && self.block_height.is_none()
-            && self.block_hash.is_none()
-            && self.contract.is_none()
-            && self.q.is_none()
-            && self.nft_name_partial.is_none()
-            && self.nft_description_partial.is_none()
-            && self.address_partial.is_none()
-            && self.event_kind_partial_ids.is_none();
-
-        kind_ids_are_selective
-            && joined_filters_absent
-            && !matches!(order_by, EventOrderBy::BlockHeight)
-    }
-}
-
-/// Event list for one or more kind ids, seeking each kind separately.
-///
-/// The general list walks the `event.id` (or timestamp) ordering and keeps rows whose
-/// kind matches. That works only while matches are near where the walk starts, and on
-/// this chain they are not: `event_kind_id` is strongly clustered because gen1, gen2 and
-/// gen3 wrote different kinds in different id ranges. Measured on the live database,
-/// `CrownRewards` — 6.7M rows, none of them in the newest 13M ids — takes 7 s descending
-/// while its ascending page answers in 17 ms, and a kind with a hundred rows can die in
-/// the ascending direction for the mirror-image reason. The planner is not wrong about
-/// how many rows match, it is wrong about where they are, so no amount of statistics or
-/// inlining fixes it.
-///
-/// This takes one page per kind id through `IX_Events_EventKindId_ID` /
-/// `IX_Events_EventKind_Chain_Timestamp_Id`, which are ordered by exactly what each
-/// branch asks for, then merges and re-limits. A row in the true page must be in its own
-/// kind's page, so the merged result is identical to the general query's; the work is
-/// bounded by `limit + 1` per kind whatever the direction and wherever the rows live.
-pub async fn list_events_by_kind_seek(
-    executor: impl sqlx::PgExecutor<'_>,
-    chain_ids: &[i32],
-    filter: &EventFilter<'_>,
-    page: &EventPage,
-) -> Result<Vec<PgRow>, DbError> {
-    let dir = page.direction.as_sql();
-    let op = page.direction.cursor_operator();
-    let sort_column = match page.order_by {
-        EventOrderBy::Id => "candidate.id",
-        EventOrderBy::Date => "candidate.timestamp_unix_seconds",
-        // Excluded by `kind_seek_applies`; the sort key would come from a join.
-        EventOrderBy::BlockHeight => "candidate.id",
-    };
-    // One branch per kind id, and per chain as well when the sort key is the timestamp:
-    // the only index carrying it is `(event_kind_id, chain_id, timestamp_unix_seconds, id)`,
-    // so leaving `chain_id` unbound puts a gap in the middle of the prefix and the branch
-    // cannot seek in timestamp order at all. Pinning the chain per branch completes the
-    // prefix. There are two chains, so this stays a handful of branches.
-    let scopes: Vec<(i32, Option<i32>)> = match page.order_by {
-        EventOrderBy::Date => filter
-            .event_kind_ids
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|kind_id| {
-                chain_ids
-                    .iter()
-                    .map(move |chain_id| (*kind_id, Some(*chain_id)))
-            })
-            .collect(),
-        _ => filter
-            .event_kind_ids
-            .unwrap_or_default()
-            .iter()
-            .map(|kind_id| (*kind_id, None))
-            .collect(),
-    };
-    let branches = scopes
-        .iter()
-        .map(|(kind_id, chain_id)| {
-            let chain_predicate = match chain_id {
-                Some(chain_id) => format!("              AND candidate.chain_id = {chain_id}\n"),
-                None => "              AND ($1::integer IS NULL OR candidate.chain_id = $1)\n"
-                    .to_owned(),
-            };
-            format!(
-                r#"
-        (
-            SELECT candidate.id, {sort_column}::bigint AS sort_value
-            FROM events candidate
-            WHERE candidate.event_kind_id = {kind_id}
-{chain_predicate}              AND ($4::integer IS NULL OR candidate.id = $4)
-              AND ($5::bool OR NOT candidate.nsfw)
-              AND ($6::bool OR NOT candidate.blacklisted)
-              AND ($7::text IS NULL OR candidate.token_id = $7)
-              AND ($8::bigint IS NULL OR candidate.timestamp_unix_seconds <= $8)
-              AND ($9::bigint IS NULL OR candidate.timestamp_unix_seconds >= $9)
-              AND ($10::bigint IS NULL OR candidate.date_unix_seconds = $10)
-              AND (
-                  $2::bigint IS NULL
-                  OR {sort_column} {op} $2
-                  OR ({sort_column} = $2 AND candidate.id {op} $3)
-              )
-            ORDER BY {sort_column} {dir}, candidate.id {dir}
-            LIMIT $11
-        )"#
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n        UNION ALL");
-
-    let sql = format!(
-        r#"
-        WITH picked AS ({branches})
-        SELECT
-            event.id,
-            picked.sort_value AS cursor_sort_value,
-{projection}
-        FROM picked
-        JOIN events event ON event.id = picked.id
-        JOIN transactions tx ON tx.id = event.transaction_id
-        JOIN blocks block ON block.id = tx.block_id
-        JOIN chains chain ON chain.id = event.chain_id
-        JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
-        LEFT JOIN addresses address ON address.id = event.address_id
-        LEFT JOIN contracts contract ON contract.id = event.contract_id
-        LEFT JOIN nfts nft ON nft.id = event.nft_id
-        LEFT JOIN series series ON series.id = nft.series_id
-        LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
-        LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
-        ORDER BY picked.sort_value {dir}, event.id {dir}
-        LIMIT $11
-        "#,
-        projection = EVENT_LIST_PROJECTION,
-    );
-
-    let rows = sqlx::query(&sql)
-        .persistent(false)
-        .bind(filter.chain_id)
-        .bind(page.cursor_sort_value)
-        .bind(page.cursor_id)
-        .bind(filter.event_id)
-        .bind(filter.show_nsfw)
-        .bind(filter.show_blacklisted)
-        .bind(filter.token_id)
-        .bind(filter.date_less)
-        .bind(filter.date_greater)
-        .bind(filter.date_day)
-        .bind(page.limit + 1)
-        .fetch_all(executor)
-        .await?;
-
-    Ok(rows)
-}
-
-#[cfg(test)]
-mod kind_seek_tests {
-    use super::*;
-
-    fn kind_filter(ids: &[i32]) -> EventFilter<'_> {
-        EventFilter {
-            event_kind_ids: Some(ids),
-            ..EventFilter::default()
-        }
-    }
-
-    #[test]
-    fn kind_seek_needs_kind_ids_to_seek_with() {
-        // Without a kind filter there is nothing to seek per kind, and an empty id set is
-        // already answered by `AND FALSE` in the general query.
-        assert!(kind_filter(&[30, 92]).kind_seek_applies(EventOrderBy::Id));
-        assert!(!kind_filter(&[]).kind_seek_applies(EventOrderBy::Id));
-        assert!(!EventFilter::default().kind_seek_applies(EventOrderBy::Id));
-    }
-
-    #[test]
-    fn kind_seek_refuses_filters_it_cannot_apply_before_the_limit() {
-        // The seek path takes `limit + 1` rows per kind from `events` alone. A filter that
-        // needs one of the presentation joins would only be applied after that cut, so the
-        // page could come back short — those must fall back to the general query.
-        let ids = [30, 92];
-        for (name, filter) in [
-            (
-                "transaction_hash",
-                EventFilter {
-                    transaction_hash: Some("TX"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "block_height",
-                EventFilter {
-                    block_height: Some(1),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "block_hash",
-                EventFilter {
-                    block_hash: Some("B"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "contract",
-                EventFilter {
-                    contract: Some("SOUL"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "q",
-                EventFilter {
-                    q: Some("SOUL"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "nft_name",
-                EventFilter {
-                    nft_name_partial: Some("%a%"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "nft_description",
-                EventFilter {
-                    nft_description_partial: Some("%a%"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "address_partial",
-                EventFilter {
-                    address_partial: Some("%P%"),
-                    ..kind_filter(&ids)
-                },
-            ),
-            (
-                "kind_partial",
-                EventFilter {
-                    event_kind_partial_ids: Some(&ids),
-                    ..kind_filter(&ids)
-                },
-            ),
-        ] {
-            assert!(
-                !filter.kind_seek_applies(EventOrderBy::Id),
-                "{name} needs a join, so the seek path must not claim it"
-            );
-        }
-    }
-
-    #[test]
-    fn kind_seek_refuses_ordering_that_lives_on_a_join() {
-        // Block height comes from `blocks`, so a per-kind index cannot deliver that order.
-        assert!(kind_filter(&[30]).kind_seek_applies(EventOrderBy::Id));
-        assert!(kind_filter(&[30]).kind_seek_applies(EventOrderBy::Date));
-        assert!(!kind_filter(&[30]).kind_seek_applies(EventOrderBy::BlockHeight));
-    }
-
-    #[test]
-    fn kind_seek_keeps_filters_that_live_on_events() {
-        // These are inside the per-kind branch, so they must NOT push the query onto the
-        // general path — that is where the timeouts live.
-        let ids = [30];
-        let filter = EventFilter {
-            event_id: Some(7),
-            token_id: Some("1"),
-            show_nsfw: true,
-            show_blacklisted: true,
-            date_less: Some(2),
-            date_greater: Some(1),
-            date_day: Some(3),
-            chain_id: Some(1),
-            ..kind_filter(&ids)
-        };
-        assert!(filter.kind_seek_applies(EventOrderBy::Date));
-    }
 }

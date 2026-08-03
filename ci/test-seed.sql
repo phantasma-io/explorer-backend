@@ -33,114 +33,77 @@ COPY public.chains (id, name, current_height) FROM stdin;
 -- Data for Name: event_kinds; Type: TABLE DATA; Schema: public; Owner: -
 --
 
-COPY public.event_kinds (id, name, chain_id) FROM stdin;
-1	ValueCreate	1
-4	OrganizationAdd	1
-5	ValidatorElect	1
-22	OrderCancelled	1
-10	CrownRewards	1
-21	OrderCreated	1
-14	ExecutionFailure	1
-15	OrganizationRemove	1
-16	AddressUnregister	1
-17	AddressRegister	1
-20	AddressMigration	1
-23	OrderBid	1
-25	PollCreated	1
-26	PollVote	1
-27	PollClosed	1
-28	ValueUpdate	1
-29	MasterClaim	1
-30	Inflation	1
-32	FileCreate	1
-33	FileDelete	1
-34	ValidatorRemove	1
-35	Log	1
-37	Unknown	1
-38	ChainCreate	1
-39	AddressLink	1
-40	AddressUnlink	1
-41	OrganizationCreate	1
-42	OrderClosed	1
-43	FeedCreate	1
-44	FeedUpdate	1
-45	ValidatorPropose	1
-46	ValidatorSwitch	1
-47	PackedNFT	1
-48	ChannelCreate	1
-49	ChannelRefill	1
-50	ChannelSettle	1
-51	LeaderboardCreate	1
-52	LeaderboardInsert	1
-53	LeaderboardReset	1
-54	PlatformCreate	1
-55	ChainSwap	1
-56	ContractRegister	1
-57	OwnerAdded	1
-58	OwnerRemoved	1
-59	DomainCreate	1
-60	DomainDelete	1
-61	TaskStart	1
-62	TaskStop	1
-63	Crowdsale	1
-64	ContractKill	1
-65	OrganizationKill	1
-70	GasPayment	7
-71	ValueCreate	7
-72	OwnerRemoved	7
-73	ValueUpdate	7
-74	OrganizationCreate	7
-76	OrganizationRemove	7
-77	ChainSwap	7
-78	CrownRewards	7
-79	FileDelete	7
-80	OrderCancelled	7
-81	Log	7
-82	OrderCreated	7
-83	ContractUpgrade	7
-84	Crowdsale	7
-85	OrderBid	7
-86	TokenBurn	7
-87	PlatformCreate	7
-88	AddressMigration	7
-89	ContractDeploy	7
-90	Infusion	7
-91	OwnerAdded	7
-92	Inflation	7
-93	ValidatorElect	7
-94	TokenMint	7
-95	AddressUnregister	7
-96	TokenStake	7
-97	ValidatorRemove	7
-98	TokenCreate	7
-99	TokenSend	7
-100	FileCreate	7
-101	OrderFilled	7
-102	TokenClaim	7
-103	GasEscrow	7
-104	TokenReceive	7
-105	OrganizationAdd	7
-106	AddressRegister	7
-75	ContractKill	7
-67	GovernanceSetGasConfig	1
-3	TokenStake	1
-66	Custom_V2	1
-24	Custom	1
-9723061	TokenSeriesCreate	1
-68	GovernanceSetChainConfig	1
-13	ContractUpgrade	1
-36	ContractDeploy	1
-19	OrderFilled	1
-31	TokenCreate	1
-18	Infusion	1
-8	TokenClaim	1
-7	GasPayment	1
-6	GasEscrow	1
-9	TokenBurn	1
-2	TokenMint	1
-69	SpecialResolution	1
-11	TokenSend	1
-12	TokenReceive	1
+COPY public.event_kinds (id, name) FROM stdin;
+1	ValueCreate
+4	OrganizationAdd
+5	ValidatorElect
+22	OrderCancelled
+10	CrownRewards
+21	OrderCreated
+14	ExecutionFailure
+15	OrganizationRemove
+16	AddressUnregister
+17	AddressRegister
+20	AddressMigration
+23	OrderBid
+25	PollCreated
+26	PollVote
+27	PollClosed
+28	ValueUpdate
+29	MasterClaim
+30	Inflation
+32	FileCreate
+33	FileDelete
+34	ValidatorRemove
+35	Log
+37	Unknown
+38	ChainCreate
+39	AddressLink
+40	AddressUnlink
+41	OrganizationCreate
+42	OrderClosed
+43	FeedCreate
+44	FeedUpdate
+45	ValidatorPropose
+46	ValidatorSwitch
+47	PackedNFT
+48	ChannelCreate
+49	ChannelRefill
+50	ChannelSettle
+51	LeaderboardCreate
+52	LeaderboardInsert
+53	LeaderboardReset
+54	PlatformCreate
+55	ChainSwap
+56	ContractRegister
+57	OwnerAdded
+58	OwnerRemoved
+59	DomainCreate
+60	DomainDelete
+61	TaskStart
+62	TaskStop
+63	Crowdsale
+64	ContractKill
+65	OrganizationKill
+70	GasPayment
+83	ContractUpgrade
+86	TokenBurn
+89	ContractDeploy
+90	Infusion
+94	TokenMint
+96	TokenStake
+98	TokenCreate
+99	TokenSend
+101	OrderFilled
+102	TokenClaim
+103	GasEscrow
+104	TokenReceive
+67	GovernanceSetGasConfig
+66	Custom_V2
+24	Custom
+9723061	TokenSeriesCreate
+68	GovernanceSetChainConfig
+69	SpecialResolution
 \.
 
 

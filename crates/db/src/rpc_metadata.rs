@@ -21,7 +21,6 @@ pub async fn fetch_contract_rpc_metadata_candidates(
                 FROM events event
                 JOIN event_kinds event_kind
                   ON event_kind.id = event.event_kind_id
-                 AND event_kind.chain_id = event.chain_id
                 JOIN transactions tx ON tx.id = event.transaction_id
                 JOIN blocks block ON block.id = tx.block_id
                 WHERE event.chain_id = contract.chain_id
@@ -154,7 +153,6 @@ pub async fn fetch_contract_upgrade_method_candidates(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN transactions tx ON tx.id = event.transaction_id
             JOIN blocks block ON block.id = tx.block_id
             JOIN contracts contract
@@ -313,7 +311,6 @@ async fn fetch_nft_rpc_metadata_candidates_impl(
               FROM events event
               JOIN event_kinds event_kind
                 ON event_kind.id = event.event_kind_id
-               AND event_kind.chain_id = event.chain_id
               JOIN transactions tx
                 ON tx.id = event.transaction_id
               JOIN blocks block
@@ -375,7 +372,6 @@ pub async fn fetch_nft_rpc_metadata_candidates_for_mint_block(
          AND event.chain_id = nft.chain_id
         JOIN event_kinds event_kind
           ON event_kind.id = event.event_kind_id
-         AND event_kind.chain_id = event.chain_id
         JOIN transactions tx
           ON tx.id = event.transaction_id
         JOIN blocks block
@@ -1140,10 +1136,7 @@ mod tests {
                     "token_id": token_id
                 })),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
-                date_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             None,
         )

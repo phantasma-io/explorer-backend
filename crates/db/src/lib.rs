@@ -244,10 +244,7 @@ pub struct EventUpsert {
     pub payload_format: Option<String>,
     pub payload_json: Option<Value>,
     pub timestamp_unix_seconds: i64,
-    pub date_unix_seconds: i64,
     pub burned: Option<bool>,
-    pub nsfw: bool,
-    pub blacklisted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1577,22 +1574,21 @@ pub async fn upsert_contract_id(
     Ok(id)
 }
 
-pub async fn upsert_event_kind_id(
-    conn: &mut PgConnection,
-    chain_id: i32,
-    name: &str,
-) -> Result<i32, DbError> {
+/// Resolves an event-kind name to its id, creating the row on first sight.
+///
+/// The dimension is global: an event kind is a protocol concept, so the same name is the
+/// same row on every chain.
+pub async fn upsert_event_kind_id(conn: &mut PgConnection, name: &str) -> Result<i32, DbError> {
     let id = sqlx::query_scalar::<_, i32>(
         r#"
-        INSERT INTO event_kinds (name, chain_id)
-        VALUES ($1, $2)
-        ON CONFLICT (chain_id, name) DO UPDATE SET
+        INSERT INTO event_kinds (name)
+        VALUES ($1)
+        ON CONFLICT (name) DO UPDATE SET
             name = event_kinds.name
         RETURNING id
         "#,
     )
     .bind(name)
-    .bind(chain_id)
     .fetch_one(&mut *conn)
     .await?;
 
@@ -1749,7 +1745,7 @@ pub async fn upsert_block(
 pub struct ProjectionDimensionCache {
     addresses: HashMap<(i32, String), i32>,
     transaction_states: HashMap<String, i32>,
-    event_kinds: HashMap<(i32, String), i32>,
+    event_kinds: HashMap<String, i32>,
     contracts: HashMap<(i32, String), i32>,
 }
 
@@ -1833,17 +1829,12 @@ impl ProjectionDimensionCache {
         Ok(id)
     }
 
-    async fn event_kind_id(
-        &mut self,
-        conn: &mut PgConnection,
-        chain_id: i32,
-        name: &str,
-    ) -> Result<i32, DbError> {
-        if let Some(&id) = self.event_kinds.get(&(chain_id, name.to_owned())) {
+    async fn event_kind_id(&mut self, conn: &mut PgConnection, name: &str) -> Result<i32, DbError> {
+        if let Some(&id) = self.event_kinds.get(name) {
             return Ok(id);
         }
-        let id = upsert_event_kind_id(conn, chain_id, name).await?;
-        self.event_kinds.insert((chain_id, name.to_owned()), id);
+        let id = upsert_event_kind_id(conn, name).await?;
+        self.event_kinds.insert(name.to_owned(), id);
         Ok(id)
     }
 
@@ -2559,61 +2550,6 @@ mod tests {
         .fetch_one(&mut *transaction)
         .await?;
         assert_eq!(stored, "1100000000");
-
-        transaction.rollback().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn event_kind_name_resolves_to_every_chain_that_defines_it()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // The kind dimension is unique per (chain_id, name), so one name exists once per
-        // chain — `Inflation` is a different id on `main` than on `main-generation-1`.
-        // Event filters run on these ids, so the resolver has to return all of them or a
-        // filter would silently hide one chain's events. An unknown name must resolve to
-        // an empty set, which makes the filter match nothing instead of everything.
-        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
-            return Ok(());
-        };
-
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await?;
-        let mut transaction = pool.begin().await?;
-        let main_id = resolve_chain_id(&mut transaction, &ChainName::new("main")?).await?;
-        let gen1_id =
-            resolve_chain_id(&mut transaction, &ChainName::new("main-generation-1")?).await?;
-        assert_ne!(main_id, gen1_id);
-
-        let suffix = Uuid::now_v7().simple().to_string();
-        let name = format!("RstKind{}", &suffix[..8]);
-        let on_main = upsert_event_kind_id(&mut transaction, main_id, &name).await?;
-        let on_gen1 = upsert_event_kind_id(&mut transaction, gen1_id, &name).await?;
-        assert_ne!(
-            on_main, on_gen1,
-            "the same name on two chains must be two rows"
-        );
-
-        let mut resolved = event_kind_ids_by_name(&mut *transaction, &name).await?;
-        resolved.sort_unstable();
-        let mut expected = vec![on_main, on_gen1];
-        expected.sort_unstable();
-        assert_eq!(resolved, expected);
-
-        let partial =
-            event_kind_ids_by_name_like(&mut *transaction, &format!("%{}%", &suffix[..8])).await?;
-        assert_eq!(
-            partial.len(),
-            2,
-            "the substring filter sees both chains too"
-        );
-
-        let unknown = event_kind_ids_by_name(&mut *transaction, "RstKindThatDoesNotExist").await?;
-        assert!(
-            unknown.is_empty(),
-            "an unknown kind must resolve to nothing, not to every kind"
-        );
 
         transaction.rollback().await?;
         Ok(())

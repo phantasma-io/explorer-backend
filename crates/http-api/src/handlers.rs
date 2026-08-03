@@ -1577,14 +1577,22 @@ pub(crate) async fn load_events(
         ))
     })?;
     let direction = parse_sort_direction(query.order_direction.as_deref())?;
-    // The kind dimension is resolved to ids here so the list query can seek on
-    // IX_Events_EventKindId_ID. Comparing the joined name instead made the planner walk
-    // the primary key backwards, which never finishes for a kind that has fewer events
-    // than one page.
-    let event_kind_ids = match event_kind.as_deref() {
-        Some(name) => Some(event_kind_ids_by_name(&state.pool, name).await?),
+    // The kind name is resolved to its id here so the list query filters on the indexed
+    // column. Comparing the joined name instead made the planner walk the primary key,
+    // which never finishes for a kind that has fewer events than one page. A name no
+    // chain defines resolves to nothing, and then there is no page to look for.
+    let requested_kind = event_kind.as_deref();
+    let event_kind_id = match requested_kind {
+        Some(name) => event_kind_id_by_name(&state.pool, name).await?,
         None => None,
     };
+    if requested_kind.is_some() && event_kind_id.is_none() {
+        return Ok(EventListResponse {
+            total_results: None,
+            events: Vec::new(),
+            next_cursor: None,
+        });
+    }
     let event_kind_partial_ids = match event_kind_partial.as_deref() {
         Some(pattern) => Some(event_kind_ids_by_name_like(&state.pool, pattern).await?),
         None => None,
@@ -1592,7 +1600,7 @@ pub(crate) async fn load_events(
     let filter = EventFilter {
         transaction_hash: transaction_hash.as_deref(),
         block_height: query.block_height,
-        event_kind_ids: event_kind_ids.as_deref(),
+        event_kind_id,
         event_source: event_source.as_deref(),
         contract: contract.as_deref(),
         q: q.as_deref(),
@@ -1639,20 +1647,7 @@ pub(crate) async fn load_events(
         // gen1 / non-main events for transaction_hash/block_hash lookups, leaving
         // legacy transaction pages with an empty narrative and no events.
         let chain_name = chain.as_deref().unwrap_or_else(|| state.chain.as_str());
-        // The kind-seek path takes one page per kind id through the kind index instead of
-        // walking the global ordering. That walk is what dies when a kind's rows are
-        // clustered away from where it starts, which on this chain is the normal case.
-        if filter.kind_seek_applies(order_by) {
-            // Ordering by timestamp needs the chain pinned per branch, so hand the seek
-            // every chain when the request did not scope to one.
-            let seek_chain_ids = match chain_filter_id {
-                Some(chain_id) => vec![chain_id],
-                None => all_chain_ids(&state.pool).await?,
-            };
-            list_events_by_kind_seek(&state.pool, &seek_chain_ids, &filter, &page).await?
-        } else {
-            list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
-        }
+        list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, "event")?;

@@ -1649,10 +1649,7 @@ fn event_to_projection(
         payload_format: Some("live.v1".to_owned()),
         payload_json: Some(payload_json),
         timestamp_unix_seconds: transaction_record.timestamp_unix_seconds,
-        date_unix_seconds: unix_day_start(transaction_record.timestamp_unix_seconds),
         burned: None,
-        nsfw: false,
-        blacklisted: false,
     })
 }
 
@@ -2332,10 +2329,6 @@ fn event_index_to_i32(
         event_index,
         field: "event_index",
     })
-}
-
-fn unix_day_start(timestamp_unix_seconds: i64) -> i64 {
-    timestamp_unix_seconds - timestamp_unix_seconds.rem_euclid(86_400)
 }
 
 fn extract_block_hash(block: &SdkBlockResult) -> Option<String> {
@@ -3537,7 +3530,6 @@ mod tests {
                     .and_then(|call| call.get("module_id")),
                 Some(&serde_json::json!(0))
             );
-            assert_eq!(events[2].date_unix_seconds, 1743465600);
         }
     }
 

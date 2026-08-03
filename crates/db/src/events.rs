@@ -208,12 +208,9 @@ pub(crate) async fn insert_block_events(
     // in one pass. The id column is omitted so the serial default assigns ids in
     // `unnest` order, which is the (transaction, event_index) order.
     let mut timestamp = Vec::new();
-    let mut date = Vec::new();
     let mut event_index = Vec::new();
     let mut token_id = Vec::new();
     let mut burned = Vec::new();
-    let mut nsfw = Vec::new();
-    let mut blacklisted = Vec::new();
     let mut address_id = Vec::new();
     let mut chain_id = Vec::new();
     let mut contract_id = Vec::new();
@@ -226,9 +223,7 @@ pub(crate) async fn insert_block_events(
     let mut event_name = Vec::new();
     for (_, events) in batches {
         for event in events {
-            let kind_id = cache
-                .event_kind_id(conn, event.chain_id, &event.event_kind)
-                .await?;
+            let kind_id = cache.event_kind_id(conn, &event.event_kind).await?;
             let resolved_address_id = cache
                 .address_id(
                     conn,
@@ -249,12 +244,9 @@ pub(crate) async fn insert_block_events(
                 )
                 .await?;
             timestamp.push(event.timestamp_unix_seconds);
-            date.push(event.date_unix_seconds);
             event_index.push(event.event_index);
             token_id.push(event.token_id.clone());
             burned.push(event.burned);
-            nsfw.push(event.nsfw);
-            blacklisted.push(event.blacklisted);
             address_id.push(resolved_address_id);
             chain_id.push(event.chain_id);
             contract_id.push(resolved_contract_id);
@@ -274,14 +266,10 @@ pub(crate) async fn insert_block_events(
     sqlx::query(
         r#"
         INSERT INTO events (
-            dm_unix_seconds,
             timestamp_unix_seconds,
-            date_unix_seconds,
             event_index,
             token_id,
             burned,
-            nsfw,
-            blacklisted,
             address_id,
             chain_id,
             contract_id,
@@ -294,16 +282,16 @@ pub(crate) async fn insert_block_events(
             event_name
         )
         SELECT
-            t.timestamp, t.timestamp, t.date, t.event_index, t.token_id, t.burned, t.nsfw,
-            t.blacklisted, t.address_id, t.chain_id, t.contract_id, t.transaction_id,
+            t.timestamp, t.event_index, t.token_id, t.burned,
+            t.address_id, t.chain_id, t.contract_id, t.transaction_id,
             t.event_kind_id, t.target_address_id, t.payload_format, t.payload_json::jsonb,
             t.raw_data, t.event_name
         FROM unnest(
-            $1::bigint[], $2::bigint[], $3::int[], $4::text[], $5::bool[], $6::bool[], $7::bool[],
-            $8::int[], $9::int[], $10::int[], $11::int[], $12::int[], $13::int[], $14::text[],
-            $15::text[], $16::text[], $17::text[]
+            $1::bigint[], $2::int[], $3::text[], $4::bool[],
+            $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[], $11::text[],
+            $12::text[], $13::text[], $14::text[]
         ) AS t(
-            timestamp, date, event_index, token_id, burned, nsfw, blacklisted, address_id,
+            timestamp, event_index, token_id, burned, address_id,
             chain_id, contract_id, transaction_id, event_kind_id, target_address_id,
             payload_format, payload_json, raw_data, event_name
         )
@@ -311,12 +299,9 @@ pub(crate) async fn insert_block_events(
         "#,
     )
     .bind(&timestamp)
-    .bind(&date)
     .bind(&event_index)
     .bind(&token_id)
     .bind(&burned)
-    .bind(&nsfw)
-    .bind(&blacklisted)
     .bind(&address_id)
     .bind(&chain_id)
     .bind(&contract_id)
@@ -369,7 +354,6 @@ async fn apply_contract_string_event_side_effects(
             JOIN blocks block ON block.id = tx.block_id
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             WHERE ($1::integer IS NULL OR event.chain_id = $1)
               AND ($2::integer IS NULL OR event.transaction_id = $2)
               AND ($3::bigint IS NULL OR block.height > $3)
@@ -414,7 +398,6 @@ async fn apply_contract_string_event_side_effects(
                 JOIN blocks block ON block.id = tx.block_id
                 JOIN event_kinds event_kind
                   ON event_kind.id = event.event_kind_id
-                 AND event_kind.chain_id = event.chain_id
                 WHERE ($1::integer IS NULL OR event.chain_id = $1)
                   AND ($2::integer IS NULL OR event.transaction_id = $2)
                   AND ($3::bigint IS NULL OR block.height > $3)
@@ -465,7 +448,6 @@ async fn has_nft_side_effect_candidates(
             FROM tx_events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN tokens token
               ON token.chain_id = event.chain_id
              AND token.contract_id = event.contract_id
@@ -502,9 +484,7 @@ pub(crate) async fn upsert_event_cached(
     event: &EventUpsert,
     id: Option<i32>,
 ) -> Result<(), DbError> {
-    let event_kind_id = cache
-        .event_kind_id(conn, event.chain_id, &event.event_kind)
-        .await?;
+    let event_kind_id = cache.event_kind_id(conn, &event.event_kind).await?;
     let address = event.address.as_deref().unwrap_or("NULL");
     let address_id = cache.address_id(conn, event.chain_id, address).await?;
     let target_address_id = match event.target_address.as_deref().and_then(usable_address) {
@@ -518,14 +498,10 @@ pub(crate) async fn upsert_event_cached(
         r#"
         INSERT INTO events (
             id,
-            dm_unix_seconds,
             timestamp_unix_seconds,
-            date_unix_seconds,
             event_index,
             token_id,
             burned,
-            nsfw,
-            blacklisted,
             address_id,
             chain_id,
             contract_id,
@@ -539,18 +515,14 @@ pub(crate) async fn upsert_event_cached(
         )
         VALUES (
             COALESCE($1, nextval(pg_get_serial_sequence('events', 'id'))::integer),
-            $2, $3, $4, $5, $6, $7, $8, $9,
-            $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            $2, $3, $4, $5,
+            $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
         )
         ON CONFLICT (id) DO UPDATE SET
-            dm_unix_seconds = EXCLUDED.dm_unix_seconds,
             timestamp_unix_seconds = EXCLUDED.timestamp_unix_seconds,
-            date_unix_seconds = EXCLUDED.date_unix_seconds,
             event_index = EXCLUDED.event_index,
             token_id = EXCLUDED.token_id,
             burned = EXCLUDED.burned,
-            nsfw = EXCLUDED.nsfw,
-            blacklisted = EXCLUDED.blacklisted,
             address_id = EXCLUDED.address_id,
             chain_id = EXCLUDED.chain_id,
             contract_id = EXCLUDED.contract_id,
@@ -566,13 +538,9 @@ pub(crate) async fn upsert_event_cached(
     )
     .bind(id)
     .bind(event.timestamp_unix_seconds)
-    .bind(event.timestamp_unix_seconds)
-    .bind(event.date_unix_seconds)
     .bind(event.event_index)
     .bind(&event.token_id)
     .bind(event.burned)
-    .bind(event.nsfw)
-    .bind(event.blacklisted)
     .bind(address_id)
     .bind(event.chain_id)
     .bind(contract_id)
@@ -607,7 +575,6 @@ async fn upsert_tokens_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             WHERE event.transaction_id = $1
               AND event_kind.name = 'TokenCreate'
               AND jsonb_typeof(event.payload_json->'token_create_event') = 'object'
@@ -895,7 +862,6 @@ async fn upsert_series_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             WHERE event.transaction_id = $1
               AND event_kind.name = 'TokenSeriesCreate'
               AND jsonb_typeof(event.payload_json->'token_series_event') = 'object'
@@ -1081,7 +1047,6 @@ async fn apply_token_mint_extended_side_effects_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN tokens token
               ON token.chain_id = event.chain_id
              AND token.contract_id = event.contract_id
@@ -1182,7 +1147,6 @@ async fn apply_nft_side_effects_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN tokens token
               ON token.chain_id = event.chain_id
              AND token.contract_id = event.contract_id
@@ -1265,7 +1229,6 @@ async fn apply_nft_side_effects_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN tokens token
               ON token.chain_id = event.chain_id
              AND token.contract_id = event.contract_id
@@ -1318,7 +1281,6 @@ async fn apply_nft_side_effects_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             WHERE event.transaction_id = $1
               AND event.token_id IS NOT NULL
               AND event.address_id IS NOT NULL
@@ -1443,7 +1405,6 @@ async fn apply_infusions_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN tokens infused_token
               ON infused_token.chain_id = event.chain_id
              AND lower(infused_token.symbol) = lower(event.payload_json #>> '{infusion_event,infused_token}')
@@ -1480,7 +1441,6 @@ async fn apply_infusions_for_transaction(
              AND COALESCE(event.payload_json #>> '{infusion_event,infused_value}', '') ~ '^[0-9]+$'
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
              AND event_kind.name = 'Infusion'
             GROUP BY touched.nft_id, touched.token_id, touched.key
         ),
@@ -1536,7 +1496,6 @@ async fn apply_infusions_for_transaction(
             FROM events event
             JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             JOIN tokens infused_token
               ON infused_token.chain_id = event.chain_id
              AND lower(infused_token.symbol) = lower(event.payload_json #>> '{infusion_event,infused_token}')
@@ -1591,7 +1550,6 @@ async fn apply_series_lifecycle_for_transaction(
         FROM events event
         JOIN event_kinds event_kind
           ON event_kind.id = event.event_kind_id
-         AND event_kind.chain_id = event.chain_id
         JOIN nfts nft
           ON nft.id = event.nft_id
         WHERE event.transaction_id = $1
@@ -1693,7 +1651,7 @@ async fn apply_burn_markers_for_transaction(
               AND token_id IS NOT NULL
         ),
         token_burn_kinds AS MATERIALIZED (
-            SELECT id, chain_id
+            SELECT id
             FROM event_kinds
             WHERE name = $2
         ),
@@ -1717,7 +1675,6 @@ async fn apply_burn_markers_for_transaction(
             FROM tx_non_kcal_events burn_event
             JOIN token_burn_kinds burn_kind
               ON burn_kind.id = burn_event.event_kind_id
-             AND burn_kind.chain_id = burn_event.chain_id
 
             UNION
 
@@ -1731,7 +1688,6 @@ async fn apply_burn_markers_for_transaction(
                 FROM events burn_event
                 JOIN token_burn_kinds burn_kind
                   ON burn_kind.id = burn_event.event_kind_id
-                 AND burn_kind.chain_id = burn_event.chain_id
                 WHERE burn_event.chain_id = tx_event.chain_id
                   AND burn_event.contract_id = tx_event.contract_id
                   AND burn_event.token_id = tx_event.token_id
@@ -1873,10 +1829,7 @@ mod tests {
                     }
                 })),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
-                date_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             EventUpsert {
                 transaction_id: tx.id,
@@ -1899,10 +1852,7 @@ mod tests {
                     }
                 })),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
-                date_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
         ];
 
@@ -1915,7 +1865,6 @@ mod tests {
             LEFT JOIN events event ON event.id = contract.create_event_id
             LEFT JOIN event_kinds event_kind
               ON event_kind.id = event.event_kind_id
-             AND event_kind.chain_id = event.chain_id
             WHERE contract.chain_id = $1
               AND contract.hash = ANY($2)
             ORDER BY contract.hash
@@ -2067,10 +2016,7 @@ mod tests {
                     }
                 })),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
-                date_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             EventUpsert {
                 transaction_id: tx.id,
@@ -2107,10 +2053,7 @@ mod tests {
                     }
                 })),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
-                date_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             EventUpsert {
                 transaction_id: tx.id,
@@ -2138,10 +2081,7 @@ mod tests {
                     }
                 })),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
-                date_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
         ];
 
@@ -2284,10 +2224,7 @@ mod tests {
                 payload_format: Some("live.v1".to_owned()),
                 payload_json: None,
                 timestamp_unix_seconds: first_block.timestamp_unix_seconds,
-                date_unix_seconds: first_block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             EventUpsert {
                 transaction_id: first_tx.id,
@@ -2303,10 +2240,7 @@ mod tests {
                 payload_format: Some("live.v1".to_owned()),
                 payload_json: None,
                 timestamp_unix_seconds: first_block.timestamp_unix_seconds,
-                date_unix_seconds: first_block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
         ];
         replace_events(&mut transaction, first_tx.id, &first_events).await?;
@@ -2371,10 +2305,7 @@ mod tests {
                 payload_format: Some("live.v1".to_owned()),
                 payload_json: None,
                 timestamp_unix_seconds: second_block.timestamp_unix_seconds,
-                date_unix_seconds: second_block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             EventUpsert {
                 transaction_id: second_tx.id,
@@ -2390,10 +2321,7 @@ mod tests {
                 payload_format: Some("live.v1".to_owned()),
                 payload_json: None,
                 timestamp_unix_seconds: second_block.timestamp_unix_seconds,
-                date_unix_seconds: second_block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
             EventUpsert {
                 transaction_id: second_tx.id,
@@ -2409,10 +2337,7 @@ mod tests {
                 payload_format: Some("live.v1".to_owned()),
                 payload_json: None,
                 timestamp_unix_seconds: second_block.timestamp_unix_seconds,
-                date_unix_seconds: second_block.timestamp_unix_seconds,
                 burned: None,
-                nsfw: false,
-                blacklisted: false,
             },
         ];
         replace_events(&mut transaction, second_tx.id, &second_events).await?;

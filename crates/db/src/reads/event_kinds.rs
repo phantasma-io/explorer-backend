@@ -38,30 +38,22 @@ impl EventKindOrderBy {
     }
 }
 
-/// Resolves an event-kind name to every id that carries it.
+/// Resolves an event-kind name to its id.
 ///
-/// The dimension is scoped per chain (`UNIQUE (chain_id, name)`), so one name
-/// legitimately exists once per chain — `Inflation` is id 30 on `main` and id 92 on
-/// `main-generation-1` — and a filter has to match all of them.
-///
-/// Event lists filter on these ids rather than joining `event_kinds` and comparing the
-/// name, because the joined-name form cannot use `IX_Events_EventKindId_ID`: the planner
-/// falls back to walking the primary key backwards and, for a kind with fewer rows than
-/// the page size, that means scanning all 76M events before it can answer at all.
-pub async fn event_kind_ids_by_name(
+/// The dimension is global, so this is a single id or nothing. Event lists filter on the
+/// id rather than joining `event_kinds` and comparing the name: the joined-name form
+/// cannot use the kind indexes, and the planner then walks the primary key instead —
+/// which never finishes for a kind holding fewer rows than one page.
+pub async fn event_kind_id_by_name(
     executor: impl sqlx::PgExecutor<'_>,
     name: &str,
-) -> Result<Vec<i32>, DbError> {
-    let ids = sqlx::query_scalar::<_, i32>(
-        r#"
-        SELECT id FROM event_kinds WHERE name = $1
-        "#,
-    )
-    .bind(name)
-    .fetch_all(executor)
-    .await?;
+) -> Result<Option<i32>, DbError> {
+    let id = sqlx::query_scalar::<_, i32>("SELECT id FROM event_kinds WHERE name = $1")
+        .bind(name)
+        .fetch_optional(executor)
+        .await?;
 
-    Ok(ids)
+    Ok(id)
 }
 
 /// Resolves an event-kind `%substring%` pattern to the ids it matches. Same reason as
@@ -99,8 +91,12 @@ pub async fn list_event_kinds(
         r#"
         SELECT event_kind.name, MIN(event_kind.id) AS sort_id
         FROM event_kinds event_kind
-        WHERE ($1::integer IS NULL OR event_kind.chain_id = $1)
-          AND ($2::text IS NULL OR event_kind.name = $2)
+        WHERE ($2::text IS NULL OR event_kind.name = $2)
+          AND ($1::integer IS NULL OR EXISTS (
+              SELECT 1 FROM events event
+              WHERE event.event_kind_id = event_kind.id
+                AND event.chain_id = $1
+          ))
         GROUP BY event_kind.name
         ORDER BY {column} {dir}, event_kind.name {dir}
         LIMIT $3 OFFSET $4
@@ -131,8 +127,12 @@ pub async fn count_event_kinds(
         r#"
         SELECT COUNT(*)::bigint
         FROM event_kinds event_kind
-        WHERE ($1::integer IS NULL OR event_kind.chain_id = $1)
-          AND ($2::text IS NULL OR event_kind.name = $2)
+        WHERE ($2::text IS NULL OR event_kind.name = $2)
+          AND ($1::integer IS NULL OR EXISTS (
+              SELECT 1 FROM events event
+              WHERE event.event_kind_id = event_kind.id
+                AND event.chain_id = $1
+          ))
         "#,
     )
     .bind(chain_id)
@@ -153,11 +153,11 @@ pub async fn list_event_kinds_with_events(
         r#"
         SELECT DISTINCT event_kind.name
         FROM event_kinds event_kind
-        WHERE ($1::integer IS NULL OR event_kind.chain_id = $1)
-          AND EXISTS (
+        WHERE EXISTS (
               SELECT 1
               FROM events event
               WHERE event.event_kind_id = event_kind.id
+                AND ($1::integer IS NULL OR event.chain_id = $1)
           )
         ORDER BY event_kind.name ASC
         "#,
