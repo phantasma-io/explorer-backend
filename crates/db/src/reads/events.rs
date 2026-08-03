@@ -421,6 +421,7 @@ pub async fn list_events_by_address(
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
         .bind(filter.chain_id)
+        .bind(filter.event_kind_id)
         .fetch_all(executor)
         .await?;
 
@@ -579,4 +580,156 @@ pub async fn list_event_tokens_by_symbols(
     .await?;
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    // Address-scoped event list round-trip: seed one transaction with two events for
+    // a fresh address, then list them by the resolved address id — unfiltered (both
+    // events) and narrowed to one kind (one event). Guards the bind list of
+    // `list_events_by_address`: the statement references a placeholder per optional
+    // filter even when unused, so a missing `.bind()` fails EVERY address-scoped
+    // request, which is exactly how the kind filter shipped broken once. Runs inside
+    // a rolled-back transaction.
+    #[tokio::test]
+    async fn address_scoped_events_list_and_kind_filter() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let actor = format!("PTESTEVADDR{suffix}");
+
+        let block = upsert_block(
+            &mut tx,
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_300_000),
+                hash: format!("TESTEVADDRBLOCK{suffix}"),
+                previous_hash: None,
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: 1_800_300_000,
+                reward: None,
+            },
+        )
+        .await?;
+        let seeded_tx = upsert_transaction(
+            &mut tx,
+            TransactionUpsert {
+                block_id: block.id,
+                chain_id,
+                tx_index: 0,
+                hash: format!("TESTEVADDRTX{suffix}"),
+                timestamp_unix_seconds: block.timestamp_unix_seconds,
+                state: "Halt".to_owned(),
+                result: None,
+                debug_comment: None,
+                payload: None,
+                script_raw: None,
+                fee: None,
+                fee_raw: None,
+                gas_price: None,
+                gas_price_raw: None,
+                gas_limit: None,
+                gas_limit_raw: None,
+                sender: Some(actor.clone()),
+                gas_payer: Some(actor.clone()),
+                gas_target: Some(actor.clone()),
+                carbon_tx_type: None,
+                carbon_tx_data: None,
+                expiration_unix_seconds: 0,
+                signatures: Vec::new(),
+            },
+        )
+        .await?;
+        let events = vec![
+            EventUpsert {
+                transaction_id: seeded_tx.id,
+                chain_id,
+                event_index: 1,
+                event_kind: "TokenSend".to_owned(),
+                event_name: None,
+                address: Some(actor.clone()),
+                target_address: None,
+                contract: Some("SOUL".to_owned()),
+                token_id: None,
+                raw_data: None,
+                payload_format: Some("live.v1".to_owned()),
+                payload_json: None,
+                timestamp_unix_seconds: block.timestamp_unix_seconds,
+                burned: None,
+            },
+            EventUpsert {
+                transaction_id: seeded_tx.id,
+                chain_id,
+                event_index: 2,
+                event_kind: "TokenReceive".to_owned(),
+                event_name: None,
+                address: Some(actor.clone()),
+                target_address: None,
+                contract: Some("SOUL".to_owned()),
+                token_id: None,
+                raw_data: None,
+                payload_format: Some("live.v1".to_owned()),
+                payload_json: None,
+                timestamp_unix_seconds: block.timestamp_unix_seconds,
+                burned: None,
+            },
+        ];
+        replace_events(&mut tx, seeded_tx.id, &events).await?;
+
+        let address_id = sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM addresses WHERE chain_id = $1 AND address = $2",
+        )
+        .bind(chain_id)
+        .bind(&actor)
+        .fetch_one(&mut *tx)
+        .await?;
+        let send_kind_id =
+            sqlx::query_scalar::<_, i32>("SELECT id FROM event_kinds WHERE name = 'TokenSend'")
+                .fetch_one(&mut *tx)
+                .await?;
+        let page = EventPage {
+            order_by: EventOrderBy::Id,
+            direction: SortDirection::Desc,
+            cursor_sort_value: None,
+            cursor_id: None,
+            limit: 10,
+        };
+
+        let unfiltered =
+            list_events_by_address(&mut *tx, "main", address_id, &EventFilter::default(), &page)
+                .await?;
+        assert_eq!(unfiltered.len(), 2);
+
+        let kind_filtered = list_events_by_address(
+            &mut *tx,
+            "main",
+            address_id,
+            &EventFilter {
+                event_kind_id: Some(send_kind_id),
+                ..EventFilter::default()
+            },
+            &page,
+        )
+        .await?;
+        assert_eq!(kind_filtered.len(), 1);
+        assert_eq!(kind_filtered[0].get::<String, _>("event_kind"), "TokenSend");
+
+        Ok(())
+    }
 }
