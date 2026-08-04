@@ -5,9 +5,9 @@ use explorer_domain::BlockHeight;
 use explorer_ingestion::{
     BalanceDirtyMarkReport, BalanceSyncReport, BlockIngestionDriver, ContractRpcMetadataSyncReport,
     ContractStringEventSideEffectSyncReport, ContractUpgradeMethodSyncReport,
-    FailedTransactionDebugSyncReport, NftRpcMetadataSyncReport, SeriesRpcMetadataSyncReport,
-    StartupProbe, SyncBatchReport, TokenMetadataSyncReport, TokenPriceSyncReport,
-    TokenSupplySyncReport, TtrsOffchainSyncReport,
+    FailedTransactionDebugSyncReport, LegacyRawDecodeReport, NftRpcMetadataSyncReport,
+    SeriesRpcMetadataSyncReport, StartupProbe, SyncBatchReport, TokenMetadataSyncReport,
+    TokenPriceSyncReport, TokenSupplySyncReport, TtrsOffchainSyncReport,
 };
 use explorer_rpc::PhantasmaSdkClient;
 use std::path::PathBuf;
@@ -73,6 +73,9 @@ struct Args {
     /// Run one failed-transaction debug-comment sync batch and exit.
     #[arg(long, env = "EXPLORER_WORKER_FAILED_TX_DEBUG_SYNC_ONCE")]
     failed_tx_debug_sync_once: bool,
+    /// One-time: decode every remaining legacy.raw.v1 event payload and exit.
+    #[arg(long, env = "EXPLORER_WORKER_DECODE_LEGACY_RAW_ONCE")]
+    decode_legacy_raw_once: bool,
     /// Fetch one raw block payload through RPC, then exit.
     #[arg(long, env = "EXPLORER_WORKER_FETCH_BLOCK")]
     fetch_block: Option<u64>,
@@ -178,6 +181,10 @@ async fn main() -> anyhow::Result<()> {
     } else if args.failed_tx_debug_sync_once {
         let report = driver.sync_failed_transaction_debug_comments_once().await?;
         log_failed_tx_debug_sync_batch(&report);
+        return Ok(());
+    } else if args.decode_legacy_raw_once {
+        let report = driver.decode_legacy_raw_events_once().await?;
+        log_legacy_raw_decode(&report);
         return Ok(());
     } else if args.sync_once {
         let report = driver.sync_once().await?;
@@ -364,6 +371,21 @@ fn log_series_rpc_metadata_sync_batch(report: &SeriesRpcMetadataSyncReport) {
         report.lag,
         report.skipped_catchup
     );
+}
+
+fn log_legacy_raw_decode(report: &LegacyRawDecodeReport) {
+    info!(
+        "decoded legacy raw events scanned={} converted={} contracts_repointed={} token_ids_filled={} token_ids_already_equal={} target_addresses_filled={}",
+        report.scanned,
+        report.converted,
+        report.contracts_repointed,
+        report.token_ids_filled,
+        report.token_ids_already_equal,
+        report.target_addresses_filled
+    );
+    for (kind, count) in &report.per_kind {
+        info!("decoded legacy raw events kind={kind} count={count}");
+    }
 }
 
 fn log_failed_tx_debug_sync_batch(report: &FailedTransactionDebugSyncReport) {

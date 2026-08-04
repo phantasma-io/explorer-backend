@@ -1042,6 +1042,129 @@ impl BlockIngestionDriver {
         })
     }
 
+    /// One-shot decode of every remaining `legacy.raw.v1` event
+    /// (`--decode-legacy-raw-once`): adds the decoded payload keys from the
+    /// row's own `raw_data`, fills `token_id`, re-points `contract_id` at the
+    /// token contract and sets the validator-election target address exactly
+    /// as the live path/C# would have, then flips the row to
+    /// `legacy.decoded.v1`. Idempotent: the batch UPDATE is guarded on
+    /// `payload_format = 3`, so a re-run only sees rows a previous run missed.
+    /// A `token_id` that decodes differently from a stored non-NULL value
+    /// aborts the run: stored enrichments are frozen C#-era data, never
+    /// overwritten.
+    pub async fn decode_legacy_raw_events_once(
+        &self,
+    ) -> Result<LegacyRawDecodeReport, IngestionError> {
+        const DECODE_LEGACY_RAW_BATCH: i64 = 5_000;
+        let mut conn = self.pool.acquire().await?;
+        let mut cache = explorer_db::ProjectionDimensionCache::new();
+        let mut report = LegacyRawDecodeReport::default();
+        let mut per_kind: BTreeMap<String, u64> = BTreeMap::new();
+        let mut after_id = 0;
+        let mut chunk_index = 0u64;
+        loop {
+            let rows =
+                explorer_db::list_legacy_raw_events(&mut conn, after_id, DECODE_LEGACY_RAW_BATCH)
+                    .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut updates = Vec::with_capacity(rows.len());
+            for row in &rows {
+                after_id = after_id.max(row.id);
+                let raw_data = row
+                    .raw_data
+                    .as_deref()
+                    .ok_or(IngestionError::LegacyRawMissingData { event_id: row.id })?;
+                let outcome = crate::legacy_raw::decode_legacy_raw_event(
+                    &row.event_kind,
+                    raw_data,
+                    &row.chain_name,
+                    u64::try_from(row.block_height).unwrap_or(0),
+                    usize::try_from(row.tx_index).unwrap_or(0),
+                    usize::try_from(row.event_index).unwrap_or(0),
+                )?;
+
+                let token_id = match (row.token_id.clone(), outcome.token_id.clone()) {
+                    (Some(stored), Some(computed)) => {
+                        if stored != computed {
+                            return Err(IngestionError::LegacyRawTokenIdConflict {
+                                event_id: row.id,
+                                stored,
+                                computed,
+                            });
+                        }
+                        report.token_ids_already_equal += 1;
+                        Some(stored)
+                    }
+                    (Some(stored), None) => Some(stored),
+                    (None, Some(computed)) => {
+                        report.token_ids_filled += 1;
+                        Some(computed)
+                    }
+                    (None, None) => None,
+                };
+
+                let contract_id = match outcome.contract_symbol.as_deref() {
+                    Some(symbol) => {
+                        let resolved = cache.contract_id(&mut conn, row.chain_id, symbol).await?;
+                        if row.contract_id != Some(resolved) {
+                            report.contracts_repointed += 1;
+                        }
+                        Some(resolved)
+                    }
+                    None => None,
+                };
+
+                let target_address_id = match outcome.target_address.as_deref() {
+                    Some(address) => {
+                        let resolved = cache.address_id(&mut conn, row.chain_id, address).await?;
+                        if row.target_address_id.is_none() {
+                            report.target_addresses_filled += 1;
+                        }
+                        Some(resolved)
+                    }
+                    None => None,
+                };
+
+                // Preserve every stored payload key (C#-era quirks included);
+                // drop only the in-payload raw_data duplicate, then add the
+                // decoded subobjects.
+                let mut payload = match &row.payload_json {
+                    Some(Value::Object(map)) => map.clone(),
+                    _ => Map::new(),
+                };
+                payload.remove("raw_data");
+                for (key, value) in outcome.payload_additions {
+                    payload.insert(key.to_owned(), value);
+                }
+
+                *per_kind.entry(row.event_kind.clone()).or_default() += 1;
+                updates.push(explorer_db::LegacyDecodedRowUpdate {
+                    id: row.id,
+                    payload_json: Value::Object(payload),
+                    token_id,
+                    contract_id,
+                    target_address_id,
+                });
+            }
+            report.scanned += rows.len() as u64;
+            report.converted +=
+                explorer_db::apply_legacy_decoded_events(&mut conn, &updates).await?;
+            chunk_index += 1;
+            if chunk_index.is_multiple_of(20) {
+                info!(
+                    scanned = report.scanned,
+                    converted = report.converted,
+                    "decoding legacy raw events"
+                );
+            }
+        }
+        report.per_kind = per_kind.into_iter().collect();
+
+        Ok(report)
+    }
+
     pub async fn sync_contract_string_event_side_effects_once(
         &self,
     ) -> Result<ContractStringEventSideEffectSyncReport, IngestionError> {

@@ -156,6 +156,18 @@ pub struct BalanceDirtyMarkReport {
     pub marked_addresses: u64,
 }
 
+/// Outcome of the one-shot `legacy.raw.v1` decode (`--decode-legacy-raw-once`).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LegacyRawDecodeReport {
+    pub scanned: u64,
+    pub converted: u64,
+    pub contracts_repointed: u64,
+    pub token_ids_filled: u64,
+    pub token_ids_already_equal: u64,
+    pub target_addresses_filled: u64,
+    pub per_kind: Vec<(String, u64)>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ContractStringEventSideEffectSyncReport {
     pub configured_nexus: String,
@@ -354,11 +366,22 @@ pub enum IngestionError {
         chain: String,
         configured_nexus: String,
     },
+    #[error("legacy raw event {event_id} has no raw_data to decode")]
+    LegacyRawMissingData { event_id: i32 },
+    #[error(
+        "legacy raw event {event_id} decoded token_id {computed:?} but the row already carries {stored:?} — refusing to overwrite frozen data"
+    )]
+    LegacyRawTokenIdConflict {
+        event_id: i32,
+        stored: String,
+        computed: String,
+    },
 }
 
 // The BlockIngestionDriver orchestrator's (large) inherent impl lives in its own
 // module to keep this crate root focused on types and free helper functions.
 mod driver;
+mod legacy_raw;
 mod prices;
 mod ttrs;
 

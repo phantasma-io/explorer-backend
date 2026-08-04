@@ -1695,7 +1695,10 @@ impl ProjectionDimensionCache {
         Ok(())
     }
 
-    async fn address_id(
+    // Public: the legacy-raw decode tool resolves its contract/target-address
+    // enrichments through the same cached upserts the block projection uses,
+    // so both paths mint identical dimension ids.
+    pub async fn address_id(
         &mut self,
         conn: &mut PgConnection,
         chain_id: i32,
@@ -1731,7 +1734,7 @@ impl ProjectionDimensionCache {
         Ok(id)
     }
 
-    async fn contract_id(
+    pub async fn contract_id(
         &mut self,
         conn: &mut PgConnection,
         chain_id: i32,

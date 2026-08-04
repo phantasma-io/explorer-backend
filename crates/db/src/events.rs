@@ -1710,6 +1710,141 @@ async fn apply_burn_markers_for_transaction(
     Ok(())
 }
 
+/// One undecoded `legacy.raw.v1` event row (payload_format 3), joined with
+/// everything the one-shot decode tool needs: the kind name for dispatch, the
+/// chain name for the C# `chain_event` shape, and the block/tx coordinates the
+/// legacy decoders put in their error context.
+#[derive(Debug)]
+pub struct LegacyRawEventRow {
+    pub id: i32,
+    pub chain_id: i32,
+    pub chain_name: String,
+    pub event_kind: String,
+    pub raw_data: Option<String>,
+    pub payload_json: Option<Value>,
+    pub token_id: Option<String>,
+    pub contract_id: Option<i32>,
+    pub target_address_id: Option<i32>,
+    pub block_height: i64,
+    pub tx_index: i32,
+    pub event_index: i32,
+}
+
+/// Page the remaining `legacy.raw.v1` rows by id (the tool's resume key).
+pub async fn list_legacy_raw_events(
+    conn: &mut PgConnection,
+    after_id: i32,
+    limit: i64,
+) -> Result<Vec<LegacyRawEventRow>, DbError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            event.id,
+            event.chain_id,
+            chain.name AS chain_name,
+            event_kind.name AS event_kind,
+            event.raw_data,
+            event.payload_json,
+            event.token_id,
+            event.contract_id,
+            event.target_address_id,
+            block.height AS block_height,
+            tx.tx_index,
+            event.event_index
+        FROM events event
+        JOIN chains chain ON chain.id = event.chain_id
+        JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
+        JOIN transactions tx ON tx.id = event.transaction_id
+        JOIN blocks block ON block.id = tx.block_id
+        WHERE event.payload_format = 3
+          AND event.id > $1
+        ORDER BY event.id
+        LIMIT $2
+        "#,
+    )
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| LegacyRawEventRow {
+            id: row.get("id"),
+            chain_id: row.get("chain_id"),
+            chain_name: row.get("chain_name"),
+            event_kind: row.get("event_kind"),
+            raw_data: row.get("raw_data"),
+            payload_json: row.get("payload_json"),
+            token_id: row.get("token_id"),
+            contract_id: row.get("contract_id"),
+            target_address_id: row.get("target_address_id"),
+            block_height: row.get("block_height"),
+            tx_index: row.get("tx_index"),
+            event_index: row.get("event_index"),
+        })
+        .collect())
+}
+
+/// One decoded row's replacement values. `contract_id`/`target_address_id`
+/// `None` means "keep the stored value"; `token_id` is bound verbatim (the
+/// driver already merged computed-vs-stored and aborts on conflicts).
+#[derive(Debug)]
+pub struct LegacyDecodedRowUpdate {
+    pub id: i32,
+    pub payload_json: Value,
+    pub token_id: Option<String>,
+    pub contract_id: Option<i32>,
+    pub target_address_id: Option<i32>,
+}
+
+/// Apply one decoded batch. The `payload_format = 3` guard makes the tool
+/// idempotent: a re-run cannot touch rows a previous run already flipped.
+pub async fn apply_legacy_decoded_events(
+    conn: &mut PgConnection,
+    updates: &[LegacyDecodedRowUpdate],
+) -> Result<u64, DbError> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let mut ids = Vec::with_capacity(updates.len());
+    let mut payloads = Vec::with_capacity(updates.len());
+    let mut token_ids = Vec::with_capacity(updates.len());
+    let mut contract_ids = Vec::with_capacity(updates.len());
+    let mut target_address_ids = Vec::with_capacity(updates.len());
+    for update in updates {
+        ids.push(update.id);
+        payloads.push(update.payload_json.to_string());
+        token_ids.push(update.token_id.clone());
+        contract_ids.push(update.contract_id);
+        target_address_ids.push(update.target_address_id);
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE events
+        SET payload_json = data.payload_json::jsonb,
+            payload_format = 4,
+            token_id = data.token_id,
+            contract_id = COALESCE(data.contract_id, events.contract_id),
+            target_address_id = COALESCE(data.target_address_id, events.target_address_id)
+        FROM unnest($1::int[], $2::text[], $3::text[], $4::int[], $5::int[])
+             AS data(id, payload_json, token_id, contract_id, target_address_id)
+        WHERE events.id = data.id
+          AND events.payload_format = 3
+        "#,
+    )
+    .bind(&ids)
+    .bind(&payloads)
+    .bind(&token_ids)
+    .bind(&contract_ids)
+    .bind(&target_address_ids)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
