@@ -1297,9 +1297,9 @@ pub(crate) async fn load_transactions(
     let hash = empty_to_none(query.hash);
     let block_hash = empty_to_none(query.block_hash);
     let address = empty_to_none(query.address);
-    // The global and address-scoped transaction lists page over different id
-    // spaces (tx.id vs address_tx.id), so they use distinct cursor kinds: a cursor
-    // minted on one list cannot be replayed against the other.
+    // Both transaction lists seek on the transaction id (the address-scoped one
+    // via address_transactions' natural key), but they keep distinct cursor kinds
+    // so a cursor stays scoped to the list variant that minted it.
     let cursor_kind = if address.is_some() {
         "tx-address"
     } else {

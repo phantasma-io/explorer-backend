@@ -2179,9 +2179,7 @@ pub async fn replace_address_transactions_for_transaction(
 /// Replace the AddressTransaction links for every transaction in a block in one
 /// set-based pass (mirrors the C# block-level `InsertBatchAsync`). The per-block
 /// batch is equivalent to running [`replace_address_transactions_for_transaction`]
-/// for each id in order: links are deduped per transaction and inserted ordered
-/// by `(transaction_id, ord)` — sender, gas payer, gas target, then event
-/// addresses — so the observable surrogate ids match the per-transaction order.
+/// for each id in order: links are deduped per transaction before the insert.
 pub async fn replace_address_transactions_for_block(
     conn: &mut PgConnection,
     transaction_ids: &[i32],
@@ -2220,12 +2218,11 @@ pub async fn replace_address_transactions_for_block(
     .execute(&mut *conn)
     .await?;
 
-    // C# queues AddressTransaction rows in a HashSet: first-seen order is
-    // sender, gas payer, gas target, then event addresses, while duplicates are
-    // removed before the batch insert. The surrogate IDs are observable in the
-    // legacy DB, so Rust must preserve both the order and the pre-insert dedupe.
-    // Ordering by `(transaction_id, ord)` reproduces the per-transaction insert
-    // sequence (transaction ids are assigned in `tx_index` order within a block).
+    // C# queues AddressTransaction rows in a HashSet, so duplicates are removed
+    // before the batch insert; MIN(ord) keeps the first-seen link (sender, gas
+    // payer, gas target, then event addresses). The table keys on
+    // (address_id, transaction_id) with no surrogate id, so insert order is not
+    // observable; the ORDER BY stays only to keep the write deterministic.
     let result = sqlx::query(
         r#"
         WITH candidate_address_links AS (

@@ -11,8 +11,8 @@ use crate::*;
 use sqlx::postgres::PgRow;
 
 /// Sortable keys for the transactions list. The seek cursor keys on the selected
-/// sort column plus `tx.id` (or `address_tx.id`), so paging stays consistent for
-/// every order.
+/// sort column plus `tx.id` (or `address_tx.transaction_id`), so paging stays
+/// consistent for every order.
 #[derive(Debug, Clone, Copy)]
 pub enum TransactionOrderBy {
     Date,
@@ -40,8 +40,8 @@ impl TransactionOrderBy {
 
     /// The SQL sort column for the address-scoped lists. `Date` reads the
     /// timestamp denormalized onto `address_transactions`, so the
-    /// `(address_id, timestamp_unix_seconds, id)` index orders the page without
-    /// sorting the joined transactions of a high-activity address.
+    /// `(address_id, timestamp_unix_seconds, transaction_id)` index orders the
+    /// page without sorting the joined transactions of a high-activity address.
     fn address_column(self) -> &'static str {
         match self {
             Self::Date => "address_tx.timestamp_unix_seconds",
@@ -279,7 +279,6 @@ pub async fn list_transactions_for_address_timeline(
         r#"
         WITH address_page AS MATERIALIZED (
             SELECT
-                address_tx.id AS cursor_id,
                 address_tx.transaction_id,
                 {column}::bigint AS cursor_sort_value
             FROM address_transactions address_tx
@@ -288,14 +287,14 @@ pub async fn list_transactions_for_address_timeline(
               AND (
                   $2::bigint IS NULL
                   OR {column} {op} $2
-                  OR ({column} = $2 AND address_tx.id {op} $3)
+                  OR ({column} = $2 AND address_tx.transaction_id {op} $3)
               )
-            ORDER BY {column} {dir}, address_tx.id {dir}
+            ORDER BY {column} {dir}, address_tx.transaction_id {dir}
             LIMIT $4
         )
         SELECT
             tx.id,
-            address_page.cursor_id,
+            address_page.transaction_id AS cursor_id,
             address_page.cursor_sort_value,
             tx.hash,
             block.hash AS block_hash,
@@ -335,7 +334,7 @@ pub async fn list_transactions_for_address_timeline(
         LEFT JOIN addresses sender ON sender.id = tx.sender_id
         LEFT JOIN addresses gas_payer ON gas_payer.id = tx.gas_payer_id
         LEFT JOIN addresses gas_target ON gas_target.id = tx.gas_target_id
-        ORDER BY address_page.cursor_sort_value {dir}, address_page.cursor_id {dir}
+        ORDER BY address_page.cursor_sort_value {dir}, address_page.transaction_id {dir}
         "#,
     );
     let rows = sqlx::query(&sql)
@@ -366,7 +365,7 @@ pub async fn list_transactions_for_filtered_address(
         r#"
         SELECT
             tx.id,
-            address_tx.id AS cursor_id,
+            address_tx.transaction_id AS cursor_id,
             {column}::bigint AS cursor_sort_value,
             tx.hash,
             block.hash AS block_hash,
@@ -422,9 +421,9 @@ pub async fn list_transactions_for_filtered_address(
           AND (
               $9::bigint IS NULL
               OR {column} {op} $9
-              OR ({column} = $9 AND address_tx.id {op} $10)
+              OR ({column} = $9 AND address_tx.transaction_id {op} $10)
           )
-        ORDER BY {column} {dir}, address_tx.id {dir}
+        ORDER BY {column} {dir}, address_tx.transaction_id {dir}
         LIMIT $11
         "#,
     );
@@ -712,4 +711,157 @@ pub async fn list_signatures(
     .await?;
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    // Address-scoped paging across a same-second tie: three transactions share one
+    // timestamp for a fresh address, and limit-1 cursor walks page through both
+    // address-scoped list fns. The seek tie-break keys on address_transactions'
+    // natural key (`transaction_id`, also served as `cursor_id`), so every page
+    // must surface exactly the next transaction — a wrong tie-break column,
+    // operator, or bind order skips or repeats rows. Runs inside a rolled-back
+    // transaction.
+    #[tokio::test]
+    async fn address_scoped_lists_page_ties_by_transaction_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let actor = format!("PTESTATPAGE{suffix}");
+
+        let block = upsert_block(
+            &mut tx,
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_400_000),
+                hash: format!("TESTATPAGEBLOCK{suffix}"),
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: 1_800_400_000,
+                reward: None,
+            },
+        )
+        .await?;
+        let mut seeded_tx_ids = Vec::new();
+        for tx_index in 0..3i32 {
+            let seeded = upsert_transaction(
+                &mut tx,
+                TransactionUpsert {
+                    block_id: block.id,
+                    chain_id,
+                    tx_index,
+                    hash: format!("TESTATPAGETX{tx_index}{suffix}"),
+                    timestamp_unix_seconds: block.timestamp_unix_seconds,
+                    state: "Halt".to_owned(),
+                    result: None,
+                    debug_comment: None,
+                    payload: None,
+                    script_raw: None,
+                    fee_raw: None,
+                    gas_price_raw: None,
+                    gas_limit_raw: None,
+                    sender: Some(actor.clone()),
+                    gas_payer: Some(actor.clone()),
+                    gas_target: Some(actor.clone()),
+                    carbon_tx_type: None,
+                    carbon_tx_data: None,
+                    expiration_unix_seconds: 0,
+                    signatures: Vec::new(),
+                },
+            )
+            .await?;
+            seeded_tx_ids.push(seeded.id);
+        }
+        replace_address_transactions_for_block(&mut tx, &seeded_tx_ids).await?;
+
+        let address_id = sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM addresses WHERE chain_id = $1 AND address = $2",
+        )
+        .bind(chain_id)
+        .bind(&actor)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Ascending timeline walk; the tie must come out in transaction id order.
+        let mut cursor: Option<(i64, i32)> = None;
+        let mut walked = Vec::new();
+        for _ in 0..3 {
+            let page = TransactionPage {
+                order_by: TransactionOrderBy::Date,
+                direction: SortDirection::Asc,
+                cursor_sort_value: cursor.map(|(sort_value, _)| sort_value),
+                cursor_id: cursor.map(|(_, id)| id),
+                limit: 1,
+            };
+            let rows = list_transactions_for_address_timeline(&mut *tx, address_id, &page).await?;
+            assert!(!rows.is_empty(), "walk page must not be empty");
+            let row = &rows[0];
+            let cursor_id = row.get::<i32, _>("cursor_id");
+            assert_eq!(
+                cursor_id,
+                row.get::<i32, _>("id"),
+                "cursor_id must carry the transaction id"
+            );
+            walked.push(cursor_id);
+            cursor = Some((row.get::<i64, _>("cursor_sort_value"), cursor_id));
+        }
+        assert_eq!(walked, seeded_tx_ids);
+        let exhausted = TransactionPage {
+            order_by: TransactionOrderBy::Date,
+            direction: SortDirection::Asc,
+            cursor_sort_value: cursor.map(|(sort_value, _)| sort_value),
+            cursor_id: cursor.map(|(_, id)| id),
+            limit: 1,
+        };
+        assert!(
+            list_transactions_for_address_timeline(&mut *tx, address_id, &exhausted)
+                .await?
+                .is_empty(),
+            "the walk must end after the last link"
+        );
+
+        // Descending filtered walk (chain filter routes to the filtered variant).
+        let filter = TransactionFilter {
+            chain_id: Some(chain_id),
+            ..TransactionFilter::default()
+        };
+        let mut cursor: Option<(i64, i32)> = None;
+        let mut walked_desc = Vec::new();
+        for _ in 0..3 {
+            let page = TransactionPage {
+                order_by: TransactionOrderBy::Date,
+                direction: SortDirection::Desc,
+                cursor_sort_value: cursor.map(|(sort_value, _)| sort_value),
+                cursor_id: cursor.map(|(_, id)| id),
+                limit: 1,
+            };
+            let rows = list_transactions_for_filtered_address(&mut *tx, address_id, &filter, &page)
+                .await?;
+            assert!(!rows.is_empty(), "filtered walk page must not be empty");
+            let row = &rows[0];
+            let cursor_id = row.get::<i32, _>("cursor_id");
+            walked_desc.push(cursor_id);
+            cursor = Some((row.get::<i64, _>("cursor_sort_value"), cursor_id));
+        }
+        let mut expected_desc = seeded_tx_ids.clone();
+        expected_desc.reverse();
+        assert_eq!(walked_desc, expected_desc);
+
+        Ok(())
+    }
 }

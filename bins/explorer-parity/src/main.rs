@@ -577,46 +577,10 @@ SELECT
 FROM rows
 "#;
 
-const STRICT_ADDRESS_TRANSACTIONS_RANGE_DIGEST_SQL: &str = r#"
-WITH range_transactions AS MATERIALIZED (
-    SELECT
-        tx.id,
-        tx.tx_index,
-        tx.hash,
-        block.height
-    FROM blocks block
-    JOIN chains chain ON chain.id = block.chain_id
-    JOIN transactions tx ON tx.block_id = block.id
-    WHERE chain.name = $1
-      AND block.height BETWEEN $2 AND $3
-),
-rows AS (
-    SELECT
-        range_tx.height,
-        range_tx.tx_index,
-        address_tx.id,
-        address.address,
-        ARRAY[
-            address_tx.id::text,
-            range_tx.height::text,
-            range_tx.tx_index::text,
-            range_tx.hash,
-            address.address
-        ] AS fields
-    FROM range_transactions range_tx
-    JOIN LATERAL (
-        SELECT *
-        FROM address_transactions address_tx_lookup
-        WHERE address_tx_lookup.transaction_id = range_tx.id
-        OFFSET 0
-    ) address_tx ON TRUE
-    JOIN addresses address ON address.id = address_tx.address_id
-)
-SELECT
-    COUNT(*)::bigint AS row_count,
-    md5(COALESCE(string_agg(array_to_string(fields, '|'), E'\n' ORDER BY height, tx_index, address, id), '')) AS digest
-FROM rows
-"#;
+// address_transactions keys on (address_id, transaction_id) with no surrogate id,
+// so strict mode has no insertion-order ids to pin and shares the semantic digest.
+const STRICT_ADDRESS_TRANSACTIONS_RANGE_DIGEST_SQL: &str =
+    SEMANTIC_ADDRESS_TRANSACTIONS_RANGE_DIGEST_SQL;
 
 const LEGACY_CSHARP_SEMANTIC_BLOCKS_RANGE_DIGEST_SQL: &str = r#"
 WITH rows AS (
