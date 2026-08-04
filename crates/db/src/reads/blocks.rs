@@ -78,7 +78,7 @@ pub async fn list_blocks(
             validator_address.address AS validator_address,
             producer_address.address AS producer_address,
             block.timestamp_unix_seconds,
-            block.reward,
+            block.reward::text AS reward,
             (
                 SELECT COUNT(*)::integer
                 FROM transactions tx
@@ -140,7 +140,7 @@ pub async fn block_detail(
             validator_address.address AS validator_address,
             producer_address.address AS producer_address,
             block.timestamp_unix_seconds,
-            block.reward,
+            block.reward::text AS reward,
             (
                 SELECT COUNT(*)::integer
                 FROM transactions tx

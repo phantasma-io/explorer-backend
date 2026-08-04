@@ -30,7 +30,6 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{error, info, warn};
 
 const LEGACY_UNLIMITED_GAS_RAW: &str = "18446744073709551615";
-const LEGACY_GAS_TOKEN_SYMBOL: &str = "KCAL";
 const SPECIAL_RESOLUTION_REFETCH_ATTEMPTS: usize = 25;
 /// Block size above which an incomplete extended payload is no longer chased by
 /// refetching the whole block. Ordinary blocks are kilobytes; the ones that carry a
@@ -399,7 +398,6 @@ fn transaction_result_to_projection(
     block: &BlockRecord,
     tx_index: usize,
     transaction: &SdkTransactionResult,
-    kcal_decimals: i32,
 ) -> Result<TransactionUpsert, IngestionError> {
     let block_height =
         u64::try_from(block.height).map_err(|_| IngestionError::BlockFieldOutOfRange {
@@ -446,24 +444,9 @@ fn transaction_result_to_projection(
             field: "carbon_tx_type",
         });
     }
-    let kcal_decimals =
-        usize::try_from(kcal_decimals).map_err(|_| IngestionError::TransactionFieldOutOfRange {
-            height: block_height,
-            index: tx_index,
-            field: "kcal_decimals",
-        })?;
     let fee_raw = non_empty_string(&transaction.fee);
     let gas_price_raw = non_empty_string(&transaction.gas_price);
     let gas_limit_raw = non_empty_string(&transaction.gas_limit);
-    let fee = fee_raw
-        .as_deref()
-        .map(|amount| format_token_amount(amount, kcal_decimals));
-    let gas_price = gas_price_raw
-        .as_deref()
-        .map(|amount| format_token_amount(amount, kcal_decimals));
-    let gas_limit = gas_limit_raw.as_deref().and_then(|amount| {
-        (amount != LEGACY_UNLIMITED_GAS_RAW).then(|| format_token_amount(amount, kcal_decimals))
-    });
 
     Ok(TransactionUpsert {
         block_id: block.id,
@@ -482,11 +465,8 @@ fn transaction_result_to_projection(
         debug_comment: transaction.debug_comment.clone(),
         payload: Some(transaction.payload.clone()),
         script_raw: Some(transaction.script.clone()),
-        fee,
         fee_raw,
-        gas_price,
         gas_price_raw,
-        gas_limit,
         gas_limit_raw,
         sender: non_empty_string(&transaction.sender),
         gas_payer: non_empty_string(&transaction.gas_payer),
@@ -515,30 +495,6 @@ fn transaction_result_to_projection(
     })
 }
 
-fn format_token_amount(amount: &str, token_decimals: usize) -> String {
-    if amount == "0" || token_decimals == 0 {
-        return amount.to_owned();
-    }
-
-    if amount.len() <= token_decimals {
-        let mut padded = "0".repeat(token_decimals - amount.len());
-        padded.push_str(amount);
-        return format!("0.{}", padded.trim_end_matches('0'));
-    }
-
-    let decimal_start = amount.len() - token_decimals;
-    let decimal_part = &amount[decimal_start..];
-    let decimal_part = decimal_part
-        .chars()
-        .any(|character| character != '0')
-        .then(|| decimal_part.trim_end_matches('0'));
-
-    match decimal_part {
-        Some(decimal_part) => format!("{}.{}", &amount[..decimal_start], decimal_part),
-        None => amount[..decimal_start].to_owned(),
-    }
-}
-
 /// One dirty address's freshly fetched account state: the lightweight overview
 /// (name + stake from `getAccountInfo(s)`) plus the assembled balance rows —
 /// fungible pages from `getAccountFungibleTokens` and per-token NFT ownership
@@ -552,8 +508,6 @@ pub(crate) struct FetchedBalanceAccount {
 fn account_info_to_upsert(
     address_id: i32,
     account: &FetchedBalanceAccount,
-    soul_decimals: i32,
-    kcal_decimals: i32,
     now_unix_seconds: i64,
 ) -> AddressAccountUpsert {
     // The wire key is `stake` here (an object), not the legacy AccountResult's
@@ -573,11 +527,7 @@ fn account_info_to_upsert(
         .filter_map(|balance| {
             let symbol = non_empty_string(&balance.symbol)?;
             let amount_raw = normalized_amount_raw(&balance.amount);
-            Some(AddressBalanceUpsert {
-                symbol,
-                amount: format_token_amount(&amount_raw, balance.decimals as usize),
-                amount_raw,
-            })
+            Some(AddressBalanceUpsert { symbol, amount_raw })
         })
         .collect();
     let address_name =
@@ -588,12 +538,7 @@ fn account_info_to_upsert(
         address_name,
         name_last_updated_unix_seconds: now_unix_seconds,
         stake_timestamp: i64::try_from(account.info.stake.time).unwrap_or(i64::MAX),
-        staked_amount: format_token_amount(&staked_amount_raw, decimals_to_usize(soul_decimals)),
         staked_amount_raw,
-        unclaimed_amount: format_token_amount(
-            &unclaimed_amount_raw,
-            decimals_to_usize(kcal_decimals),
-        ),
         unclaimed_amount_raw,
         soul_balance_raw,
         balances,
@@ -601,7 +546,6 @@ fn account_info_to_upsert(
 }
 
 fn token_result_to_supply_upsert(token: &SdkTokenResult) -> TokenSupplyUpsert {
-    let decimals = token.decimals as usize;
     let current_supply_raw = normalized_amount_raw(&token.current_supply);
     let max_supply_raw = normalized_amount_raw(&token.max_supply);
     let burned_supply_raw = normalized_amount_raw(&token.burned_supply);
@@ -609,11 +553,8 @@ fn token_result_to_supply_upsert(token: &SdkTokenResult) -> TokenSupplyUpsert {
     TokenSupplyUpsert {
         symbol: token.symbol.clone(),
         carbon_id: non_empty_string(&token.carbon_id).and_then(|value| value.parse().ok()),
-        current_supply: format_token_amount(&current_supply_raw, decimals),
         current_supply_raw,
-        max_supply: format_token_amount(&max_supply_raw, decimals),
         max_supply_raw,
-        burned_supply: format_token_amount(&burned_supply_raw, decimals),
         burned_supply_raw,
     }
 }
@@ -1011,10 +952,6 @@ fn normalize_rpc_image_url(url: Option<String>) -> Option<String> {
 
 fn normalized_amount_raw(value: &str) -> String {
     non_empty_string(value).unwrap_or_else(|| "0".to_owned())
-}
-
-fn decimals_to_usize(decimals: i32) -> usize {
-    usize::try_from(decimals).unwrap_or_default()
 }
 
 fn balance_dirty_batch_size(dirty_count: i64) -> i64 {
@@ -2627,15 +2564,6 @@ mod tests {
     }
 
     #[test]
-    fn formats_token_amount_like_csharp_utils() {
-        assert_eq!(format_token_amount("0", 10), "0");
-        assert_eq!(format_token_amount("467", 10), "0.0000000467");
-        assert_eq!(format_token_amount("1", 10), "0.0000000001");
-        assert_eq!(format_token_amount("2100000000", 10), "0.21");
-        assert_eq!(format_token_amount("10000000000", 10), "1");
-    }
-
-    #[test]
     fn account_balance_projection_reads_the_account_info_stake_object()
     -> Result<(), Box<dyn std::error::Error>> {
         // getAccountInfo carries the staking object under the wire key `stake`
@@ -2661,18 +2589,16 @@ mod tests {
         ]))?;
         let account = FetchedBalanceAccount { info, balances };
 
-        let projection = account_info_to_upsert(7, &account, 8, 10, 999);
+        let projection = account_info_to_upsert(7, &account, 999);
 
         assert_eq!(projection.address_id, 7);
         assert_eq!(projection.address_name, None);
         assert_eq!(projection.stake_timestamp, 123);
-        assert_eq!(projection.staked_amount, "50000");
         assert_eq!(projection.staked_amount_raw, "5000000000000");
-        assert_eq!(projection.unclaimed_amount, "0.0000000467");
+        assert_eq!(projection.unclaimed_amount_raw, "467");
         assert_eq!(projection.soul_balance_raw, "42");
         assert_eq!(projection.balances.len(), 3);
-        assert_eq!(projection.balances[1].amount, "0.0000000467");
-        assert_eq!(projection.balances[2].amount, "20");
+        assert_eq!(projection.balances[1].amount_raw, "467");
         assert_eq!(projection.balances[2].amount_raw, "20");
         Ok(())
     }
@@ -2690,7 +2616,7 @@ mod tests {
             balances: Vec::new(),
         };
 
-        let projection = account_info_to_upsert(7, &account, 8, 10, 999);
+        let projection = account_info_to_upsert(7, &account, 999);
 
         assert_eq!(projection.address_name.as_deref(), Some("moneymaker01"));
         assert_eq!(projection.soul_balance_raw, "0");
@@ -2699,7 +2625,7 @@ mod tests {
     }
 
     #[test]
-    fn token_supply_projection_formats_rpc_raw_values() {
+    fn token_supply_projection_passes_rpc_raw_values_through() {
         let token = SdkTokenResult {
             symbol: "KCAL".to_owned(),
             carbon_id: "1".to_owned(),
@@ -2714,10 +2640,9 @@ mod tests {
 
         assert_eq!(supply.symbol, "KCAL");
         assert_eq!(supply.carbon_id, Some(1));
-        assert_eq!(supply.current_supply, "209370058.8047349606");
         assert_eq!(supply.current_supply_raw, "2093700588047349606");
-        assert_eq!(supply.max_supply, "0");
-        assert_eq!(supply.burned_supply, "924281.4271535702");
+        assert_eq!(supply.max_supply_raw, "0");
+        assert_eq!(supply.burned_supply_raw, "9242814271535702");
     }
 
     #[test]
@@ -3016,19 +2941,17 @@ mod tests {
             ..Default::default()
         };
 
-        let projection = transaction_result_to_projection(&block, 0, &transaction, 10)?;
+        let projection = transaction_result_to_projection(&block, 0, &transaction)?;
 
-        assert_eq!(projection.fee.as_deref(), Some("0.0000000467"));
         assert_eq!(projection.fee_raw.as_deref(), Some("467"));
-        assert_eq!(projection.gas_price.as_deref(), Some("0.0000000001"));
         assert_eq!(projection.gas_price_raw.as_deref(), Some("1"));
-        assert_eq!(projection.gas_limit.as_deref(), Some("0.21"));
         assert_eq!(projection.gas_limit_raw.as_deref(), Some("2100000000"));
 
+        // The unlimited-gas sentinel is stored raw as-is; the READ path serves the
+        // formatted gas_limit as NULL for it (the projection no longer formats).
         transaction.gas_limit = LEGACY_UNLIMITED_GAS_RAW.to_owned();
-        let projection = transaction_result_to_projection(&block, 0, &transaction, 10)?;
+        let projection = transaction_result_to_projection(&block, 0, &transaction)?;
 
-        assert_eq!(projection.gas_limit, None);
         assert_eq!(
             projection.gas_limit_raw.as_deref(),
             Some(LEGACY_UNLIMITED_GAS_RAW)
@@ -3125,11 +3048,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -3300,11 +3220,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -3453,11 +3370,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -3627,11 +3541,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -3727,11 +3638,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -3933,11 +3841,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -4059,11 +3964,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,
@@ -4201,11 +4103,8 @@ mod tests {
             debug_comment: None,
             payload: None,
             script_raw: None,
-            fee: None,
             fee_raw: None,
-            gas_price: None,
             gas_price_raw: None,
-            gas_limit: None,
             gas_limit_raw: None,
             sender_id: 1,
             gas_payer_id: 1,

@@ -183,11 +183,8 @@ pub struct TransactionUpsert {
     pub debug_comment: Option<String>,
     pub payload: Option<String>,
     pub script_raw: Option<String>,
-    pub fee: Option<String>,
     pub fee_raw: Option<String>,
-    pub gas_price: Option<String>,
     pub gas_price_raw: Option<String>,
-    pub gas_limit: Option<String>,
     pub gas_limit_raw: Option<String>,
     pub sender: Option<String>,
     pub gas_payer: Option<String>,
@@ -211,11 +208,8 @@ pub struct TransactionRecord {
     pub debug_comment: Option<String>,
     pub payload: Option<String>,
     pub script_raw: Option<String>,
-    pub fee: Option<String>,
     pub fee_raw: Option<String>,
-    pub gas_price: Option<String>,
     pub gas_price_raw: Option<String>,
-    pub gas_limit: Option<String>,
     pub gas_limit_raw: Option<String>,
     pub sender_id: i32,
     pub gas_payer_id: i32,
@@ -352,7 +346,6 @@ pub struct SeriesRpcMetadataUpsert {
 #[derive(Debug, Clone)]
 pub struct AddressBalanceUpsert {
     pub symbol: String,
-    pub amount: String,
     pub amount_raw: String,
 }
 
@@ -371,9 +364,7 @@ pub struct AddressAccountUpsert {
     pub address_name: Option<String>,
     pub name_last_updated_unix_seconds: i64,
     pub stake_timestamp: i64,
-    pub staked_amount: String,
     pub staked_amount_raw: String,
-    pub unclaimed_amount: String,
     pub unclaimed_amount_raw: String,
     pub soul_balance_raw: String,
     pub balances: Vec<AddressBalanceUpsert>,
@@ -388,11 +379,8 @@ pub struct AddressAccountUpsertResult {
 pub struct TokenSupplyUpsert {
     pub symbol: String,
     pub carbon_id: Option<i64>,
-    pub current_supply: String,
     pub current_supply_raw: String,
-    pub max_supply: String,
     pub max_supply_raw: String,
-    pub burned_supply: String,
     pub burned_supply_raw: String,
 }
 
@@ -841,24 +829,20 @@ pub async fn upsert_address_account(
             address_name = $2,
             name_last_updated_unix_seconds = $3,
             stake_timestamp = $4,
-            staked_amount = $5,
-            staked_amount_raw = $6,
-            unclaimed_amount = $7,
-            unclaimed_amount_raw = $8,
+            staked_amount_raw = NULLIF($5, '')::numeric,
+            unclaimed_amount_raw = NULLIF($6, '')::numeric,
             total_soul_amount =
-                COALESCE(NULLIF($9, '')::numeric, 0)
-                + COALESCE(NULLIF($6, '')::numeric, 0)
+                COALESCE(NULLIF($7, '')::numeric, 0)
+                + COALESCE(NULLIF($5, '')::numeric, 0)
         WHERE id = $1
-          AND chain_id = $10
+          AND chain_id = $8
         "#,
     )
     .bind(account.address_id)
     .bind(&account.address_name)
     .bind(account.name_last_updated_unix_seconds)
     .bind(account.stake_timestamp)
-    .bind(&account.staked_amount)
     .bind(&account.staked_amount_raw)
-    .bind(&account.unclaimed_amount)
     .bind(&account.unclaimed_amount_raw)
     .bind(&account.soul_balance_raw)
     .bind(chain_id)
@@ -885,7 +869,7 @@ pub async fn reconcile_stake_memberships(
         WITH scoped AS (
             SELECT
                 id AS address_id,
-                COALESCE(NULLIF(staked_amount_raw, '')::numeric, 0) AS staked_raw
+                COALESCE(staked_amount_raw, 0) AS staked_raw
             FROM addresses
             WHERE id = ANY($1)
         ),
@@ -913,7 +897,7 @@ pub async fn reconcile_stake_memberships(
         WITH scoped AS (
             SELECT
                 id AS address_id,
-                COALESCE(NULLIF(staked_amount_raw, '')::numeric, 0) AS staked_raw
+                COALESCE(staked_amount_raw, 0) AS staked_raw
             FROM addresses
             WHERE id = ANY($1)
         ),
@@ -960,10 +944,6 @@ pub async fn update_token_supplies(
         .iter()
         .map(|supply| supply.symbol.clone())
         .collect::<Vec<_>>();
-    let current_supplies = supplies
-        .iter()
-        .map(|supply| supply.current_supply.clone())
-        .collect::<Vec<_>>();
     let carbon_ids = supplies
         .iter()
         .map(|supply| supply.carbon_id)
@@ -972,17 +952,9 @@ pub async fn update_token_supplies(
         .iter()
         .map(|supply| supply.current_supply_raw.clone())
         .collect::<Vec<_>>();
-    let max_supplies = supplies
-        .iter()
-        .map(|supply| supply.max_supply.clone())
-        .collect::<Vec<_>>();
     let max_supply_raws = supplies
         .iter()
         .map(|supply| supply.max_supply_raw.clone())
-        .collect::<Vec<_>>();
-    let burned_supplies = supplies
-        .iter()
-        .map(|supply| supply.burned_supply.clone())
         .collect::<Vec<_>>();
     let burned_supply_raws = supplies
         .iter()
@@ -993,61 +965,43 @@ pub async fn update_token_supplies(
         r#"
         UPDATE tokens token
         SET
-            current_supply = desired.current_supply,
             carbon_id = COALESCE(desired.carbon_id, token.carbon_id),
-            current_supply_raw = desired.current_supply_raw,
-            max_supply = desired.max_supply,
-            max_supply_raw = desired.max_supply_raw,
-            burned_supply = desired.burned_supply,
-            burned_supply_raw = desired.burned_supply_raw
+            current_supply_raw = NULLIF(desired.current_supply_raw, '')::numeric,
+            max_supply_raw = NULLIF(desired.max_supply_raw, '')::numeric,
+            burned_supply_raw = NULLIF(desired.burned_supply_raw, '')::numeric
         FROM UNNEST(
             $2::text[],
             $3::bigint[],
             $4::text[],
             $5::text[],
-            $6::text[],
-            $7::text[],
-            $8::text[],
-            $9::text[]
+            $6::text[]
         ) AS desired(
             symbol,
             carbon_id,
-            current_supply,
             current_supply_raw,
-            max_supply,
             max_supply_raw,
-            burned_supply,
             burned_supply_raw
         )
         WHERE token.chain_id = $1
           AND token.symbol = desired.symbol
           AND (
-                token.current_supply,
                 token.carbon_id,
                 token.current_supply_raw,
-                token.max_supply,
                 token.max_supply_raw,
-                token.burned_supply,
                 token.burned_supply_raw
               ) IS DISTINCT FROM (
-                desired.current_supply,
                 COALESCE(desired.carbon_id, token.carbon_id),
-                desired.current_supply_raw,
-                desired.max_supply,
-                desired.max_supply_raw,
-                desired.burned_supply,
-                desired.burned_supply_raw
+                NULLIF(desired.current_supply_raw, '')::numeric,
+                NULLIF(desired.max_supply_raw, '')::numeric,
+                NULLIF(desired.burned_supply_raw, '')::numeric
               )
         "#,
     )
     .bind(chain_id)
     .bind(&symbols)
     .bind(&carbon_ids)
-    .bind(&current_supplies)
     .bind(&current_supply_raws)
-    .bind(&max_supplies)
     .bind(&max_supply_raws)
-    .bind(&burned_supplies)
     .bind(&burned_supply_raws)
     .execute(&mut *conn)
     .await?;
@@ -1418,10 +1372,6 @@ async fn replace_address_balances(
         .iter()
         .map(|balance| balance.symbol.clone())
         .collect::<Vec<_>>();
-    let amounts = balances
-        .iter()
-        .map(|balance| balance.amount.clone())
-        .collect::<Vec<_>>();
     let amount_raws = balances
         .iter()
         .map(|balance| balance.amount_raw.clone())
@@ -1448,24 +1398,21 @@ async fn replace_address_balances(
 
     sqlx::query(
         r#"
-        INSERT INTO address_balances (address_id, token_id, amount, amount_raw)
+        INSERT INTO address_balances (address_id, token_id, amount_raw)
         SELECT
             $1,
             token.id,
-            desired.amount,
             COALESCE(NULLIF(desired.amount_raw, '')::numeric, 0)
-        FROM UNNEST($2::text[], $3::text[], $4::text[]) AS desired(symbol, amount, amount_raw)
+        FROM UNNEST($2::text[], $3::text[]) AS desired(symbol, amount_raw)
         JOIN tokens token
-          ON token.chain_id = $5
+          ON token.chain_id = $4
          AND token.symbol = desired.symbol
         ON CONFLICT (address_id, token_id) DO UPDATE SET
-            amount = EXCLUDED.amount,
             amount_raw = EXCLUDED.amount_raw
         "#,
     )
     .bind(address_id)
     .bind(&symbols)
-    .bind(&amounts)
     .bind(&amount_raws)
     .bind(chain_id)
     .execute(&mut *conn)
@@ -1614,7 +1561,7 @@ pub async fn upsert_block(
                 validator_address_id = $5,
                 producer_address_id = $6,
                 timestamp_unix_seconds = $7,
-                reward = $8
+                reward = NULLIF($8, '')::numeric
             WHERE id = $1
             "#,
         )
@@ -1643,7 +1590,7 @@ pub async fn upsert_block(
                 producer_address_id,
                 reward
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, '')::numeric)
             RETURNING id
             "#,
         )
@@ -1845,22 +1792,19 @@ pub async fn upsert_transaction_cached(
             SET hash = $2,
                 timestamp_unix_seconds = $3,
                 payload = $4,
-                script_raw = $5,
+                script_raw = decode($5, 'hex'),
                 result = $6,
-                fee = $7,
-                expiration = $8,
-                state_id = $9,
-                gas_price = $10,
-                gas_limit = $11,
-                sender_id = $12,
-                gas_payer_id = $13,
-                gas_target_id = $14,
-                fee_raw = $15,
-                gas_limit_raw = $16,
-                gas_price_raw = $17,
-                carbon_tx_data = $18,
-                carbon_tx_type = $19,
-                debug_comment = $20
+                expiration = $7,
+                state_id = $8,
+                sender_id = $9,
+                gas_payer_id = $10,
+                gas_target_id = $11,
+                fee_raw = NULLIF($12, '')::numeric,
+                gas_limit_raw = NULLIF($13, '')::numeric,
+                gas_price_raw = NULLIF($14, '')::numeric,
+                carbon_tx_data = decode($15, 'hex'),
+                carbon_tx_type = $16,
+                debug_comment = $17
             WHERE id = $1
             "#,
         )
@@ -1870,11 +1814,8 @@ pub async fn upsert_transaction_cached(
         .bind(&transaction.payload)
         .bind(&transaction.script_raw)
         .bind(&transaction.result)
-        .bind(&transaction.fee)
         .bind(transaction.expiration_unix_seconds)
         .bind(state_id)
-        .bind(&transaction.gas_price)
-        .bind(&transaction.gas_limit)
         .bind(sender_id)
         .bind(gas_payer_id)
         .bind(gas_target_id)
@@ -1902,11 +1843,8 @@ pub async fn upsert_transaction_cached(
                 payload,
                 script_raw,
                 result,
-                fee,
                 expiration,
                 state_id,
-                gas_price,
-                gas_limit,
                 sender_id,
                 gas_payer_id,
                 gas_target_id,
@@ -1918,8 +1856,9 @@ pub async fn upsert_transaction_cached(
                 debug_comment
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+                $1, $2, $3, $4, $5, decode($6, 'hex'), $7, $8, $9, $10,
+                $11, $12, NULLIF($13, '')::numeric, NULLIF($14, '')::numeric,
+                NULLIF($15, '')::numeric, decode($16, 'hex'), $17, $18
             )
             RETURNING id
             "#,
@@ -1931,11 +1870,8 @@ pub async fn upsert_transaction_cached(
         .bind(&transaction.payload)
         .bind(&transaction.script_raw)
         .bind(&transaction.result)
-        .bind(&transaction.fee)
         .bind(transaction.expiration_unix_seconds)
         .bind(state_id)
-        .bind(&transaction.gas_price)
-        .bind(&transaction.gas_limit)
         .bind(sender_id)
         .bind(gas_payer_id)
         .bind(gas_target_id)
@@ -1983,11 +1919,8 @@ fn transaction_record_from_upsert(
         debug_comment: transaction.debug_comment,
         payload: transaction.payload,
         script_raw: transaction.script_raw,
-        fee: transaction.fee,
         fee_raw: transaction.fee_raw,
-        gas_price: transaction.gas_price,
         gas_price_raw: transaction.gas_price_raw,
-        gas_limit: transaction.gas_limit,
         gas_limit_raw: transaction.gas_limit_raw,
         sender_id,
         gas_payer_id,
@@ -2068,11 +2001,8 @@ pub async fn batch_upsert_transactions(
     let mut payload = Vec::with_capacity(transactions.len());
     let mut script_raw = Vec::with_capacity(transactions.len());
     let mut result = Vec::with_capacity(transactions.len());
-    let mut fee = Vec::with_capacity(transactions.len());
     let mut expiration = Vec::with_capacity(transactions.len());
     let mut state_id = Vec::with_capacity(transactions.len());
-    let mut gas_price = Vec::with_capacity(transactions.len());
-    let mut gas_limit = Vec::with_capacity(transactions.len());
     let mut sender_id = Vec::with_capacity(transactions.len());
     let mut gas_payer_id = Vec::with_capacity(transactions.len());
     let mut gas_target_id = Vec::with_capacity(transactions.len());
@@ -2092,11 +2022,8 @@ pub async fn batch_upsert_transactions(
         payload.push(transaction.payload.clone());
         script_raw.push(transaction.script_raw.clone());
         result.push(transaction.result.clone());
-        fee.push(transaction.fee.clone());
         expiration.push(transaction.expiration_unix_seconds);
         state_id.push(*resolved_state);
-        gas_price.push(transaction.gas_price.clone());
-        gas_limit.push(transaction.gas_limit.clone());
         sender_id.push(*resolved_sender);
         gas_payer_id.push(*resolved_gas_payer);
         gas_target_id.push(*resolved_gas_target);
@@ -2115,23 +2042,24 @@ pub async fn batch_upsert_transactions(
     let inserted = sqlx::query_as::<_, (i32, i32)>(
         r#"
         INSERT INTO transactions (
-            hash, tx_index, block_id, timestamp_unix_seconds, payload, script_raw, result, fee,
-            expiration, state_id, gas_price, gas_limit, sender_id, gas_payer_id, gas_target_id,
+            hash, tx_index, block_id, timestamp_unix_seconds, payload, script_raw, result,
+            expiration, state_id, sender_id, gas_payer_id, gas_target_id,
             fee_raw, gas_limit_raw, gas_price_raw, carbon_tx_data, carbon_tx_type, debug_comment
         )
         SELECT
-            t.hash, t.tx_index, t.block_id, t.timestamp, t.payload, t.script_raw, t.result, t.fee,
-            t.expiration, t.state_id, t.gas_price, t.gas_limit, t.sender_id, t.gas_payer_id,
-            t.gas_target_id, t.fee_raw, t.gas_limit_raw, t.gas_price_raw, t.carbon_tx_data,
+            t.hash, t.tx_index, t.block_id, t.timestamp, t.payload, decode(t.script_raw, 'hex'),
+            t.result, t.expiration, t.state_id, t.sender_id, t.gas_payer_id, t.gas_target_id,
+            NULLIF(t.fee_raw, '')::numeric, NULLIF(t.gas_limit_raw, '')::numeric,
+            NULLIF(t.gas_price_raw, '')::numeric, decode(t.carbon_tx_data, 'hex'),
             t.carbon_tx_type, t.debug_comment
         FROM unnest(
             $1::text[], $2::int[], $3::int[], $4::bigint[], $5::text[], $6::text[], $7::text[],
-            $8::text[], $9::bigint[], $10::int[], $11::text[], $12::text[], $13::int[], $14::int[],
-            $15::int[], $16::text[], $17::text[], $18::text[], $19::text[], $20::smallint[],
-            $21::text[]
+            $8::bigint[], $9::int[], $10::int[], $11::int[],
+            $12::int[], $13::text[], $14::text[], $15::text[], $16::text[], $17::smallint[],
+            $18::text[]
         ) AS t(
-            hash, tx_index, block_id, timestamp, payload, script_raw, result, fee, expiration,
-            state_id, gas_price, gas_limit, sender_id, gas_payer_id, gas_target_id, fee_raw,
+            hash, tx_index, block_id, timestamp, payload, script_raw, result, expiration,
+            state_id, sender_id, gas_payer_id, gas_target_id, fee_raw,
             gas_limit_raw, gas_price_raw, carbon_tx_data, carbon_tx_type, debug_comment
         )
         ORDER BY t.tx_index
@@ -2145,11 +2073,8 @@ pub async fn batch_upsert_transactions(
     .bind(&payload)
     .bind(&script_raw)
     .bind(&result)
-    .bind(&fee)
     .bind(&expiration)
     .bind(&state_id)
-    .bind(&gas_price)
-    .bind(&gas_limit)
     .bind(&sender_id)
     .bind(&gas_payer_id)
     .bind(&gas_target_id)
@@ -2202,7 +2127,7 @@ async fn replace_transaction_signatures(
         sqlx::query(
             r#"
             INSERT INTO signatures (signature_kind_id, data, transaction_id)
-            VALUES ($1, $2, $3)
+            VALUES ($1, decode($2, 'hex'), $3)
             "#,
         )
         .bind(kind_id)
@@ -2435,14 +2360,14 @@ mod tests {
             r#"
             INSERT INTO tokens (
                 symbol, fungible, transferable, finite, divisible, fuel, stakable, fiat,
-                swappable, burnable, decimals, current_supply, max_supply, burned_supply,
+                swappable, burnable, decimals,
                 address_id, owner_id, price_usd, chain_id, contract_id,
                 burned_supply_raw, current_supply_raw, max_supply_raw, mintable, name
             )
             VALUES (
                 $1, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, 8,
-                '0', '0', '0', $2, $2, 0, $3, $4,
-                '0', '0', '0', TRUE, $1
+                $2, $2, 0, $3, $4,
+                0, 0, 0, TRUE, $1
             )
             "#,
         )
@@ -2456,11 +2381,8 @@ mod tests {
         let supply = TokenSupplyUpsert {
             symbol: symbol.clone(),
             carbon_id: Some(4242),
-            current_supply: "10".to_owned(),
             current_supply_raw: "1000000000".to_owned(),
-            max_supply: "20".to_owned(),
             max_supply_raw: "2000000000".to_owned(),
-            burned_supply: "1".to_owned(),
             burned_supply_raw: "100000000".to_owned(),
         };
 
@@ -2478,7 +2400,6 @@ mod tests {
         );
 
         let moved = TokenSupplyUpsert {
-            current_supply: "11".to_owned(),
             current_supply_raw: "1100000000".to_owned(),
             ..supply
         };
@@ -2486,7 +2407,7 @@ mod tests {
         assert_eq!(third, 1, "a real supply change must still be written");
 
         let stored = sqlx::query_scalar::<_, String>(
-            "SELECT current_supply_raw FROM tokens WHERE chain_id = $1 AND symbol = $2",
+            "SELECT current_supply_raw::text FROM tokens WHERE chain_id = $1 AND symbol = $2",
         )
         .bind(chain_id)
         .bind(&symbol)

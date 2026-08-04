@@ -13,7 +13,7 @@ pub async fn circulating_soul_supply(
 ) -> Result<Option<String>, DbError> {
     let supply = sqlx::query_scalar::<_, Option<String>>(
         r#"
-        SELECT current_supply
+        SELECT trim_scale(current_supply_raw * power(10::numeric, -decimals))::text
         FROM tokens
         WHERE symbol = 'SOUL'
         ORDER BY id

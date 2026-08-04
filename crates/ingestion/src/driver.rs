@@ -464,18 +464,6 @@ impl BlockIngestionDriver {
     ) -> Result<BlockRecord, IngestionError> {
         let projection = block_result_to_projection(&self.chain.chain, height, block)?;
         let block_record = explorer_db::upsert_block(conn, projection).await?;
-        let kcal_decimals = if block.txs.is_empty() {
-            None
-        } else {
-            Some(
-                explorer_db::get_token_decimals(
-                    conn,
-                    block_record.chain_id,
-                    LEGACY_GAS_TOKEN_SYMBOL,
-                )
-                .await?,
-            )
-        };
 
         // One dimension cache per block: addresses/states/kinds/contracts are
         // resolved once on first encounter (in transaction/event order) and
@@ -487,7 +475,6 @@ impl BlockIngestionDriver {
                 &block_record,
                 tx_index,
                 transaction,
-                kcal_decimals.unwrap_or_default(),
             )?);
         }
         // Pre-resolve the block's transaction addresses in one batch so the per-tx
@@ -1473,11 +1460,6 @@ impl BlockIngestionDriver {
             .map(|address| (address.address.as_str(), address))
             .collect::<BTreeMap<_, _>>();
 
-        let mut conn = self.pool.acquire().await?;
-        let soul_decimals = explorer_db::get_token_decimals(&mut conn, chain_id, "SOUL").await?;
-        let kcal_decimals = explorer_db::get_token_decimals(&mut conn, chain_id, "KCAL").await?;
-        drop(conn);
-
         let now_unix_seconds = chrono::Utc::now().timestamp();
         let mut updated_dirty_addresses = Vec::new();
         let mut transaction = self.pool.begin().await?;
@@ -1486,13 +1468,8 @@ impl BlockIngestionDriver {
             let Some(dirty_address) = dirty_by_address.get(account.info.address.as_str()) else {
                 continue;
             };
-            let account_upsert = account_info_to_upsert(
-                dirty_address.id,
-                &account,
-                soul_decimals,
-                kcal_decimals,
-                now_unix_seconds,
-            );
+            let account_upsert =
+                account_info_to_upsert(dirty_address.id, &account, now_unix_seconds);
             let upsert_result =
                 explorer_db::upsert_address_account(&mut transaction, chain_id, &account_upsert)
                     .await?;

@@ -81,12 +81,12 @@ pub async fn list_tokens(
             token.burnable,
             token.mintable,
             token.decimals,
-            token.current_supply,
-            token.current_supply_raw,
-            token.max_supply,
-            token.max_supply_raw,
-            token.burned_supply,
-            token.burned_supply_raw,
+            trim_scale(token.current_supply_raw * power(10::numeric, -token.decimals))::text AS current_supply,
+            token.current_supply_raw::text AS current_supply_raw,
+            trim_scale(token.max_supply_raw * power(10::numeric, -token.decimals))::text AS max_supply,
+            token.max_supply_raw::text AS max_supply_raw,
+            trim_scale(token.burned_supply_raw * power(10::numeric, -token.decimals))::text AS burned_supply,
+            token.burned_supply_raw::text AS burned_supply_raw,
             token.script_raw,
             -- USD is the only currency the system prices; the per-currency columns and the
             -- token_logos tables were dropped (202608030004, empty/stale C# relics). The embed

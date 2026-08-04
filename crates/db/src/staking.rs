@@ -24,7 +24,7 @@ pub async fn upsert_current_stake_snapshots(
                 EXTRACT(EPOCH FROM date_trunc('month', to_timestamp($2::double precision)))::bigint AS month_unix_seconds
         ),
         soul AS (
-            SELECT COALESCE(NULLIF(current_supply_raw, '')::numeric, 0) AS supply_raw
+            SELECT COALESCE(current_supply_raw, 0) AS supply_raw
             FROM tokens
             WHERE chain_id = $1
               AND symbol = 'SOUL'
@@ -32,7 +32,7 @@ pub async fn upsert_current_stake_snapshots(
             LIMIT 1
         ),
         staked AS (
-            SELECT COALESCE(SUM(COALESCE(NULLIF(staked_amount_raw, '')::numeric, 0)), 0) AS staked_raw
+            SELECT COALESCE(SUM(COALESCE(staked_amount_raw, 0)), 0) AS staked_raw
             FROM addresses
             WHERE chain_id = $1
               AND address <> 'NULL'
@@ -526,7 +526,7 @@ async fn load_current_stake_snapshot_state(
 ) -> Result<StakeSnapshotState, DbError> {
     let soul_supply_raw = sqlx::query_scalar::<_, Option<String>>(
         r#"
-        SELECT current_supply_raw
+        SELECT current_supply_raw::text
         FROM tokens
         WHERE chain_id = $1
           AND symbol = 'SOUL'
@@ -544,12 +544,11 @@ async fn load_current_stake_snapshot_state(
 
     let rows = sqlx::query(
         r#"
-        SELECT address, staked_amount_raw
+        SELECT address, staked_amount_raw::text AS staked_amount_raw
         FROM addresses
         WHERE chain_id = $1
           AND address <> 'NULL'
-          AND NULLIF(staked_amount_raw, '') IS NOT NULL
-          AND NULLIF(staked_amount_raw, '')::numeric > 0
+          AND staked_amount_raw > 0
         "#,
     )
     .bind(chain_id)
@@ -607,20 +606,24 @@ async fn load_stake_snapshot_events(
                 event.payload_json->'market_event'->>'quote_symbol',
                 event.payload_json->'market_event'->>'quote_token'
             ) AS market_quote_symbol,
+            -- carbon_tx_data/script_raw are bytea; the markers ('Stake', 'Unstake',
+            -- 'Claim' as ASCII hex) decode to bytea and are searched directly.
             (
-                POSITION(DECODE('5374616B65', 'hex') IN DECODE(COALESCE(tx.carbon_tx_data, ''), 'hex')) > 0
-                OR POSITION(DECODE('5374616B65', 'hex') IN DECODE(COALESCE(tx.script_raw, ''), 'hex')) > 0
+                POSITION(DECODE('5374616B65', 'hex') IN COALESCE(tx.carbon_tx_data, ''::bytea)) > 0
+                OR POSITION(DECODE('5374616B65', 'hex') IN COALESCE(tx.script_raw, ''::bytea)) > 0
             ) AS tx_has_stake_call,
             (
-                POSITION(DECODE('556E7374616B65', 'hex') IN DECODE(COALESCE(tx.carbon_tx_data, ''), 'hex')) > 0
-                OR POSITION(DECODE('556E7374616B65', 'hex') IN DECODE(COALESCE(tx.script_raw, ''), 'hex')) > 0
+                POSITION(DECODE('556E7374616B65', 'hex') IN COALESCE(tx.carbon_tx_data, ''::bytea)) > 0
+                OR POSITION(DECODE('556E7374616B65', 'hex') IN COALESCE(tx.script_raw, ''::bytea)) > 0
             ) AS tx_has_unstake_call,
             (
-                POSITION(DECODE('436C61696D', 'hex') IN DECODE(COALESCE(tx.carbon_tx_data, ''), 'hex')) > 0
-                OR POSITION(DECODE('436C61696D', 'hex') IN DECODE(COALESCE(tx.script_raw, ''), 'hex')) > 0
+                POSITION(DECODE('436C61696D', 'hex') IN COALESCE(tx.carbon_tx_data, ''::bytea)) > 0
+                OR POSITION(DECODE('436C61696D', 'hex') IN COALESCE(tx.script_raw, ''::bytea)) > 0
             ) AS tx_has_claim_call,
-            LOWER(COALESCE(tx.carbon_tx_data, '')) = '0100000016000000080000000200000000000000'
-                AS tx_is_soul_apply_inflation,
+            COALESCE(
+                tx.carbon_tx_data = DECODE('0100000016000000080000000200000000000000', 'hex'),
+                FALSE
+            ) AS tx_is_soul_apply_inflation,
             tx.result AS tx_result
         FROM events event
         JOIN event_kinds event_kind
@@ -1236,6 +1239,136 @@ mod tests {
         assert_eq!(points[0].date_unix_seconds, day_one);
         assert_eq!(points[0].staked_soul_raw, "50");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stake_snapshot_event_loader_reads_bytea_tx_blobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // transactions.carbon_tx_data/script_raw are bytea (migration 202608040001);
+        // the loader's Stake/Unstake/Claim markers and the Token.ApplyInflation image
+        // must be matched as bytea. This is the query the forward projector feeds on —
+        // a text-typed predicate here fails the whole stake projection on the first
+        // new day (the skip-gate hides it on an already-built curve).
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let actor = format!("PTESTSTKLOAD{suffix}");
+        let timestamp = 1_800_600_000_i64;
+
+        let block = upsert_block(
+            &mut tx,
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_600_000),
+                hash: format!("TESTSTKLOADBLOCK{suffix}"),
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: timestamp,
+                reward: None,
+            },
+        )
+        .await?;
+        let seed_tx =
+            |tx_index: i32, carbon_tx_data: &str, result: Option<&str>| TransactionUpsert {
+                block_id: block.id,
+                chain_id,
+                tx_index,
+                hash: format!("TESTSTKLOADTX{tx_index}{suffix}"),
+                timestamp_unix_seconds: timestamp,
+                state: "Halt".to_owned(),
+                result: result.map(str::to_owned),
+                debug_comment: None,
+                payload: None,
+                script_raw: None,
+                fee_raw: None,
+                gas_price_raw: None,
+                gas_limit_raw: None,
+                sender: Some(actor.clone()),
+                gas_payer: Some(actor.clone()),
+                gas_target: Some(actor.clone()),
+                carbon_tx_type: None,
+                carbon_tx_data: Some(carbon_tx_data.to_owned()),
+                expiration_unix_seconds: 0,
+                signatures: Vec::new(),
+            };
+        let seed_event = |transaction_id: i32, kind: &str| EventUpsert {
+            transaction_id,
+            chain_id,
+            event_index: 0,
+            event_kind: kind.to_owned(),
+            event_name: None,
+            address: Some(actor.clone()),
+            target_address: None,
+            contract: Some("SOUL".to_owned()),
+            token_id: None,
+            raw_data: None,
+            payload_format: Some("live.v1".to_owned()),
+            payload_json: Some(serde_json::json!({
+                "token_event": { "token": "SOUL", "value_raw": "50" }
+            })),
+            timestamp_unix_seconds: timestamp,
+            burned: None,
+        };
+
+        // 'Stake' in ASCII hex inside the carbon tx image.
+        let stake_tx = upsert_transaction(&mut tx, seed_tx(0, "AA5374616B65BB", None)).await?;
+        replace_events(
+            &mut tx,
+            stake_tx.id,
+            &[seed_event(stake_tx.id, "TokenStake")],
+        )
+        .await?;
+        // The Token.ApplyInflation image, whose SOUL delta lives in tx.result
+        // (the literal from parse_carbon_intx_i64_raw's own test).
+        let inflation_tx = upsert_transaction(
+            &mut tx,
+            seed_tx(
+                1,
+                "0100000016000000080000000200000000000000",
+                Some("088AF5DD19852C0000"),
+            ),
+        )
+        .await?;
+        replace_events(
+            &mut tx,
+            inflation_tx.id,
+            &[seed_event(inflation_tx.id, "TokenMint")],
+        )
+        .await?;
+
+        let rows =
+            load_stake_snapshot_events(&mut tx, chain_id, timestamp - 5, timestamp + 5).await?;
+        let stake_row = rows
+            .iter()
+            .find(|row| row.tx_id == stake_tx.id)
+            .ok_or("the TokenStake row must be loaded")?;
+        assert!(stake_row.tx_has_stake_call, "'Stake' marker must match");
+        assert!(!stake_row.tx_has_unstake_call);
+        assert!(!stake_row.tx_has_claim_call);
+        assert!(stake_row.tx_apply_inflation_result_soul_delta_raw.is_none());
+
+        let inflation_row = rows
+            .iter()
+            .find(|row| row.tx_id == inflation_tx.id)
+            .ok_or("the ApplyInflation row must be loaded")?;
+        assert_eq!(
+            inflation_row.tx_apply_inflation_result_soul_delta_raw,
+            Some(BigInt::from(48_950_176_249_226_i64)),
+            "the ApplyInflation image must be recognized in bytea form"
+        );
+
+        tx.rollback().await?;
         Ok(())
     }
 

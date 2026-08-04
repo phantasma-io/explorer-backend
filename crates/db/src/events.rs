@@ -702,34 +702,7 @@ async fn upsert_tokens_for_transaction(
             SELECT
                 token_create_values.*,
                 token_contracts.id AS contract_id,
-                token_schema_values.carbon_token_schemas,
-                CASE
-                    WHEN max_supply_raw = '0' OR decimals = 0 THEN max_supply_raw
-                    WHEN length(max_supply_raw) <= decimals THEN
-                        COALESCE(
-                            NULLIF(
-                                regexp_replace(
-                                    trim(trailing '0' FROM '0.' || repeat('0', decimals - length(max_supply_raw)) || max_supply_raw),
-                                    '\.$',
-                                    ''
-                                ),
-                                ''
-                            ),
-                            '0'
-                        )
-                    ELSE
-                        COALESCE(
-                            NULLIF(
-                                regexp_replace(
-                                    trim(trailing '0' FROM left(max_supply_raw, length(max_supply_raw) - decimals) || '.' || right(max_supply_raw, decimals)),
-                                    '\.$',
-                                    ''
-                                ),
-                                ''
-                            ),
-                            '0'
-                        )
-                END AS max_supply
+                token_schema_values.carbon_token_schemas
             FROM token_create_values
             JOIN token_contracts
               ON token_contracts.chain_id = token_create_values.chain_id
@@ -749,9 +722,6 @@ async fn upsert_tokens_for_transaction(
             swappable,
             burnable,
             decimals,
-            current_supply,
-            max_supply,
-            burned_supply,
             script_raw,
             address_id,
             owner_id,
@@ -779,9 +749,6 @@ async fn upsert_tokens_for_transaction(
             swappable,
             burnable,
             decimals,
-            '0',
-            max_supply,
-            '0',
             NULL,
             address_id,
             address_id,
@@ -789,9 +756,9 @@ async fn upsert_tokens_for_transaction(
             chain_id,
             contract_id,
             event_id,
-            '0',
-            '0',
-            max_supply_raw,
+            0::numeric,
+            0::numeric,
+            NULLIF(max_supply_raw, '')::numeric,
             mintable,
             name,
             carbon_token_schemas,
@@ -813,7 +780,6 @@ async fn upsert_tokens_for_transaction(
             mintable = EXCLUDED.mintable,
             address_id = EXCLUDED.address_id,
             owner_id = EXCLUDED.owner_id,
-            max_supply = EXCLUDED.max_supply,
             max_supply_raw = EXCLUDED.max_supply_raw,
             create_event_id = EXCLUDED.create_event_id,
             carbon_token_schemas = CASE
@@ -1775,11 +1741,8 @@ mod tests {
                 debug_comment: None,
                 payload: None,
                 script_raw: None,
-                fee: None,
                 fee_raw: None,
-                gas_price: None,
                 gas_price_raw: None,
-                gas_limit: None,
                 gas_limit_raw: None,
                 sender: Some(owner.clone()),
                 gas_payer: Some(owner.clone()),
@@ -1951,11 +1914,8 @@ mod tests {
                 debug_comment: None,
                 payload: None,
                 script_raw: None,
-                fee: None,
                 fee_raw: None,
-                gas_price: None,
                 gas_price_raw: None,
-                gas_limit: None,
                 gas_limit_raw: None,
                 sender: Some(owner.clone()),
                 gas_payer: Some(owner.clone()),
@@ -2176,11 +2136,8 @@ mod tests {
                 debug_comment: None,
                 payload: None,
                 script_raw: None,
-                fee: None,
                 fee_raw: None,
-                gas_price: None,
                 gas_price_raw: None,
-                gas_limit: None,
                 gas_limit_raw: None,
                 sender: Some(owner.clone()),
                 gas_payer: Some(owner.clone()),
@@ -2256,11 +2213,8 @@ mod tests {
                 debug_comment: None,
                 payload: None,
                 script_raw: None,
-                fee: None,
                 fee_raw: None,
-                gas_price: None,
                 gas_price_raw: None,
-                gas_limit: None,
                 gas_limit_raw: None,
                 sender: Some(owner.clone()),
                 gas_payer: Some(owner.clone()),
@@ -2373,9 +2327,6 @@ mod tests {
                 swappable,
                 burnable,
                 decimals,
-                current_supply,
-                max_supply,
-                burned_supply,
                 address_id,
                 owner_id,
                 price_usd,
@@ -2399,17 +2350,14 @@ mod tests {
                 FALSE,
                 TRUE,
                 $3,
-                '0',
-                '0',
-                '0',
                 $4,
                 $4,
                 0,
                 $5,
                 $6,
-                '0',
-                '0',
-                '0',
+                0,
+                0,
+                0,
                 TRUE,
                 $1
             )

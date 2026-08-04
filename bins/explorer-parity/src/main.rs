@@ -302,7 +302,7 @@ WITH rows AS (
             block.protocol::text,
             COALESCE(chain_address.address, '<NULL>'),
             COALESCE(validator_address.address, '<NULL>'),
-            COALESCE(block.reward, '<NULL>')
+            COALESCE(block.reward::text, '<NULL>')
         ] AS fields
     FROM blocks block
     JOIN chains chain ON chain.id = block.chain_id
@@ -328,21 +328,18 @@ WITH rows AS (
             tx.hash,
             tx.timestamp_unix_seconds::text,
             COALESCE(tx.payload, '<NULL>'),
-            COALESCE(tx.script_raw, '<NULL>'),
+            COALESCE(upper(encode(tx.script_raw, 'hex')), '<NULL>'),
             COALESCE(tx.result, '<NULL>'),
-            COALESCE(tx.fee, '<NULL>'),
-            COALESCE(tx.fee_raw, '<NULL>'),
+            COALESCE(tx.fee_raw::text, '<NULL>'),
             tx.expiration::text,
             state.name,
-            COALESCE(tx.gas_price, '<NULL>'),
-            COALESCE(tx.gas_price_raw, '<NULL>'),
-            COALESCE(tx.gas_limit, '<NULL>'),
-            COALESCE(tx.gas_limit_raw, '<NULL>'),
+            COALESCE(tx.gas_price_raw::text, '<NULL>'),
+            COALESCE(tx.gas_limit_raw::text, '<NULL>'),
             COALESCE(sender.address, '<NULL>'),
             COALESCE(gas_payer.address, '<NULL>'),
             COALESCE(gas_target.address, '<NULL>'),
             COALESCE(tx.carbon_tx_type::text, '<NULL>'),
-            COALESCE(tx.carbon_tx_data, '<NULL>'),
+            COALESCE(upper(encode(tx.carbon_tx_data, 'hex')), '<NULL>'),
             COALESCE(tx.debug_comment, '<NULL>')
         ] AS fields
     FROM transactions tx
@@ -466,7 +463,7 @@ WITH rows AS (
             block.protocol::text,
             COALESCE(chain_address.address, '<NULL>'),
             COALESCE(validator_address.address, '<NULL>'),
-            COALESCE(block.reward, '<NULL>')
+            COALESCE(block.reward::text, '<NULL>')
         ] AS fields
     FROM blocks block
     JOIN chains chain ON chain.id = block.chain_id
@@ -494,21 +491,18 @@ WITH rows AS (
             tx.hash,
             tx.timestamp_unix_seconds::text,
             COALESCE(tx.payload, '<NULL>'),
-            COALESCE(tx.script_raw, '<NULL>'),
+            COALESCE(upper(encode(tx.script_raw, 'hex')), '<NULL>'),
             COALESCE(tx.result, '<NULL>'),
-            COALESCE(tx.fee, '<NULL>'),
-            COALESCE(tx.fee_raw, '<NULL>'),
+            COALESCE(tx.fee_raw::text, '<NULL>'),
             tx.expiration::text,
             state.name,
-            COALESCE(tx.gas_price, '<NULL>'),
-            COALESCE(tx.gas_price_raw, '<NULL>'),
-            COALESCE(tx.gas_limit, '<NULL>'),
-            COALESCE(tx.gas_limit_raw, '<NULL>'),
+            COALESCE(tx.gas_price_raw::text, '<NULL>'),
+            COALESCE(tx.gas_limit_raw::text, '<NULL>'),
             COALESCE(sender.address, '<NULL>'),
             COALESCE(gas_payer.address, '<NULL>'),
             COALESCE(gas_target.address, '<NULL>'),
             COALESCE(tx.carbon_tx_type::text, '<NULL>'),
-            COALESCE(tx.carbon_tx_data, '<NULL>'),
+            COALESCE(upper(encode(tx.carbon_tx_data, 'hex')), '<NULL>'),
             COALESCE(tx.debug_comment, '<NULL>')
         ] AS fields
     FROM transactions tx

@@ -570,7 +570,7 @@ pub async fn list_event_tokens_by_symbols(
             token.burnable,
             token.mintable,
             token.decimals,
-            token.max_supply_raw
+            token.max_supply_raw::text AS max_supply_raw
         FROM tokens token
         WHERE token.symbol = ANY($1)
         "#,
@@ -639,11 +639,8 @@ mod tests {
                 debug_comment: None,
                 payload: None,
                 script_raw: None,
-                fee: None,
                 fee_raw: None,
-                gas_price: None,
                 gas_price_raw: None,
-                gas_limit: None,
                 gas_limit_raw: None,
                 sender: Some(actor.clone()),
                 gas_payer: Some(actor.clone()),
