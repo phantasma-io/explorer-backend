@@ -67,7 +67,6 @@ pub struct TransactionPage {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TransactionFilter<'a> {
     pub hash: Option<&'a str>,
-    pub hash_partial: Option<&'a str>,
     pub block_height: Option<i64>,
     pub block_hash: Option<&'a str>,
     pub chain_id: Option<i32>,
@@ -212,31 +211,29 @@ pub async fn list_transactions_global(
         LEFT JOIN addresses gas_target ON gas_target.id = tx.gas_target_id
         WHERE ($1::integer IS NULL OR block.chain_id = $1)
           AND ($2::text IS NULL OR tx.hash = $2)
-          AND ($3::text IS NULL OR tx.hash ILIKE $3)
-          AND ($4::bigint IS NULL OR block.height = $4)
-          AND ($5::text IS NULL OR block.hash = $5)
-          AND ($6::integer IS NULL OR tx.state_id = $6)
-          AND ($7::bigint IS NULL OR tx.timestamp_unix_seconds >= $7)
-          AND ($8::bigint IS NULL OR tx.timestamp_unix_seconds <= $8)
+          AND ($3::bigint IS NULL OR block.height = $3)
+          AND ($4::text IS NULL OR block.hash = $4)
+          AND ($5::integer IS NULL OR tx.state_id = $5)
+          AND ($6::bigint IS NULL OR tx.timestamp_unix_seconds >= $6)
+          AND ($7::bigint IS NULL OR tx.timestamp_unix_seconds <= $7)
           AND (
-              ($12::text IS NULL AND $13::bigint IS NULL)
-              OR ($12::text IS NOT NULL AND (tx.hash ILIKE $12 OR block.hash ILIKE $12))
-              OR ($13::bigint IS NOT NULL AND block.height = $13)
+              ($11::text IS NULL AND $12::bigint IS NULL)
+              OR ($11::text IS NOT NULL AND (tx.hash ILIKE $11 OR block.hash ILIKE $11))
+              OR ($12::bigint IS NOT NULL AND block.height = $12)
           )
           AND (
-              $9::bigint IS NULL
-              OR {column} {op} $9
-              OR ({column} = $9 AND tx.id {op} $10)
+              $8::bigint IS NULL
+              OR {column} {op} $8
+              OR ({column} = $8 AND tx.id {op} $9)
           )
         ORDER BY {column} {dir}, tx.id {dir}
-        LIMIT $11
+        LIMIT $10
         "#,
         column = page.order_by.column(),
     );
     let rows = sqlx::query(&sql)
         .bind(filter.chain_id)
         .bind(filter.hash)
-        .bind(filter.hash_partial)
         .bind(filter.block_height)
         .bind(filter.block_hash)
         .bind(filter.state_id)
@@ -403,31 +400,29 @@ pub async fn list_transactions_for_filtered_address(
         LEFT JOIN addresses gas_target ON gas_target.id = tx.gas_target_id
         WHERE address_tx.address_id = $1
           AND ($2::text IS NULL OR tx.hash = $2)
-          AND ($3::text IS NULL OR tx.hash ILIKE $3)
-          AND ($4::bigint IS NULL OR block.height = $4)
-          AND ($5::text IS NULL OR block.hash = $5)
-          AND ($6::integer IS NULL OR block.chain_id = $6)
-          AND ($7::integer IS NULL OR tx.state_id = $7)
-          AND ($8::bigint IS NULL OR tx.timestamp_unix_seconds >= $8)
-          AND ($9::bigint IS NULL OR tx.timestamp_unix_seconds <= $9)
+          AND ($3::bigint IS NULL OR block.height = $3)
+          AND ($4::text IS NULL OR block.hash = $4)
+          AND ($5::integer IS NULL OR block.chain_id = $5)
+          AND ($6::integer IS NULL OR tx.state_id = $6)
+          AND ($7::bigint IS NULL OR tx.timestamp_unix_seconds >= $7)
+          AND ($8::bigint IS NULL OR tx.timestamp_unix_seconds <= $8)
           AND (
-              ($13::text IS NULL AND $14::bigint IS NULL)
-              OR ($13::text IS NOT NULL AND (tx.hash ILIKE $13 OR block.hash ILIKE $13))
-              OR ($14::bigint IS NOT NULL AND block.height = $14)
+              ($12::text IS NULL AND $13::bigint IS NULL)
+              OR ($12::text IS NOT NULL AND (tx.hash ILIKE $12 OR block.hash ILIKE $12))
+              OR ($13::bigint IS NOT NULL AND block.height = $13)
           )
           AND (
-              $10::bigint IS NULL
-              OR {column} {op} $10
-              OR ({column} = $10 AND address_tx.id {op} $11)
+              $9::bigint IS NULL
+              OR {column} {op} $9
+              OR ({column} = $9 AND address_tx.id {op} $10)
           )
         ORDER BY {column} {dir}, address_tx.id {dir}
-        LIMIT $12
+        LIMIT $11
         "#,
     );
     let rows = sqlx::query(&sql)
         .bind(address_id)
         .bind(filter.hash)
-        .bind(filter.hash_partial)
         .bind(filter.block_height)
         .bind(filter.block_hash)
         .bind(filter.chain_id)

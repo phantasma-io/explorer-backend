@@ -135,7 +135,6 @@ pub struct BlockUpsert {
     pub chain: ChainName,
     pub height: BlockHeight,
     pub hash: String,
-    pub previous_hash: Option<String>,
     pub protocol: Option<i32>,
     pub chain_address: Option<String>,
     pub validator_address: Option<String>,
@@ -154,7 +153,6 @@ pub struct BlockRecord {
     pub chain: String,
     pub height: i64,
     pub hash: String,
-    pub previous_hash: Option<String>,
     pub protocol: Option<i32>,
     pub chain_address_id: i32,
     pub chain_address: Option<String>,
@@ -407,19 +405,13 @@ pub struct TokenMetadataUpsert {
     pub metadata: Value,
 }
 
-/// Live token price in every fiat currency the explorer serves. `None` fields are
-/// left untouched on update so an unavailable fiat pairing never clobbers a good one.
+/// Live token USD price. `None` is left untouched on update so an unavailable
+/// pairing never clobbers a value that is already there. USD is the only currency
+/// the system prices (202608030004 dropped the per-currency columns).
 #[derive(Debug, Clone)]
 pub struct TokenPriceUpsert {
     pub symbol: String,
     pub price_usd: Option<f64>,
-    pub price_eur: Option<f64>,
-    pub price_gbp: Option<f64>,
-    pub price_jpy: Option<f64>,
-    pub price_cad: Option<f64>,
-    pub price_aud: Option<f64>,
-    pub price_cny: Option<f64>,
-    pub price_rub: Option<f64>,
 }
 
 /// One historical daily USD close for a token, feeding `token_daily_prices`
@@ -1107,10 +1099,9 @@ pub async fn update_token_metadata(
     Ok(result.rows_affected())
 }
 
-/// Refreshes the live `tokens.price_*` columns from an external price feed.
-/// Mirrors the C# CoinGecko plugin's `TokenMethods.SetPrice`: one UPDATE across all
-/// fiat columns, `COALESCE`-guarded so a missing fiat pairing never clobbers a value
-/// that is already there. Returns the number of token rows touched.
+/// Refreshes the live `tokens.price_usd` column from an external price feed,
+/// `COALESCE`-guarded so a missing pairing never clobbers a value that is already
+/// there. Returns the number of token rows touched.
 pub async fn update_token_prices(
     conn: &mut PgConnection,
     chain_id: i32,
@@ -1122,47 +1113,12 @@ pub async fn update_token_prices(
 
     let symbols = prices.iter().map(|p| p.symbol.clone()).collect::<Vec<_>>();
     let usd = prices.iter().map(|p| p.price_usd).collect::<Vec<_>>();
-    let eur = prices.iter().map(|p| p.price_eur).collect::<Vec<_>>();
-    let gbp = prices.iter().map(|p| p.price_gbp).collect::<Vec<_>>();
-    let jpy = prices.iter().map(|p| p.price_jpy).collect::<Vec<_>>();
-    let cad = prices.iter().map(|p| p.price_cad).collect::<Vec<_>>();
-    let aud = prices.iter().map(|p| p.price_aud).collect::<Vec<_>>();
-    let cny = prices.iter().map(|p| p.price_cny).collect::<Vec<_>>();
-    let rub = prices.iter().map(|p| p.price_rub).collect::<Vec<_>>();
 
     let result = sqlx::query(
         r#"
         UPDATE tokens token
-        SET
-            price_usd = COALESCE(desired.price_usd, token.price_usd),
-            price_eur = COALESCE(desired.price_eur, token.price_eur),
-            price_gbp = COALESCE(desired.price_gbp, token.price_gbp),
-            price_jpy = COALESCE(desired.price_jpy, token.price_jpy),
-            price_cad = COALESCE(desired.price_cad, token.price_cad),
-            price_aud = COALESCE(desired.price_aud, token.price_aud),
-            price_cny = COALESCE(desired.price_cny, token.price_cny),
-            price_rub = COALESCE(desired.price_rub, token.price_rub)
-        FROM UNNEST(
-            $2::text[],
-            $3::double precision[],
-            $4::double precision[],
-            $5::double precision[],
-            $6::double precision[],
-            $7::double precision[],
-            $8::double precision[],
-            $9::double precision[],
-            $10::double precision[]
-        ) AS desired(
-            symbol,
-            price_usd,
-            price_eur,
-            price_gbp,
-            price_jpy,
-            price_cad,
-            price_aud,
-            price_cny,
-            price_rub
-        )
+        SET price_usd = COALESCE(desired.price_usd, token.price_usd)
+        FROM UNNEST($2::text[], $3::double precision[]) AS desired(symbol, price_usd)
         WHERE token.chain_id = $1
           AND token.symbol = desired.symbol
         "#,
@@ -1170,13 +1126,6 @@ pub async fn update_token_prices(
     .bind(chain_id)
     .bind(&symbols)
     .bind(&usd)
-    .bind(&eur)
-    .bind(&gbp)
-    .bind(&jpy)
-    .bind(&cad)
-    .bind(&aud)
-    .bind(&cny)
-    .bind(&rub)
     .execute(&mut *conn)
     .await?;
 
@@ -1660,19 +1609,17 @@ pub async fn upsert_block(
             r#"
             UPDATE blocks
             SET hash = $2,
-                previous_hash = $3,
-                protocol = $4,
-                chain_address_id = $5,
-                validator_address_id = $6,
-                producer_address_id = $7,
-                timestamp_unix_seconds = $8,
-                reward = $9
+                protocol = $3,
+                chain_address_id = $4,
+                validator_address_id = $5,
+                producer_address_id = $6,
+                timestamp_unix_seconds = $7,
+                reward = $8
             WHERE id = $1
             "#,
         )
         .bind(id)
         .bind(&block.hash)
-        .bind(&block.previous_hash)
         .bind(block.protocol.unwrap_or_default())
         .bind(chain_address_id)
         .bind(validator_address_id)
@@ -1690,14 +1637,13 @@ pub async fn upsert_block(
                 timestamp_unix_seconds,
                 chain_id,
                 hash,
-                previous_hash,
                 protocol,
                 chain_address_id,
                 validator_address_id,
                 producer_address_id,
                 reward
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id
             "#,
         )
@@ -1705,7 +1651,6 @@ pub async fn upsert_block(
         .bind(block.timestamp_unix_seconds)
         .bind(chain_id)
         .bind(&block.hash)
-        .bind(&block.previous_hash)
         .bind(block.protocol.unwrap_or_default())
         .bind(chain_address_id)
         .bind(validator_address_id)
@@ -1721,7 +1666,6 @@ pub async fn upsert_block(
         chain: block.chain.to_string(),
         height,
         hash: block.hash,
-        previous_hash: block.previous_hash,
         protocol: block.protocol,
         chain_address_id,
         chain_address: Some(chain_address.to_owned()),
@@ -2492,13 +2436,12 @@ mod tests {
             INSERT INTO tokens (
                 symbol, fungible, transferable, finite, divisible, fuel, stakable, fiat,
                 swappable, burnable, decimals, current_supply, max_supply, burned_supply,
-                address_id, owner_id, price_usd, price_eur, price_gbp, price_jpy,
-                price_cad, price_aud, price_cny, price_rub, chain_id, contract_id,
+                address_id, owner_id, price_usd, chain_id, contract_id,
                 burned_supply_raw, current_supply_raw, max_supply_raw, mintable, name
             )
             VALUES (
                 $1, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, 8,
-                '0', '0', '0', $2, $2, 0, 0, 0, 0, 0, 0, 0, 0, $3, $4,
+                '0', '0', '0', $2, $2, 0, $3, $4,
                 '0', '0', '0', TRUE, $1
             )
             "#,

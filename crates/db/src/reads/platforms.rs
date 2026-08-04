@@ -60,34 +60,12 @@ pub async fn list_platforms(
             platform.name,
             platform.chain,
             platform.fuel,
-            CASE WHEN $2::boolean THEN (
-                SELECT COALESCE(jsonb_agg(jsonb_build_object(
-                    'hash', external.hash,
-                    'token', jsonb_build_object('symbol', token.symbol)
-                ) ORDER BY external.id), '[]'::jsonb)
-                FROM externals external
-                LEFT JOIN tokens token ON token.id = external.token_id
-                WHERE external.platform_id = platform.id
-            ) ELSE NULL END AS externals_json,
-            CASE WHEN $3::boolean THEN (
-                SELECT COALESCE(jsonb_agg(jsonb_build_object(
-                    'external_address', interop.external,
-                    'local_address', jsonb_build_object(
-                        'address', address.address,
-                        'address_name', address.address_name
-                    )
-                ) ORDER BY interop.id), '[]'::jsonb)
-                FROM platform_interops interop
-                LEFT JOIN addresses address ON address.id = interop.local_address_id
-                WHERE interop.platform_id = platform.id
-            ) ELSE NULL END AS platform_interops_json,
-            CASE WHEN $4::boolean THEN (
-                SELECT COALESCE(jsonb_agg(jsonb_build_object(
-                    'name', platform_token.name
-                ) ORDER BY platform_token.id), '[]'::jsonb)
-                FROM platform_tokens platform_token
-                WHERE platform_token.platform_id = platform.id
-            ) ELSE NULL END AS platform_tokens_json,
+            -- The externals/platform_interops/platform_tokens satellite tables were dropped
+            -- (202608030004): empty through all of mainnet history with no writer in this
+            -- codebase. The embed flags keep their response shape — an empty list when asked for.
+            CASE WHEN $2::boolean THEN '[]'::jsonb ELSE NULL END AS externals_json,
+            CASE WHEN $3::boolean THEN '[]'::jsonb ELSE NULL END AS platform_interops_json,
+            CASE WHEN $4::boolean THEN '[]'::jsonb ELSE NULL END AS platform_tokens_json,
             create_event.id AS create_event_id,
             create_event.event_index AS create_event_index,
             create_chain.name AS create_chain,

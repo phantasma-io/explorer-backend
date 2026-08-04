@@ -117,55 +117,6 @@ pub(crate) async fn chains(
     }))
 }
 
-pub(crate) async fn oracles(
-    State(state): State<ApiState>,
-    Query(query): Query<OracleListQuery>,
-) -> Result<Json<OracleListResponse>, ApiError> {
-    let limit = clamp_limit(query.limit);
-    let offset = nonnegative_offset(query.offset)?;
-    let chain = query_chain(query.chain, state.chain.as_str());
-    let chain_id = resolve_chain_id_by_name(&state.pool, &chain).await?;
-    let order_by_param = empty_to_none(query.order_by);
-    let order_by = OracleOrderBy::from_api_param(order_by_param.as_deref()).ok_or_else(|| {
-        ApiError::BadRequest(format!(
-            "unsupported order_by '{}'",
-            order_by_param.as_deref().unwrap_or_default()
-        ))
-    })?;
-    let direction = parse_sort_direction(query.order_direction.as_deref())?;
-    let block_hash = empty_to_none(query.block_hash);
-    let block_height =
-        parse_optional_i64(empty_to_none(query.block_height).as_deref(), "block_height")?;
-    if block_hash.is_none() && block_height.is_none() {
-        return Err(ApiError::BadRequest(
-            "Need either block_hash or block_height != null".to_owned(),
-        ));
-    }
-
-    let filter = OracleFilter {
-        chain_id,
-        block_hash: block_hash.as_deref(),
-        block_height,
-    };
-    let rows = list_oracles(&state.pool, &filter, order_by, direction, limit, offset).await?;
-    let total_results = if query.with_total == Some(1) {
-        Some(count_oracles(&state.pool, &filter).await?)
-    } else {
-        None
-    };
-
-    Ok(Json(OracleListResponse {
-        total_results,
-        oracles: rows
-            .into_iter()
-            .map(|row| OracleResponse {
-                url: row.url,
-                content: row.content,
-            })
-            .collect(),
-    }))
-}
-
 pub(crate) async fn history_prices(
     State(state): State<ApiState>,
     Query(query): Query<HistoryPriceListQuery>,
@@ -328,7 +279,6 @@ pub(crate) async fn blocks(
     let id = empty_to_none(query.id).map(normalize_block_id);
     let id_height = id.as_deref().and_then(|value| value.parse::<i64>().ok());
     let hash = empty_to_none(query.hash).map(|value| value.to_uppercase());
-    let hash_partial = empty_to_none(query.hash_partial).map(|value| format!("%{value}%"));
     let height = parse_optional_i64(empty_to_none(query.height).as_deref(), "height")?;
     let q = empty_to_none(query.q);
     let q_height = parse_optional_i64(q.as_deref(), "q").ok().flatten();
@@ -351,7 +301,6 @@ pub(crate) async fn blocks(
         id: id.as_deref(),
         id_height,
         hash: hash.as_deref(),
-        hash_partial: hash_partial.as_deref(),
         height,
         q_height,
         q_hash: q_hash.as_deref(),
@@ -1088,37 +1037,6 @@ pub(crate) async fn searches(
     Ok(Json(SearchListResponse { result }))
 }
 
-pub(crate) async fn rejected_transactions(
-    State(state): State<ApiState>,
-    Query(query): Query<RejectedTransactionQuery>,
-) -> Result<Json<RejectedTransactionListResponse>, ApiError> {
-    let hash = normalized_required_path(
-        "hash",
-        query
-            .hash
-            .ok_or_else(|| ApiError::BadRequest("hash is required".to_owned()))?,
-    )?
-    .to_uppercase();
-    let chain = query_chain(query.chain, state.chain.as_str());
-    let _ = query.capture.unwrap_or_default();
-
-    let canonical_exists =
-        rejected_transaction_canonical_exists(&state.pool, hash.as_str(), chain.as_str()).await?;
-
-    if canonical_exists {
-        return Ok(Json(RejectedTransactionListResponse {
-            rejected_transactions: Vec::new(),
-        }));
-    }
-
-    let rows =
-        list_rejected_transaction_candidates(&state.pool, hash.as_str(), chain.as_str()).await?;
-
-    Ok(Json(RejectedTransactionListResponse {
-        rejected_transactions: rows.iter().map(rejected_transaction_from_row).collect(),
-    }))
-}
-
 #[utoipa::path(
     get,
     path = "/api/v1/events/{id}/resolution-calls",
@@ -1377,7 +1295,6 @@ pub(crate) async fn load_transactions(
 ) -> Result<TransactionListResponse, ApiError> {
     let limit = clamp_limit(query.limit);
     let hash = empty_to_none(query.hash);
-    let hash_partial = empty_to_none(query.hash_partial).map(|value| format!("%{value}%"));
     let block_hash = empty_to_none(query.block_hash);
     let address = empty_to_none(query.address);
     // The global and address-scoped transaction lists page over different id
@@ -1411,7 +1328,6 @@ pub(crate) async fn load_transactions(
     let direction = parse_sort_direction(query.order_direction.as_deref())?;
     let filter = TransactionFilter {
         hash: hash.as_deref(),
-        hash_partial: hash_partial.as_deref(),
         block_height: query.block_height,
         block_hash: block_hash.as_deref(),
         chain_id,
@@ -1438,7 +1354,6 @@ pub(crate) async fn load_transactions(
         match address_id_by_address(&state.pool, &address).await? {
             Some(address_id) => {
                 if hash.is_none()
-                    && hash_partial.is_none()
                     && query.block_height.is_none()
                     && block_hash.is_none()
                     && chain_id.is_none()

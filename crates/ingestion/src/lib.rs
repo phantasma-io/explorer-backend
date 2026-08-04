@@ -376,7 +376,6 @@ fn block_result_to_projection(
         chain: chain.clone(),
         height,
         hash,
-        previous_hash: non_empty_string(&block.previous_hash),
         protocol: Some(i32::try_from(block.protocol).map_err(|_| {
             IngestionError::BlockFieldOutOfRange {
                 height: height.value(),
@@ -2594,13 +2593,12 @@ mod tests {
             projection,
             Ok(BlockUpsert {
                 hash,
-                previous_hash: Some(previous_hash),
                 protocol: Some(18),
                 // Pre-v2 blocks carry no producerAddress on the wire; the
                 // projection must leave it None, never default it.
                 producer_address: None,
                 ..
-            }) if hash == "ABC" && previous_hash == "PREV"
+            }) if hash == "ABC"
         ));
         Ok(())
     }
@@ -2997,7 +2995,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 42,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(18),
             chain_address_id: 1,
             chain_address: None,
@@ -3078,7 +3075,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 42,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(19),
             chain_address_id: 1,
             chain_address: None,
@@ -3235,7 +3231,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 8784909,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(19),
             chain_address_id: 1,
             chain_address: None,
@@ -3395,7 +3390,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 42,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(18),
             chain_address_id: 1,
             chain_address: None,
@@ -3589,7 +3583,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 8_785_038,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(18),
             chain_address_id: 1,
             chain_address: None,
@@ -3683,7 +3676,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 8_785_036,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(18),
             chain_address_id: 1,
             chain_address: None,
@@ -3890,7 +3882,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 42,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(19),
             chain_address_id: 1,
             chain_address: None,
@@ -3996,7 +3987,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 8_784_699,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(19),
             chain_address_id: 1,
             chain_address: None,
@@ -4162,7 +4152,6 @@ mod tests {
             chain: "main".to_owned(),
             height: 42,
             hash: "BLOCK".to_owned(),
-            previous_hash: None,
             protocol: Some(19),
             chain_address_id: 1,
             chain_address: None,

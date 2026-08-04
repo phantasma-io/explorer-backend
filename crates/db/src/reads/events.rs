@@ -227,7 +227,7 @@ pub async fn list_events_global(
           )
           AND ($20::text IS NULL OR nft.name ILIKE $20)
           AND ($21::text IS NULL OR nft.description ILIKE $21)
-          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22 OR address.user_name ILIKE $22)
+          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22)
           AND (
               $7::bigint IS NULL
               OR {column} {op} $7
@@ -372,7 +372,7 @@ pub async fn list_events_by_address(
           )
           AND ($20::text IS NULL OR nft.name ILIKE $20)
           AND ($21::text IS NULL OR nft.description ILIKE $21)
-          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22 OR address.user_name ILIKE $22)
+          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22)
           AND (
               $7::bigint IS NULL
               OR {column} {op} $7
@@ -617,7 +617,6 @@ mod tests {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_300_000),
                 hash: format!("TESTEVADDRBLOCK{suffix}"),
-                previous_hash: None,
                 protocol: Some(19),
                 chain_address: Some("NULL".to_owned()),
                 validator_address: Some("NULL".to_owned()),

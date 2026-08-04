@@ -15,8 +15,9 @@ use explorer_db::TokenPriceUpsert;
 pub const COINGECKO_BASE_URL: &str = "https://api.coingecko.com/api/v3";
 
 /// Fiat currencies the explorer stores (the `tokens.price_*` columns), lower-cased
-/// for the CoinGecko `vs_currencies` query. Mirrors C# `GetSupportedFiatSymbols`.
-pub const FIAT_SYMBOLS: [&str; 8] = ["usd", "eur", "gbp", "jpy", "cad", "aud", "cny", "rub"];
+/// for the CoinGecko `vs_currencies` query. USD only: the per-currency price
+/// columns were dropped (202608030004) as stale C# relics nothing rendered.
+pub const FIAT_SYMBOLS: [&str; 1] = ["usd"];
 
 /// Native token symbols that have a CoinGecko listing, in a stable order. GOATI is
 /// intentionally absent: it has no listing and is pegged to SOUL's price (as in C#).
@@ -131,19 +132,12 @@ pub async fn fetch_live_prices(
         upserts.push(TokenPriceUpsert {
             symbol: symbol.to_owned(),
             price_usd: fiat.get("usd").copied(),
-            price_eur: fiat.get("eur").copied(),
-            price_gbp: fiat.get("gbp").copied(),
-            price_jpy: fiat.get("jpy").copied(),
-            price_cad: fiat.get("cad").copied(),
-            price_aud: fiat.get("aud").copied(),
-            price_cny: fiat.get("cny").copied(),
-            price_rub: fiat.get("rub").copied(),
         });
     }
 
-    // GOATI has no CoinGecko listing; peg its live price to SOUL's across all fiat,
-    // matching C# (the daily-history backfill pegs GOATI to SOUL's USD too). Without
-    // this, GOATI's live price would stay stale.
+    // GOATI has no CoinGecko listing; peg its live price to SOUL's, matching C#
+    // (the daily-history backfill pegs GOATI to SOUL's USD too). Without this,
+    // GOATI's live price would stay stale.
     if let Some(soul) = upserts
         .iter()
         .find(|upsert| upsert.symbol == "SOUL")

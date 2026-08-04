@@ -11,22 +11,20 @@ use explorer_db::{
     AddressFilter, AddressOrderBy, BlockFilter, BlockOrderBy, ContractFilter,
     ContractMethodHistoryFilter, ContractMethodHistoryOrderBy, ContractOrderBy, DbError,
     EventFilter, EventKindOrderBy, EventOrderBy, EventPage, HistoryPriceFilter,
-    HistoryPriceOrderBy, NftFilter, NftOrderBy, OracleFilter, OracleOrderBy, OrganizationFilter,
-    OrganizationOrderBy, OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy,
-    RejectedTransactionRow, SeriesFilter, SeriesOrderBy, SortDirection, TokenFilter, TokenOrderBy,
-    TransactionFilter, TransactionOrderBy, TransactionPage, address_id_by_address, block_detail,
-    chain_ids_by_name, check_health, circulating_soul_supply, count_chains,
-    count_contract_method_histories, count_event_kinds, count_history_prices, count_oracles,
-    count_platforms, event_kind_id_by_name, event_kind_ids_by_name_like, event_payload_by_id,
-    list_addresses, list_blocks, list_chains, list_contract_method_histories, list_contracts,
-    list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
+    HistoryPriceOrderBy, NftFilter, NftOrderBy, OrganizationFilter, OrganizationOrderBy,
+    OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy, SeriesFilter, SeriesOrderBy,
+    SortDirection, TokenFilter, TokenOrderBy, TransactionFilter, TransactionOrderBy,
+    TransactionPage, address_id_by_address, block_detail, chain_ids_by_name, check_health,
+    circulating_soul_supply, count_chains, count_contract_method_histories, count_event_kinds,
+    count_history_prices, count_platforms, event_kind_id_by_name, event_kind_ids_by_name_like,
+    event_payload_by_id, list_addresses, list_blocks, list_chains, list_contract_method_histories,
+    list_contracts, list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
     list_events_by_address, list_events_by_transaction_ids, list_events_global,
-    list_history_prices, list_nfts, list_oracles, list_organizations, list_platforms,
-    list_rejected_transaction_candidates, list_series, list_signatures,
-    list_soul_masters_monthlies, list_staking_dailies, list_tokens, list_transaction_occurrences,
-    list_transactions_by_block_ids, list_transactions_for_address_timeline,
-    list_transactions_for_filtered_address, list_transactions_global, new_address_dailies,
-    overview_counts, rejected_transaction_canonical_exists, search_existence,
+    list_history_prices, list_nfts, list_organizations, list_platforms, list_series,
+    list_signatures, list_soul_masters_monthlies, list_staking_dailies, list_tokens,
+    list_transaction_occurrences, list_transactions_by_block_ids,
+    list_transactions_for_address_timeline, list_transactions_for_filtered_address,
+    list_transactions_global, new_address_dailies, overview_counts, search_existence,
     single_transaction_by_hash, transaction_by_hash_block_index, transaction_neighbors,
     transaction_occurrence_count, transaction_row_by_block_index, transaction_state_id_by_name,
 };
@@ -208,7 +206,6 @@ struct BlockListQuery {
     order_direction: Option<String>,
     id: Option<String>,
     hash: Option<String>,
-    hash_partial: Option<String>,
     height: Option<String>,
     q: Option<String>,
     chain: Option<String>,
@@ -701,45 +698,6 @@ struct SearchListResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct RejectedTransactionQuery {
-    hash: Option<String>,
-    chain: Option<String>,
-    capture: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-struct RejectedTransactionResponse {
-    hash: String,
-    nexus: String,
-    chain: String,
-    block_height: Option<String>,
-    block_hash: Option<String>,
-    date: Option<String>,
-    state: Option<String>,
-    result: Option<String>,
-    debug_comment: Option<String>,
-    payload: Option<String>,
-    script_raw: Option<String>,
-    fee_raw: Option<String>,
-    expiration: Option<String>,
-    gas_price_raw: Option<String>,
-    gas_limit_raw: Option<String>,
-    sender: Option<String>,
-    gas_payer: Option<String>,
-    gas_target: Option<String>,
-    canonical_status: Option<String>,
-    captured_at: String,
-    updated_at: String,
-    rpc_response_json: Option<String>,
-    block_response_json: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RejectedTransactionListResponse {
-    rejected_transactions: Vec<RejectedTransactionResponse>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ChainListQuery {
     offset: Option<i64>,
     limit: Option<i64>,
@@ -751,30 +709,6 @@ struct ChainListQuery {
 struct ChainListResponse {
     total_results: Option<i64>,
     chains: Vec<ChainRefResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OracleListQuery {
-    order_by: Option<String>,
-    order_direction: Option<String>,
-    offset: Option<i64>,
-    limit: Option<i64>,
-    block_hash: Option<String>,
-    block_height: Option<String>,
-    chain: Option<String>,
-    with_total: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleResponse {
-    url: Option<String>,
-    content: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct OracleListResponse {
-    total_results: Option<i64>,
-    oracles: Vec<OracleResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -921,7 +855,6 @@ struct TransactionListQuery {
     order_direction: Option<String>,
     /// Exact transaction hash lookup. Hashes are not globally unique in legacy history.
     hash: Option<String>,
-    hash_partial: Option<String>,
     block_height: Option<i64>,
     block_hash: Option<String>,
     /// Address involved through sender, gas, event address, or event target projections.
@@ -1291,7 +1224,6 @@ pub fn router(state: ApiState, rate_limiter: RateLimiter) -> Router {
         )
         .route("/api/v1/instructions", post(instructions))
         .route("/api/v1/nfts", get(nfts))
-        .route("/api/v1/oracles", get(oracles))
         .route("/api/v1/platforms", get(platforms))
         .route("/api/v1/series", get(series))
         .route("/api/v1/organizations", get(organizations))
@@ -1304,7 +1236,6 @@ pub fn router(state: ApiState, rate_limiter: RateLimiter) -> Router {
         .route("/api/v1/stakingStats", get(staking_stats))
         .route("/api/v1/addressStats", get(address_stats))
         .route("/api/v1/searches", get(searches))
-        .route("/api/v1/rejected-transactions", get(rejected_transactions))
         .route("/api/v1/raw-blocks/{height}", get(raw_block_by_height))
         .route("/api/v1/transaction", get(transaction_legacy))
         .route("/api/v1/transactions", get(transactions))

@@ -27,7 +27,7 @@ pub async fn search_existence(
     value_lower: &str,
 ) -> Result<SearchExistence, DbError> {
     let addresses = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM addresses WHERE address = $1 OR user_name = $1 OR address_name = $1)",
+        "SELECT EXISTS (SELECT 1 FROM addresses WHERE address = $1 OR address_name = $1)",
     )
     .bind(value)
     .fetch_one(pool)

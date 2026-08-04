@@ -1052,7 +1052,6 @@ mod tests {
                 chain,
                 height: BlockHeight::new(9_900_200_000),
                 hash: format!("TESTMINTBLOCK{suffix}"),
-                previous_hash: None,
                 protocol: Some(19),
                 chain_address: Some("NULL".to_owned()),
                 validator_address: Some("NULL".to_owned()),

@@ -298,7 +298,6 @@ WITH rows AS (
         ARRAY[
             block.height::text,
             block.hash,
-            COALESCE(block.previous_hash, '<NULL>'),
             block.timestamp_unix_seconds::text,
             block.protocol::text,
             COALESCE(chain_address.address, '<NULL>'),
@@ -463,7 +462,6 @@ WITH rows AS (
             block.id::text,
             block.height::text,
             block.hash,
-            COALESCE(block.previous_hash, '<NULL>'),
             block.timestamp_unix_seconds::text,
             block.protocol::text,
             COALESCE(chain_address.address, '<NULL>'),

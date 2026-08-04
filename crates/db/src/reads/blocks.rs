@@ -48,7 +48,6 @@ pub struct BlockFilter<'a> {
     pub id: Option<&'a str>,
     pub id_height: Option<i64>,
     pub hash: Option<&'a str>,
-    pub hash_partial: Option<&'a str>,
     pub height: Option<i64>,
     pub q_height: Option<i64>,
     pub q_hash: Option<&'a str>,
@@ -73,7 +72,7 @@ pub async fn list_blocks(
             block.id,
             block.height,
             block.hash,
-            block.previous_hash,
+            COALESCE(previous_block.hash, repeat('0', 64)) AS previous_hash,
             block.protocol,
             chain_address.address AS chain_address,
             validator_address.address AS validator_address,
@@ -86,19 +85,21 @@ pub async fn list_blocks(
                 WHERE tx.block_id = block.id
             ) AS transaction_count
         FROM blocks block
+        LEFT JOIN blocks previous_block
+            ON previous_block.chain_id = block.chain_id
+            AND previous_block.height = block.height - 1
         LEFT JOIN addresses chain_address ON chain_address.id = block.chain_address_id
         LEFT JOIN addresses validator_address ON validator_address.id = block.validator_address_id
         LEFT JOIN addresses producer_address ON producer_address.id = block.producer_address_id
         WHERE block.chain_id = $1
           AND ($2::text IS NULL OR block.hash = $2 OR block.height = $3)
           AND ($4::text IS NULL OR block.hash = $4)
-          AND ($5::text IS NULL OR block.hash ILIKE $5)
-          AND ($6::bigint IS NULL OR block.height = $6)
-          AND ($7::bigint IS NULL OR block.height = $7 OR block.hash = $8)
-          AND ($9::bigint IS NULL OR block.timestamp_unix_seconds <= $9)
-          AND ($10::bigint IS NULL OR block.timestamp_unix_seconds >= $10)
+          AND ($5::bigint IS NULL OR block.height = $5)
+          AND ($6::bigint IS NULL OR block.height = $6 OR block.hash = $7)
+          AND ($8::bigint IS NULL OR block.timestamp_unix_seconds <= $8)
+          AND ($9::bigint IS NULL OR block.timestamp_unix_seconds >= $9)
         ORDER BY {column} {dir}, block.id {dir}
-        LIMIT $11 OFFSET $12
+        LIMIT $10 OFFSET $11
         "#,
         column = order_by.column(),
     );
@@ -107,7 +108,6 @@ pub async fn list_blocks(
         .bind(filter.id)
         .bind(filter.id_height)
         .bind(filter.hash)
-        .bind(filter.hash_partial)
         .bind(filter.height)
         .bind(filter.q_height)
         .bind(filter.q_hash)
@@ -134,7 +134,7 @@ pub async fn block_detail(
         SELECT
             block.height,
             block.hash,
-            block.previous_hash,
+            COALESCE(previous_block.hash, repeat('0', 64)) AS previous_hash,
             block.protocol,
             chain_address.address AS chain_address,
             validator_address.address AS validator_address,
@@ -147,6 +147,9 @@ pub async fn block_detail(
                 WHERE tx.block_id = block.id
             ) AS transaction_count
         FROM blocks block
+        LEFT JOIN blocks previous_block
+            ON previous_block.chain_id = block.chain_id
+            AND previous_block.height = block.height - 1
         LEFT JOIN addresses chain_address ON chain_address.id = block.chain_address_id
         LEFT JOIN addresses validator_address ON validator_address.id = block.validator_address_id
         LEFT JOIN addresses producer_address ON producer_address.id = block.producer_address_id
@@ -199,7 +202,6 @@ mod tests {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_200_000),
                 hash: format!("TESTPRODBLOCKA{suffix}"),
-                previous_hash: None,
                 protocol: Some(19),
                 chain_address: Some("NULL".to_owned()),
                 validator_address: Some("NULL".to_owned()),
@@ -215,7 +217,6 @@ mod tests {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_200_001),
                 hash: format!("TESTPRODBLOCKB{suffix}"),
-                previous_hash: None,
                 protocol: Some(19),
                 chain_address: Some("NULL".to_owned()),
                 validator_address: Some("NULL".to_owned()),

@@ -88,23 +88,11 @@ pub async fn list_tokens(
             token.burned_supply,
             token.burned_supply_raw,
             token.script_raw,
+            -- USD is the only currency the system prices; the per-currency columns and the
+            -- token_logos tables were dropped (202608030004, empty/stale C# relics). The embed
+            -- flag keeps its response shape — an empty list when asked for.
             token.price_usd::double precision AS price_usd,
-            token.price_eur::double precision AS price_eur,
-            token.price_gbp::double precision AS price_gbp,
-            token.price_jpy::double precision AS price_jpy,
-            token.price_cad::double precision AS price_cad,
-            token.price_aud::double precision AS price_aud,
-            token.price_cny::double precision AS price_cny,
-            token.price_rub::double precision AS price_rub,
-            CASE WHEN $4::boolean THEN (
-                SELECT COALESCE(jsonb_agg(jsonb_build_object(
-                    'type', logo_type.name,
-                    'url', logo.url
-                ) ORDER BY logo.id), '[]'::jsonb)
-                FROM token_logos logo
-                JOIN token_logo_types logo_type ON logo_type.id = logo.token_logo_type_id
-                WHERE logo.token_id = token.id
-            ) ELSE NULL END AS token_logos_json,
+            CASE WHEN $4::boolean THEN '[]'::jsonb ELSE NULL END AS token_logos_json,
             CASE WHEN $7::boolean THEN token.metadata ELSE NULL END AS metadata_json
         FROM tokens token
         WHERE token.chain_id = $1

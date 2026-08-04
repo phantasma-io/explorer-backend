@@ -81,15 +81,17 @@ pub(crate) fn token_from_row(
         burned_supply: row.get("burned_supply"),
         burned_supply_raw: row.get("burned_supply_raw"),
         script_raw: row.get("script_raw"),
+        // USD is the only currency the system prices (202608030004 dropped the per-currency
+        // columns as stale C# relics). The response keeps its shape; the other fields stay null.
         price: with_price.then(|| PriceResponse {
             usd: nonzero_f64(row.get("price_usd")),
-            eur: nonzero_f64(row.get("price_eur")),
-            gbp: nonzero_f64(row.get("price_gbp")),
-            jpy: nonzero_f64(row.get("price_jpy")),
-            cad: nonzero_f64(row.get("price_cad")),
-            aud: nonzero_f64(row.get("price_aud")),
-            cny: nonzero_f64(row.get("price_cny")),
-            rub: nonzero_f64(row.get("price_rub")),
+            eur: None,
+            gbp: None,
+            jpy: None,
+            cad: None,
+            aud: None,
+            cny: None,
+            rub: None,
         }),
         token_logos: if with_logo {
             json_vec(row.get("token_logos_json"))?.or(Some(Vec::new()))
@@ -1849,34 +1851,4 @@ pub(crate) fn apply_staking_supply_adjustment(item: &mut StakingDailyStatRespons
     item.soul_supply_raw = Some(adjusted_supply.to_string());
     item.staking_ratio = staked_raw as f64 / adjusted_supply as f64;
     item.staking_percent = item.staking_ratio * 100.0;
-}
-
-pub(crate) fn rejected_transaction_from_row(
-    row: &RejectedTransactionRow,
-) -> RejectedTransactionResponse {
-    RejectedTransactionResponse {
-        hash: row.hash.clone(),
-        nexus: row.nexus.clone(),
-        chain: row.chain.clone(),
-        block_height: row.block_height.map(|value| value.to_string()),
-        block_hash: row.block_hash.clone(),
-        date: row.timestamp_unix_seconds.map(|value| value.to_string()),
-        state: row.state.clone(),
-        result: row.result.clone(),
-        debug_comment: row.debug_comment.clone(),
-        payload: row.payload.clone(),
-        script_raw: row.script_raw.clone(),
-        fee_raw: row.fee_raw.clone(),
-        expiration: row.expiration.map(|value| value.to_string()),
-        gas_price_raw: row.gas_price_raw.clone(),
-        gas_limit_raw: row.gas_limit_raw.clone(),
-        sender: row.sender.clone(),
-        gas_payer: row.gas_payer.clone(),
-        gas_target: row.gas_target.clone(),
-        canonical_status: row.canonical_status.clone(),
-        captured_at: row.captured_at_unix_seconds.to_string(),
-        updated_at: row.updated_at_unix_seconds.to_string(),
-        rpc_response_json: row.rpc_response_json.clone(),
-        block_response_json: row.block_response_json.clone(),
-    }
 }
