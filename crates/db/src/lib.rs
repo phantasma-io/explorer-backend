@@ -84,6 +84,8 @@ pub enum DbError {
     StakeSnapshotInvalidRaw { field: &'static str, value: String },
     #[error("staking snapshot projector replay failed: {reason}")]
     StakeSnapshotReplay { reason: String },
+    #[error("unknown event payload format {format:?}")]
+    UnknownPayloadFormat { format: String },
 }
 
 #[derive(Debug, Clone, Serialize)]

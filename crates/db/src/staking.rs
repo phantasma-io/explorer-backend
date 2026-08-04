@@ -598,10 +598,7 @@ async fn load_stake_snapshot_events(
             COALESCE(event.raw_data, event.payload_json::text, '') AS payload_identity,
             event.payload_json->'token_event'->>'token' AS token_symbol,
             event.payload_json->'token_event'->>'value_raw' AS value_raw,
-            COALESCE(
-                event.payload_json->>'address',
-                event.payload_json->'token_event'->>'address'
-            ) AS address,
+            address.address AS address,
             COALESCE(
                 event.payload_json->'market_event'->>'quote_symbol',
                 event.payload_json->'market_event'->>'quote_token'
@@ -633,10 +630,15 @@ async fn load_stake_snapshot_events(
         JOIN blocks block
           ON block.id = tx.block_id
          AND block.chain_id = event.chain_id
+        LEFT JOIN addresses address
+          ON address.id = event.address_id
         WHERE event.chain_id = $1
           AND tx.timestamp_unix_seconds >= $2
           AND tx.timestamp_unix_seconds <= $3
-          AND event.payload_format IN ('legacy.backfill.v1', 'live.v1')
+          -- 1=legacy.backfill.v1, 2=live.v1 (codes since migration 202608040003).
+          -- Decoded legacy.raw rows (4) stay excluded: the historical curve keeps
+          -- exactly its C#-era inputs.
+          AND event.payload_format IN (1, 2)
           AND (
               (
                   event_kind.name IN ('TokenStake', 'TokenClaim', 'TokenMint', 'TokenBurn')
@@ -781,7 +783,17 @@ fn deduplicate_stake_snapshot_tx_rows(
     let mut seen = HashSet::new();
     let mut deduped = Vec::with_capacity(rows.len());
     for row in rows {
-        let key = format!("{}|{}", row.kind, row.payload_identity);
+        // The identity may fall back to payload_json::text, which since migration
+        // 202608040003 no longer stores the event address; appending the
+        // relational address keeps two same-shaped events from different
+        // addresses distinct, exactly as the pre-strip payload text did (2,969
+        // same-tx groups in the live data differ only by address).
+        let key = format!(
+            "{}|{}|{}",
+            row.kind,
+            row.payload_identity,
+            row.address.as_deref().unwrap_or("")
+        );
         if seen.insert(key) {
             deduped.push(row.clone());
         }

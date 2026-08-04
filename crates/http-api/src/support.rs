@@ -721,7 +721,16 @@ pub(crate) fn event_from_row(
         .get::<Option<String>, _>("contract_hash")
         .or_else(|| row.get::<Option<String>, _>("raw_contract"));
     let event_kind = row.get::<String, _>("event_kind");
-    let payload_value = row.get::<Option<Value>, _>("payload_json");
+    // The stored payload dropped its 'chain'/'address' keys (they duplicate the
+    // relational columns; migration 202608040003). Re-inserting them first keeps
+    // everything downstream — event_data derivation and the served payload_json
+    // string — byte-identical to the pre-strip output: the string is serialized
+    // from a sorted map, so the keys land back in their historical positions.
+    let payload_value = rehydrate_event_payload(
+        row.get::<Option<Value>, _>("payload_json"),
+        row.get::<String, _>("chain_name"),
+        row.get::<Option<String>, _>("address"),
+    );
     let contract_symbol = row.get::<Option<String>, _>("contract_symbol");
     let event_data = if with_event_data {
         build_event_data_fields(
@@ -779,6 +788,24 @@ pub(crate) fn event_from_row(
         },
         event_data,
     })
+}
+
+/// Re-insert the relational 'chain'/'address' keys into a stored event payload
+/// (stripped at rest by migration 202608040003). Object payloads only; an event
+/// without an address gains no address key, matching the write-side shape.
+pub(crate) fn rehydrate_event_payload(
+    payload: Option<Value>,
+    chain_name: String,
+    address: Option<String>,
+) -> Option<Value> {
+    let mut payload = payload?;
+    if let Value::Object(object) = &mut payload {
+        object.insert("chain".to_owned(), Value::String(chain_name));
+        if let Some(address) = address {
+            object.insert("address".to_owned(), Value::String(address));
+        }
+    }
+    Some(payload)
 }
 
 /// Top-level calls a special resolution shows inline in an event response.
@@ -1851,4 +1878,51 @@ pub(crate) fn apply_staking_supply_adjustment(item: &mut StakingDailyStatRespons
     item.soul_supply_raw = Some(adjusted_supply.to_string());
     item.staking_ratio = staked_raw as f64 / adjusted_supply as f64;
     item.staking_percent = item.staking_ratio * 100.0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Strip + rehydrate must round-trip to the exact pre-strip JSON string: the
+    // re-inserted keys land in sorted-map position, so serialization matches the
+    // historical served output byte for byte. A change to the rehydration keys
+    // or to the serializer's ordering breaks this equality.
+    #[test]
+    fn rehydrated_payload_serializes_like_the_prestrip_original() {
+        let prestrip = serde_json::json!({
+            "address": "P2KTESTADDR",
+            "chain": "main",
+            "contract": "stake",
+            "event_kind": "TokenStake",
+            "token_event": {"token": "SOUL", "value_raw": "1"},
+        });
+        let stored = serde_json::json!({
+            "contract": "stake",
+            "event_kind": "TokenStake",
+            "token_event": {"token": "SOUL", "value_raw": "1"},
+        });
+        let rehydrated = rehydrate_event_payload(
+            Some(stored),
+            "main".to_owned(),
+            Some("P2KTESTADDR".to_owned()),
+        );
+        assert_eq!(
+            rehydrated.as_ref().map(serde_json::Value::to_string),
+            Some(prestrip.to_string())
+        );
+
+        // Payload-less events stay payload-less; an addressless event gains no
+        // address key (matching the write-side shape for such rows).
+        assert_eq!(rehydrate_event_payload(None, "main".to_owned(), None), None);
+        let addressless = rehydrate_event_payload(
+            Some(serde_json::json!({"event_kind": "Custom"})),
+            "main".to_owned(),
+            None,
+        );
+        assert_eq!(
+            addressless.map(|value| value.to_string()),
+            Some(r#"{"chain":"main","event_kind":"Custom"}"#.to_owned())
+        );
+    }
 }

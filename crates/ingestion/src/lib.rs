@@ -1011,7 +1011,6 @@ fn transaction_events_to_projections(
         }
         events.push(event_to_projection(
             block_height,
-            &block.chain,
             transaction_record,
             tx_index,
             event_index,
@@ -1036,7 +1035,6 @@ fn transaction_events_to_projections(
         };
         events.push(event_to_projection(
             block_height,
-            &block.chain,
             transaction_record,
             tx_index,
             synthetic_index,
@@ -1060,7 +1058,6 @@ fn transaction_events_to_projections(
         };
         events.push(event_to_projection(
             block_height,
-            &block.chain,
             transaction_record,
             tx_index,
             synthetic_index,
@@ -1370,7 +1367,6 @@ impl<'a> TxExtendedEventContext<'a> {
 
 fn event_to_projection(
     block_height: u64,
-    chain_name: &str,
     transaction_record: &TransactionRecord,
     tx_index: usize,
     event_index: usize,
@@ -1391,11 +1387,14 @@ fn event_to_projection(
     // ABI event name for self-describing contract events (set in the Custom_V2
     // branch below); stays None for native kinds, where the kind is the label.
     let mut event_name = None;
+    // The stored payload carries no 'chain'/'address' keys: they duplicate the
+    // relational chain_id/address_id on every row (equality was measured over
+    // all 76M rows before migration 202608040003 stripped the stored copies).
+    // The API re-inserts both at serve time, byte-identically, because the
+    // served string is re-serialized from a sorted map either way.
     let mut payload_json = serde_json::json!({
         "event_kind": &event_kind,
-        "chain": chain_name,
         "contract": &payload_contract,
-        "address": &address,
     });
 
     if is_legacy_token_event_kind(&event_kind) {
@@ -1562,7 +1561,6 @@ fn event_to_projection(
         }
     } else {
         payload_json = serde_json::json!({
-            "address": &event.address,
             "contract": &event.contract,
             "kind": &event.kind,
             "name": &event.name,
@@ -3390,6 +3388,20 @@ mod tests {
             assert_eq!(events[0].event_kind, "GasEscrow");
             assert_eq!(events[0].event_index, 1);
             assert_eq!(events[0].payload_format.as_deref(), Some("live.v1"));
+            // The stored payload must NOT carry 'chain'/'address': both are
+            // relational columns, stripped at rest since migration 202608040003
+            // and re-inserted by the API at serve time.
+            assert_eq!(
+                events[0].payload_json.as_ref().and_then(|v| v.get("chain")),
+                None
+            );
+            assert_eq!(
+                events[0]
+                    .payload_json
+                    .as_ref()
+                    .and_then(|v| v.get("address")),
+                None
+            );
             assert_eq!(
                 events[0]
                     .payload_json

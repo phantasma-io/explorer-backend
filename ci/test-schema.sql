@@ -317,7 +317,7 @@ CREATE TABLE public.events (
     event_kind_id integer NOT NULL,
     nft_id integer,
     target_address_id integer,
-    payload_format text,
+    payload_format smallint,
     payload_json jsonb,
     raw_data text,
     event_name text
@@ -336,6 +336,13 @@ COMMENT ON COLUMN public.events.token_id IS 'Dual semantics inherited from C#: t
 --
 
 COMMENT ON COLUMN public.events.burned IS 'Tri-state in practice: true or NULL, never false. Set retroactively on all of a token''s historical events when it burns; one of only two mutable event columns (the other is nft_id).';
+
+
+--
+-- Name: COLUMN events.payload_format; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.events.payload_format IS '1=legacy.backfill.v1, 2=live.v1, 3=legacy.raw.v1 (undecoded; raw_data holds the bytes), 4=legacy.decoded.v1';
 
 
 --

@@ -4,6 +4,26 @@
 //! and burn markers.
 use super::*;
 
+/// Storage code for `events.payload_format` (a smallint since migration
+/// 202608040003): 1=legacy.backfill.v1, 2=live.v1, 3=legacy.raw.v1,
+/// 4=legacy.decoded.v1. The Rust side keeps the descriptive names; only the
+/// column stores codes, so an unknown name is a programming error surfaced
+/// before any row is written.
+pub(crate) fn payload_format_code(format: Option<&str>) -> Result<Option<i16>, DbError> {
+    Ok(match format {
+        None => None,
+        Some("legacy.backfill.v1") => Some(1),
+        Some("live.v1") => Some(2),
+        Some("legacy.raw.v1") => Some(3),
+        Some("legacy.decoded.v1") => Some(4),
+        Some(other) => {
+            return Err(DbError::UnknownPayloadFormat {
+                format: other.to_owned(),
+            });
+        }
+    })
+}
+
 pub async fn replace_events(
     conn: &mut PgConnection,
     transaction_id: i32,
@@ -253,7 +273,7 @@ pub(crate) async fn insert_block_events(
             event_transaction_id.push(event.transaction_id);
             event_kind_id.push(kind_id);
             target_address_id.push(resolved_target_id);
-            payload_format.push(event.payload_format.clone());
+            payload_format.push(payload_format_code(event.payload_format.as_deref())?);
             payload_json.push(event.payload_json.as_ref().map(|value| value.to_string()));
             raw_data.push(event.raw_data.clone());
             event_name.push(event.event_name.clone());
@@ -288,7 +308,7 @@ pub(crate) async fn insert_block_events(
             t.raw_data, t.event_name
         FROM unnest(
             $1::bigint[], $2::int[], $3::text[], $4::bool[],
-            $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[], $11::text[],
+            $5::int[], $6::int[], $7::int[], $8::int[], $9::int[], $10::int[], $11::smallint[],
             $12::text[], $13::text[], $14::text[]
         ) AS t(
             timestamp, event_index, token_id, burned, address_id,
@@ -547,7 +567,7 @@ pub(crate) async fn upsert_event_cached(
     .bind(event.transaction_id)
     .bind(event_kind_id)
     .bind(target_address_id)
-    .bind(&event.payload_format)
+    .bind(payload_format_code(event.payload_format.as_deref())?)
     .bind(&event.payload_json)
     .bind(&event.raw_data)
     .bind(&event.event_name)
@@ -1766,7 +1786,7 @@ mod tests {
                 contract: Some("entry".to_owned()),
                 token_id: None,
                 raw_data: None,
-                payload_format: Some("legacy.v1".to_owned()),
+                payload_format: Some("live.v1".to_owned()),
                 payload_json: Some(serde_json::json!({
                     "event_kind": "ContractDeploy",
                     "chain": "main",
@@ -1790,7 +1810,7 @@ mod tests {
                 contract: Some("entry".to_owned()),
                 token_id: None,
                 raw_data: None,
-                payload_format: Some("legacy.v1".to_owned()),
+                payload_format: Some("live.v1".to_owned()),
                 payload_json: Some(serde_json::json!({
                     "event_kind": "ContractUpgrade",
                     "chain": "main",
