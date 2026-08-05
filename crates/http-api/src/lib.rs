@@ -974,9 +974,10 @@ struct EventListQuery {
     address: Option<String>,
     contract: Option<String>,
     q: Option<String>,
+    // `with_nsfw`/`with_blacklisted` are gone from this struct but still tolerated
+    // on the wire (serde ignores unknown query params): they gated events columns
+    // no row ever set, and the flags now live only on `nfts`.
     with_event_data: Option<i32>,
-    with_nsfw: Option<i32>,
-    with_blacklisted: Option<i32>,
     token_id: Option<String>,
     block_hash: Option<String>,
     date_less: Option<String>,

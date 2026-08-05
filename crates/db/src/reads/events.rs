@@ -62,16 +62,9 @@ pub struct EventFilter<'a> {
     /// [`super::event_kind_id_by_name`]). `None` means no kind filter; a name that
     /// matches no kind never reaches here — the handler answers it without a query.
     pub event_kind_id: Option<i32>,
-    pub event_source: Option<&'a str>,
     pub contract: Option<&'a str>,
     pub q: Option<&'a str>,
     pub event_id: Option<i32>,
-    /// Kept for the public `with_nsfw` / `with_blacklisted` query params. The flags now
-    /// live only on `nfts`, where they belong: `events` carried a copy that no row ever
-    /// set in 76M events, and every event of a flagged NFT is reachable through its
-    /// `nft_id`.
-    pub show_nsfw: bool,
-    pub show_blacklisted: bool,
     pub token_id: Option<&'a str>,
     pub block_hash: Option<&'a str>,
     pub date_less: Option<i64>,
@@ -206,41 +199,41 @@ pub async fn list_events_global(
         r#"
         SELECT
             event.id,
+            event.id AS cursor_id,
             {column}::bigint AS cursor_sort_value,
 {projection}
 {joins}
         WHERE ($1::integer IS NULL OR event.chain_id = $1)
 {kind_predicate}{kind_partial_predicate}          AND ($3::text IS NULL OR tx.hash = $3)
           AND ($4::bigint IS NULL OR block.height = $4)
-          AND ($5::text IS NULL OR $5 = 'legacy')
-          AND ($6::text IS NULL OR contract.hash = $6 OR contract.name = $6 OR contract.symbol = $6)
-          AND ($10::integer IS NULL OR event.id = $10)
-          AND ($11::text IS NULL OR tx.hash ILIKE $11 OR block.hash ILIKE $11 OR block.height = $12 OR event_kind.name ILIKE $11 OR address.address ILIKE $11 OR address.address_name ILIKE $11 OR contract.hash ILIKE $11 OR contract.name ILIKE $11 OR contract.symbol ILIKE $11 OR event.token_id ILIKE $11)
-          AND ($15::text IS NULL OR event.token_id = $15)
-          AND ($16::text IS NULL OR block.hash = $16)
-          AND ($17::bigint IS NULL OR event.timestamp_unix_seconds <= $17)
-          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds >= $18)
+          AND ($5::text IS NULL OR contract.hash = $5 OR contract.name = $5 OR contract.symbol = $5)
+          AND ($9::integer IS NULL OR event.id = $9)
+          AND ($10::text IS NULL OR tx.hash ILIKE $10 OR block.hash ILIKE $10 OR block.height = $11 OR event_kind.name ILIKE $10 OR address.address ILIKE $10 OR address.address_name ILIKE $10 OR contract.hash ILIKE $10 OR contract.name ILIKE $10 OR contract.symbol ILIKE $10 OR event.token_id ILIKE $10)
+          AND ($12::text IS NULL OR event.token_id = $12)
+          AND ($13::text IS NULL OR block.hash = $13)
+          AND ($14::bigint IS NULL OR event.timestamp_unix_seconds <= $14)
+          AND ($15::bigint IS NULL OR event.timestamp_unix_seconds >= $15)
           AND (
-              $19::bigint IS NULL
-              OR (event.timestamp_unix_seconds >= $19
-                  AND event.timestamp_unix_seconds < $19 + 86400)
+              $16::bigint IS NULL
+              OR (event.timestamp_unix_seconds >= $16
+                  AND event.timestamp_unix_seconds < $16 + 86400)
           )
-          AND ($20::text IS NULL OR nft.name ILIKE $20)
-          AND ($21::text IS NULL OR nft.description ILIKE $21)
-          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22)
+          AND ($17::text IS NULL OR nft.name ILIKE $17)
+          AND ($18::text IS NULL OR nft.description ILIKE $18)
+          AND ($19::text IS NULL OR address.address ILIKE $19 OR address.address_name ILIKE $19)
           AND (
-              $7::bigint IS NULL
-              OR {column} {op} $7
-              OR ({column} = $7 AND event.id {op} $8)
+              $6::bigint IS NULL
+              OR {column} {op} $6
+              OR ({column} = $6 AND event.id {op} $7)
           )
         ORDER BY {column} {dir}, event.id {dir}
-        LIMIT $9
+        LIMIT $8
         "#,
         column = page.order_by.column(),
         projection = EVENT_LIST_PROJECTION,
         joins = EVENT_LIST_JOINS,
         kind_predicate =
-            event_kind_id_predicate("event.event_kind_id", "$23", filter.event_kind_id),
+            event_kind_id_predicate("event.event_kind_id", "$20", filter.event_kind_id),
         kind_partial_predicate =
             event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
     );
@@ -259,7 +252,6 @@ pub async fn list_events_global(
         .bind(chain_name)
         .bind(filter.transaction_hash)
         .bind(filter.block_height)
-        .bind(filter.event_source)
         .bind(filter.contract)
         .bind(page.cursor_sort_value)
         .bind(page.cursor_id)
@@ -267,8 +259,6 @@ pub async fn list_events_global(
         .bind(filter.event_id)
         .bind(q_like.as_deref())
         .bind(q_height)
-        .bind(false)
-        .bind(false)
         .bind(filter.token_id)
         .bind(filter.block_hash)
         .bind(filter.date_less)
@@ -303,6 +293,7 @@ pub async fn list_events_by_address(
         r#"
         SELECT
             event.id,
+            event.id AS cursor_id,
             {column}::bigint AS cursor_sort_value,
             event.event_index,
             'legacy'::text AS event_source,
@@ -352,38 +343,37 @@ pub async fn list_events_by_address(
         LEFT JOIN series series ON series.id = nft.series_id
         LEFT JOIN series_modes series_mode ON series_mode.id = series.series_mode_id
         LEFT JOIN addresses series_creator ON series_creator.id = series.creator_address_id
-        WHERE ($5::integer IS NOT NULL OR chain.name = $1)
+        WHERE ($4::integer IS NOT NULL OR chain.name = $1)
 {kind_predicate}{kind_partial_predicate}          AND ($2::text IS NULL OR tx.hash = $2)
           AND ($3::bigint IS NULL OR block.height = $3)
-          AND ($4::text IS NULL OR $4 = 'legacy')
-          AND ($5::integer IS NULL OR event.address_id = $5 OR event.target_address_id = $5)
-          AND ($23::integer IS NULL OR event.chain_id = $23)
-          AND ($6::text IS NULL OR contract.hash = $6 OR contract.name = $6 OR contract.symbol = $6)
-          AND ($10::integer IS NULL OR event.id = $10)
-          AND ($11::text IS NULL OR tx.hash ILIKE $11 OR block.hash ILIKE $11 OR block.height = $12 OR event_kind.name ILIKE $11 OR address.address ILIKE $11 OR target_address.address ILIKE $11 OR address.address_name ILIKE $11 OR contract.hash ILIKE $11 OR contract.name ILIKE $11 OR contract.symbol ILIKE $11 OR event.token_id ILIKE $11)
-          AND ($15::text IS NULL OR event.token_id = $15)
-          AND ($16::text IS NULL OR block.hash = $16)
-          AND ($17::bigint IS NULL OR event.timestamp_unix_seconds <= $17)
-          AND ($18::bigint IS NULL OR event.timestamp_unix_seconds >= $18)
+          AND ($4::integer IS NULL OR event.address_id = $4 OR event.target_address_id = $4)
+          AND ($20::integer IS NULL OR event.chain_id = $20)
+          AND ($5::text IS NULL OR contract.hash = $5 OR contract.name = $5 OR contract.symbol = $5)
+          AND ($9::integer IS NULL OR event.id = $9)
+          AND ($10::text IS NULL OR tx.hash ILIKE $10 OR block.hash ILIKE $10 OR block.height = $11 OR event_kind.name ILIKE $10 OR address.address ILIKE $10 OR target_address.address ILIKE $10 OR address.address_name ILIKE $10 OR contract.hash ILIKE $10 OR contract.name ILIKE $10 OR contract.symbol ILIKE $10 OR event.token_id ILIKE $10)
+          AND ($12::text IS NULL OR event.token_id = $12)
+          AND ($13::text IS NULL OR block.hash = $13)
+          AND ($14::bigint IS NULL OR event.timestamp_unix_seconds <= $14)
+          AND ($15::bigint IS NULL OR event.timestamp_unix_seconds >= $15)
           AND (
-              $19::bigint IS NULL
-              OR (event.timestamp_unix_seconds >= $19
-                  AND event.timestamp_unix_seconds < $19 + 86400)
+              $16::bigint IS NULL
+              OR (event.timestamp_unix_seconds >= $16
+                  AND event.timestamp_unix_seconds < $16 + 86400)
           )
-          AND ($20::text IS NULL OR nft.name ILIKE $20)
-          AND ($21::text IS NULL OR nft.description ILIKE $21)
-          AND ($22::text IS NULL OR address.address ILIKE $22 OR address.address_name ILIKE $22)
+          AND ($17::text IS NULL OR nft.name ILIKE $17)
+          AND ($18::text IS NULL OR nft.description ILIKE $18)
+          AND ($19::text IS NULL OR address.address ILIKE $19 OR address.address_name ILIKE $19)
           AND (
-              $7::bigint IS NULL
-              OR {column} {op} $7
-              OR ({column} = $7 AND event.id {op} $8)
+              $6::bigint IS NULL
+              OR {column} {op} $6
+              OR ({column} = $6 AND event.id {op} $7)
           )
         ORDER BY {column} {dir}, event.id {dir}
-        LIMIT $9
+        LIMIT $8
         "#,
         column = page.order_by.column(),
         kind_predicate =
-            event_kind_id_predicate("event.event_kind_id", "$24", filter.event_kind_id),
+            event_kind_id_predicate("event.event_kind_id", "$21", filter.event_kind_id),
         kind_partial_predicate =
             event_kind_predicate("event.event_kind_id", filter.event_kind_partial_ids),
     );
@@ -401,7 +391,6 @@ pub async fn list_events_by_address(
         .bind(chain_name)
         .bind(filter.transaction_hash)
         .bind(filter.block_height)
-        .bind(filter.event_source)
         .bind(address_id)
         .bind(filter.contract)
         .bind(page.cursor_sort_value)
@@ -410,8 +399,6 @@ pub async fn list_events_by_address(
         .bind(filter.event_id)
         .bind(q_like.as_deref())
         .bind(q_height)
-        .bind(false)
-        .bind(false)
         .bind(filter.token_id)
         .bind(filter.block_hash)
         .bind(filter.date_less)
@@ -726,6 +713,59 @@ mod tests {
         .await?;
         assert_eq!(kind_filtered.len(), 1);
         assert_eq!(kind_filtered[0].get::<String, _>("event_kind"), "TokenSend");
+        assert_eq!(
+            kind_filtered[0].get::<i32, _>("cursor_id"),
+            kind_filtered[0].get::<i32, _>("id"),
+            "cursor_id must carry the event id"
+        );
+
+        // Every optional filter bound at once, tuned to still match the seeded
+        // TokenSend row. This walks the WHOLE parameter list with real values, so
+        // any placeholder/bind misnumbering — the exact bug class that once broke
+        // every address-scoped request ($24) — fails here as a type error or a
+        // wrong row instead of shipping.
+        let seeded_hash = format!("TESTEVADDRTX{suffix}");
+        let seeded_block_hash = format!("TESTEVADDRBLOCK{suffix}");
+        let block_timestamp = 1_800_300_000_i64;
+        let actor_partial = format!("%{actor}%");
+        let loaded_filter = EventFilter {
+            transaction_hash: Some(&seeded_hash),
+            block_height: Some(9_900_300_000),
+            event_kind_id: Some(send_kind_id),
+            contract: Some("SOUL"),
+            q: Some(&actor),
+            event_id: Some(kind_filtered[0].get::<i32, _>("id")),
+            token_id: None,
+            block_hash: Some(&seeded_block_hash),
+            date_less: Some(block_timestamp + 1),
+            date_greater: Some(block_timestamp - 1),
+            date_day: Some(block_timestamp - block_timestamp.rem_euclid(86_400)),
+            event_kind_partial_ids: Some(&[send_kind_id]),
+            nft_name_partial: None,
+            nft_description_partial: None,
+            address_partial: Some(&actor_partial),
+            chain_id: Some(chain_id),
+        };
+        let fully_filtered =
+            list_events_by_address(&mut *tx, "main", address_id, &loaded_filter, &page).await?;
+        assert_eq!(fully_filtered.len(), 1, "all filters must agree on the row");
+        assert_eq!(
+            fully_filtered[0].get::<String, _>("event_kind"),
+            "TokenSend"
+        );
+
+        // The same fully-loaded walk through the global list.
+        let fully_filtered_global =
+            list_events_global(&mut *tx, Some(chain_id), "main", &loaded_filter, &page).await?;
+        assert_eq!(fully_filtered_global.len(), 1);
+        assert_eq!(
+            fully_filtered_global[0].get::<String, _>("event_kind"),
+            "TokenSend"
+        );
+        assert_eq!(
+            fully_filtered_global[0].get::<i32, _>("cursor_id"),
+            fully_filtered_global[0].get::<i32, _>("id")
+        );
 
         Ok(())
     }

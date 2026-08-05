@@ -1520,6 +1520,21 @@ pub(crate) async fn load_events(
             next_cursor: None,
         });
     }
+    // Every stored event is 'legacy'-sourced, so any other requested source has no
+    // rows — answered here, like an unknown kind, instead of running a query whose
+    // only job would be to match nothing. (`with_nsfw`/`with_blacklisted` are still
+    // accepted for compatibility and change nothing: the flags lived on events
+    // columns no row ever set, and they now exist only on `nfts`.)
+    if event_source
+        .as_deref()
+        .is_some_and(|source| source != "legacy")
+    {
+        return Ok(EventListResponse {
+            total_results: None,
+            events: Vec::new(),
+            next_cursor: None,
+        });
+    }
     let event_kind_partial_ids = match event_kind_partial.as_deref() {
         Some(pattern) => Some(event_kind_ids_by_name_like(&state.pool, pattern).await?),
         None => None,
@@ -1528,12 +1543,9 @@ pub(crate) async fn load_events(
         transaction_hash: transaction_hash.as_deref(),
         block_height: query.block_height,
         event_kind_id,
-        event_source: event_source.as_deref(),
         contract: contract.as_deref(),
         q: q.as_deref(),
         event_id: query.event_id,
-        show_nsfw: query.with_nsfw == Some(1),
-        show_blacklisted: query.with_blacklisted == Some(1),
         token_id: token_id.as_deref(),
         block_hash: block_hash.as_deref(),
         date_less,
