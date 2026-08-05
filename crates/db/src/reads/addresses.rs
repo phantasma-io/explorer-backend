@@ -52,21 +52,6 @@ impl AddressOrderBy {
             _ => None,
         }
     }
-
-    /// The full ORDER BY clause for this key. Column names and the `balance_*`
-    /// sort aliases are fixed literals; only `direction` varies, and it is a
-    /// closed enum, so the clause is injection-safe.
-    fn order_clause(self, direction: SortDirection) -> String {
-        let dir = direction.as_sql();
-        match self {
-            Self::Id => format!("address.id {dir}, address.id {dir}"),
-            Self::Address => format!("address.address {dir}, address.id {dir}"),
-            Self::AddressName => format!("address.address_name {dir}, address.id {dir}"),
-            Self::Balance => {
-                format!("balance_missing ASC, balance_raw {dir}, address.id {dir}")
-            }
-        }
-    }
 }
 
 /// Filters for the addresses list. `symbol` selects the balance token used for
@@ -84,58 +69,100 @@ pub struct AddressFilter<'a> {
 
 /// List addresses for a chain matching the filter, ordered by the chosen key.
 /// The caller passes `limit + 1` to detect a following page.
+///
+/// The query is shaped per ordering instead of one shape for all four
+/// (the previous form materialized a balance for EVERY address of the chain —
+/// a per-address LATERAL over `address_balances` — before paging, ~250 ms per
+/// request): the non-balance orders touch no balance data at all; `balance`
+/// with SOUL orders directly on the denormalized `addresses.total_soul_amount`
+/// (`ix_addresses_chain_soul`); `balance` with any other symbol hash-joins the
+/// one token's holder rows and appends the no-balance addresses in id order —
+/// the same total order the old shape produced, row for row.
 pub async fn list_addresses(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: impl sqlx::PgExecutor<'_> + Copy,
     filter: &AddressFilter<'_>,
     order_by: AddressOrderBy,
     direction: SortDirection,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PgRow>, DbError> {
+    let dir = direction.as_sql();
+    // The balance-sort token is resolved once, and only when the balances table
+    // is actually consulted (any symbol but SOUL). Exact-case match with the
+    // lowest id, like the LATERAL's arbitrary single row used to be — symbols
+    // are unique per chain today, so this is one token or none. None (unknown
+    // symbol) leaves every address balance-less: the id-order fallback below,
+    // which is what the old shape answered too.
+    let balance_token_id = match order_by {
+        AddressOrderBy::Balance if filter.symbol != "SOUL" => {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT id FROM tokens WHERE chain_id = $1 AND symbol = $2 ORDER BY id LIMIT 1",
+            )
+            .bind(filter.chain_id)
+            .bind(filter.symbol)
+            .fetch_optional(executor)
+            .await?
+        }
+        _ => None,
+    };
+
+    let balance_by_holders = matches!(order_by, AddressOrderBy::Balance) && filter.symbol != "SOUL";
+    let (holders_cte, holders_join, page_columns, page_order, outer_order) = if balance_by_holders {
+        (
+            r#"holders AS (
+            SELECT balance.address_id, balance.amount_raw
+            FROM address_balances balance
+            WHERE balance.token_id = $9
+        ),
+        "#,
+            "LEFT JOIN holders ON holders.address_id = address.id",
+            r#"address.id,
+                   (holders.address_id IS NULL) AS balance_missing,
+                   COALESCE(holders.amount_raw, 0) AS balance_raw"#,
+            format!(
+                "(holders.address_id IS NULL) ASC, COALESCE(holders.amount_raw, 0) {dir}, address.id {dir}"
+            ),
+            format!("page.balance_missing ASC, page.balance_raw {dir}, address.id {dir}"),
+        )
+    } else {
+        // SOUL's running total lives on the address row itself; the non-balance
+        // orders never look at balances. Page and outer order share the same
+        // address-column expressions.
+        let order = match order_by {
+            AddressOrderBy::Id => format!("address.id {dir}"),
+            AddressOrderBy::Address => format!("address.address {dir}, address.id {dir}"),
+            AddressOrderBy::AddressName => {
+                format!("address.address_name {dir}, address.id {dir}")
+            }
+            AddressOrderBy::Balance => {
+                format!("address.total_soul_amount {dir}, address.id {dir}")
+            }
+        };
+        ("", "", "address.id", order.clone(), order)
+    };
+
     let sql = format!(
         r#"
-        WITH base AS MATERIALIZED (
-            SELECT
-                address.id,
-                CASE
-                    WHEN $5::text = 'SOUL' THEN address.total_soul_amount
-                    ELSE COALESCE(sort_balance.amount_raw, 0)
-                END AS balance_raw,
-                CASE
-                    WHEN $5::text = 'SOUL' THEN 0
-                    WHEN sort_balance.amount_raw IS NULL THEN 1
-                    ELSE 0
-                END AS balance_missing
+        WITH {holders_cte}page AS (
+            SELECT {page_columns}
             FROM addresses address
-            LEFT JOIN LATERAL (
-                SELECT balance.amount_raw
-                FROM address_balances balance
-                JOIN tokens token ON token.id = balance.token_id
-                WHERE balance.address_id = address.id
-                  AND token.symbol = $5
-                LIMIT 1
-            ) sort_balance ON true
+            {holders_join}
             WHERE address.chain_id = $1
               AND ($2::text IS NULL OR address.address = $2 OR address.address_name = $2)
               AND ($3::text IS NULL OR address.address_name = $3)
               AND ($4::text IS NULL OR address.address ILIKE $4)
               AND (
-                  $6::text IS NULL
+                  $5::text IS NULL
                   OR EXISTS (
                       SELECT 1
                       FROM organization_addresses org_address
                       JOIN organizations org ON org.id = org_address.organization_id
                       WHERE org_address.address_id = address.id
-                        AND org.name = $6
+                        AND org.name = $5
                   )
               )
-        ),
-        page AS MATERIALIZED (
-            SELECT base.id, base.balance_raw, base.balance_missing
-            FROM base
-            JOIN addresses address ON address.id = base.id
-            ORDER BY {order_clause}
-            LIMIT $7 OFFSET $8
+            ORDER BY {page_order}
+            LIMIT $6 OFFSET $7
         )
         SELECT
             address.id,
@@ -146,7 +173,7 @@ pub async fn list_addresses(
             trim_scale(address.unclaimed_amount_raw * power(10::numeric, -10))::text AS unclaimed_amount,
             address.unclaimed_amount_raw::text AS unclaimed_amount_raw,
             address.stake_timestamp,
-            CASE WHEN $9::boolean THEN (
+            CASE WHEN $8::boolean THEN (
                 SELECT COALESCE(jsonb_agg(jsonb_build_object(
                     'amount', trim_scale(balance.amount_raw * power(10::numeric, -token.decimals))::text,
                     'amount_raw', balance.amount_raw::text,
@@ -184,22 +211,26 @@ pub async fn list_addresses(
             ) ELSE NULL END AS balances_json
         FROM page
         JOIN addresses address ON address.id = page.id
-        ORDER BY {order_clause}
+        ORDER BY {outer_order}
         "#,
-        order_clause = order_by.order_clause(direction),
     );
-    let rows = sqlx::query(&sql)
+    let query = sqlx::query(&sql)
         .bind(filter.chain_id)
         .bind(filter.address)
         .bind(filter.address_name)
         .bind(filter.address_partial)
-        .bind(filter.symbol)
         .bind(filter.organization_name)
         .bind(limit)
         .bind(offset)
-        .bind(filter.with_balance)
-        .fetch_all(executor)
-        .await?;
+        .bind(filter.with_balance);
+    // $9 exists only in the holders shape; binding it elsewhere would over-supply
+    // the prepared statement.
+    let query = if balance_by_holders {
+        query.bind(balance_token_id)
+    } else {
+        query
+    };
+    let rows = query.fetch_all(executor).await?;
 
     Ok(rows)
 }
