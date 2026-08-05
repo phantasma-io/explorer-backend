@@ -160,6 +160,10 @@ pub async fn list_event_kinds_with_events(
                 AND ($1::integer IS NULL OR event.chain_id = $1)
           )
         ORDER BY event_kind.name ASC
+        -- Defensive bound only: ~70 kinds exist today, but the endpoint is
+        -- unpaginated and Custom_V2 lets contracts mint new kinds, so without a
+        -- cap the response is unbounded by contract.
+        LIMIT 1000
         "#,
     )
     .bind(chain_id)
