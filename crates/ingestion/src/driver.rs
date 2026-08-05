@@ -177,6 +177,30 @@ async fn wait_or_shutdown(backoff: Duration, shutdown: &mut watch::Receiver<bool
     }
 }
 
+/// Await one maintenance pass, unless shutdown arrives first; `None` when it did.
+///
+/// The sibling of [`wait_or_shutdown`] for the pass itself. A maintenance pass can
+/// legitimately run for minutes (measured 2026-08-05: the contract-metadata
+/// candidate SELECT alone held its pass for ~8 minutes on the 76M-event database),
+/// and the shutdown path joins every maintenance task, so a pass that is not raced
+/// against shutdown leaves the worker deaf to SIGTERM for exactly that long —
+/// past any orchestrator's stop grace, i.e. SIGKILL instead of a stop. The block
+/// loop already cancels `sync_once` mid-flight on shutdown; maintenance passes get
+/// the same contract here. Cancelling mid-pass is safe: every family writes in
+/// per-batch transactions, so a dropped pass rolls back its open batch and the
+/// next run redoes it — the guarantee a hard kill already relied on. A cancelled
+/// statement may keep running server-side until Postgres notices the closed
+/// socket; that delays backend cleanup, not process exit.
+async fn pass_or_shutdown<F>(pass: F, shutdown: &mut watch::Receiver<bool>) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        result = pass => Some(result),
+        _ = shutdown.changed() => None,
+    }
+}
+
 /// Result of projecting one fetch window.
 struct WindowOutcome {
     projected_blocks: u64,
@@ -2647,7 +2671,12 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_dirty_balances_once().await {
+            let Some(balance_result) =
+                pass_or_shutdown(self.sync_dirty_balances_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match balance_result {
                 Ok(balance_report) if balance_report.updated_accounts > 0 => info!(
                     "synced balances accounts={} reset_dirty={} dirty_before={} lag={}",
                     balance_report.updated_accounts,
@@ -2682,7 +2711,12 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
-            match self.project_stake_snapshots_once().await {
+            let Some(stake_result) =
+                pass_or_shutdown(self.project_stake_snapshots_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match stake_result {
                 Ok(report) if report.daily_upserted > 0 || report.monthly_upserted > 0 => info!(
                     "built soul-masters curve daily={} monthly={} boundary_masters={}",
                     report.daily_upserted, report.monthly_upserted, report.boundary_masters_count
@@ -2713,7 +2747,12 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_token_supplies_once().await {
+            let Some(supply_result) =
+                pass_or_shutdown(self.sync_token_supplies_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match supply_result {
                 // Only log when something actually changed, like the other
                 // maintenance tasks — supplies rarely move, so logging every tick
                 // would just spam an idle-tip worker once a minute.
@@ -2747,7 +2786,12 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_token_metadata_once().await {
+            let Some(token_metadata_result) =
+                pass_or_shutdown(self.sync_token_metadata_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match token_metadata_result {
                 Ok(report) if report.updated_tokens > 0 => info!(
                     "synced token metadata fetched={} updated={}",
                     report.fetched_tokens, report.updated_tokens
@@ -2775,7 +2819,12 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
-            match self.sync_token_prices_once().await {
+            let Some(price_result) =
+                pass_or_shutdown(self.sync_token_prices_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match price_result {
                 Ok(price_report)
                     if price_report.live_prices_updated > 0
                         || price_report.daily_rows_inserted > 0 =>
@@ -2807,7 +2856,12 @@ impl BlockIngestionDriver {
             if lag.load(Ordering::Relaxed) > BALANCE_SYNC_LAG_THRESHOLD {
                 continue;
             }
-            match self.sync_ttrs_offchain_nfts_once().await {
+            let Some(ttrs_result) =
+                pass_or_shutdown(self.sync_ttrs_offchain_nfts_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match ttrs_result {
                 Ok(ttrs_report) if ttrs_report.updated > 0 => info!(
                     "synced TTRS off-chain NFTs selected={} fetched={} updated={}",
                     ttrs_report.selected, ttrs_report.fetched, ttrs_report.updated
@@ -2838,7 +2892,12 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_contract_upgrade_methods_once().await {
+            let Some(upgrade_result) =
+                pass_or_shutdown(self.sync_contract_upgrade_methods_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match upgrade_result {
                 Ok(upgrade_report)
                     if upgrade_report.inserted_methods > 0
                         || upgrade_report.failed_contracts > 0 =>
@@ -2855,7 +2914,12 @@ impl BlockIngestionDriver {
                 Ok(_) => {}
                 Err(error) => warn!(%error, "contract upgrade method sync failed"),
             }
-            match self.sync_contract_rpc_metadata_once().await {
+            let Some(contract_metadata_result) =
+                pass_or_shutdown(self.sync_contract_rpc_metadata_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match contract_metadata_result {
                 Ok(contract_report)
                     if contract_report.updated_contracts > 0
                         || contract_report.failed_contracts > 0 =>
@@ -2895,7 +2959,12 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_nft_rpc_metadata_once().await {
+            let Some(nft_result) =
+                pass_or_shutdown(self.sync_nft_rpc_metadata_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match nft_result {
                 Ok(nft_report) if nft_report.updated_nfts > 0 => info!(
                     "synced NFT RPC metadata selected={} fetched={} updated={} lag={}",
                     nft_report.selected_nfts,
@@ -2929,7 +2998,12 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_series_rpc_metadata_once().await {
+            let Some(series_result) =
+                pass_or_shutdown(self.sync_series_rpc_metadata_once(), &mut shutdown).await
+            else {
+                return;
+            };
+            match series_result {
                 Ok(series_report) if series_report.updated_series > 0 => info!(
                     "synced series RPC metadata selected={} fetched={} updated={} lag={}",
                     series_report.selected_series,
@@ -2963,7 +3037,15 @@ impl BlockIngestionDriver {
             if self.rpc_maintenance_paused() {
                 continue;
             }
-            match self.sync_failed_transaction_debug_comments_once().await {
+            let Some(failed_tx_result) = pass_or_shutdown(
+                self.sync_failed_transaction_debug_comments_once(),
+                &mut shutdown,
+            )
+            .await
+            else {
+                return;
+            };
+            match failed_tx_result {
                 Ok(debug_report) if debug_report.updated_transactions > 0 => info!(
                     "synced failed tx debug comments selected={} updated={} lag={}",
                     debug_report.selected_transactions,
@@ -3188,6 +3270,38 @@ mod tests {
         // A zero backoff is not a wait at all — it must not park the loop on a
         // channel that may never change.
         assert!(!wait_or_shutdown(Duration::ZERO, &mut shutdown_rx).await);
+    }
+
+    /// A maintenance pass can run for minutes (the contract-metadata candidate
+    /// SELECT was measured at ~8 minutes), and shutdown joins every maintenance
+    /// task — so shutdown must cancel an in-flight pass instead of waiting it out.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_an_in_flight_pass() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(1)).await;
+            let _ = shutdown_tx.send(true);
+        });
+        // A pass longer than any stop grace period: shutdown must win the race.
+        let result = pass_or_shutdown(sleep(Duration::from_secs(600)), &mut shutdown_rx).await;
+        assert!(result.is_none(), "shutdown must cancel the pass");
+    }
+
+    /// Without a shutdown the pass must complete and hand its result through.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_without_shutdown_returns_its_result() {
+        // The sender stays alive for the whole test: a dropped sender completes
+        // `changed()` with an error, which would cancel the pass spuriously.
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let result = pass_or_shutdown(
+            async {
+                sleep(Duration::from_secs(600)).await;
+                7
+            },
+            &mut shutdown_rx,
+        )
+        .await;
+        assert_eq!(result, Some(7));
     }
 
     /// The escalating wait is what actually keeps a struggling node alive: every
