@@ -1091,7 +1091,11 @@ pub async fn update_token_metadata(
 
 /// Refreshes the live `tokens.price_usd` column from an external price feed,
 /// `COALESCE`-guarded so a missing pairing never clobbers a value that is already
-/// there. Returns the number of token rows touched.
+/// there. Guarded to touch a row only when the effective value really changes:
+/// the feed answers every minute and prices mostly stand still, so without the
+/// guard each tick rewrote every priced token row and `rows_affected` stopped
+/// meaning "changed" (the same contract as `update_token_supplies`). Returns the
+/// number of token rows actually changed.
 pub async fn update_token_prices(
     conn: &mut PgConnection,
     chain_id: i32,
@@ -1111,6 +1115,7 @@ pub async fn update_token_prices(
         FROM UNNEST($2::text[], $3::double precision[]) AS desired(symbol, price_usd)
         WHERE token.chain_id = $1
           AND token.symbol = desired.symbol
+          AND COALESCE(desired.price_usd, token.price_usd) IS DISTINCT FROM token.price_usd
         "#,
     )
     .bind(chain_id)
@@ -2573,6 +2578,98 @@ mod tests {
         .fetch_one(&mut *transaction)
         .await?;
         assert_eq!(stored, "1100000000");
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_price_sync_writes_only_what_changed() -> Result<(), Box<dyn std::error::Error>> {
+        // The price feed answers every minute and prices mostly stand still. The
+        // update must touch a row only when the effective value differs — both to
+        // spare the table a rewrite per tick and to keep `rows_affected` (which the
+        // maintenance loop logs as "updated") meaning "changed". Mirror of
+        // `token_supply_sync_writes_only_what_changed`.
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        let chain_id = resolve_chain_id(&mut transaction, &ChainName::new("main")?).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let symbol = format!("RSTPRC{}", &suffix[..8]);
+        let contract_id = upsert_contract_id(&mut transaction, chain_id, &symbol).await?;
+        let owner_id =
+            upsert_address_id(&mut transaction, chain_id, &format!("PTESTPRICE{suffix}")).await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO tokens (
+                symbol, fungible, transferable, finite, divisible, fuel, stakable, fiat,
+                swappable, burnable, decimals,
+                address_id, owner_id, price_usd, chain_id, contract_id,
+                burned_supply_raw, current_supply_raw, max_supply_raw, mintable, name
+            )
+            VALUES (
+                $1, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, 8,
+                $2, $2, 0, $3, $4,
+                0, 0, 0, TRUE, $1
+            )
+            "#,
+        )
+        .bind(&symbol)
+        .bind(owner_id)
+        .bind(chain_id)
+        .bind(contract_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let price = TokenPriceUpsert {
+            symbol: symbol.clone(),
+            price_usd: Some(1.23),
+        };
+
+        let first =
+            update_token_prices(&mut transaction, chain_id, std::slice::from_ref(&price)).await?;
+        assert_eq!(first, 1, "the first sync must write the new price");
+
+        let second =
+            update_token_prices(&mut transaction, chain_id, std::slice::from_ref(&price)).await?;
+        assert_eq!(
+            second, 0,
+            "an unchanged answer must not rewrite the row a second time"
+        );
+
+        let moved = TokenPriceUpsert {
+            symbol: symbol.clone(),
+            price_usd: Some(1.24),
+        };
+        let third = update_token_prices(&mut transaction, chain_id, &[moved]).await?;
+        assert_eq!(third, 1, "a real price change must still be written");
+
+        // A feed answer with no pairing must neither clobber the stored price nor
+        // count as a change.
+        let missing = TokenPriceUpsert {
+            symbol: symbol.clone(),
+            price_usd: None,
+        };
+        let fourth = update_token_prices(&mut transaction, chain_id, &[missing]).await?;
+        assert_eq!(fourth, 0, "a missing pairing is not a change");
+
+        let stored = sqlx::query_scalar::<_, f64>(
+            // price_usd is NUMERIC; cast for the f64 decode — the assertion only
+            // cares that the missing pairing left 1.24 in place.
+            "SELECT price_usd::double precision FROM tokens WHERE chain_id = $1 AND symbol = $2",
+        )
+        .bind(chain_id)
+        .bind(&symbol)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!((stored - 1.24).abs() < f64::EPSILON);
 
         transaction.rollback().await?;
         Ok(())
