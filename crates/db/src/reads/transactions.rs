@@ -235,7 +235,14 @@ pub async fn list_transactions_global(
         "#,
         column = page.order_by.column(),
     );
+    // Not cached as a prepared statement: this list carries the same
+    // `($n IS NULL OR <predicate>)` optional-guard shape the events lists do, and a
+    // cached statement's eventual GENERIC plan cannot reason about those guards (the
+    // June 2026 measured flip: 10 ms custom vs 34.8 s generic on /transactions).
+    // See the full design note on the events list query. The address timeline list
+    // stays cached: it has no optional guards, so its generic plan is the seek plan.
     let rows = sqlx::query(&sql)
+        .persistent(false)
         .bind(filter.chain_id)
         .bind(filter.hash)
         .bind(filter.block_height)
@@ -427,7 +434,9 @@ pub async fn list_transactions_for_filtered_address(
         LIMIT $11
         "#,
     );
+    // Not cached: optional-guard shape — see the note on `list_transactions_global`.
     let rows = sqlx::query(&sql)
+        .persistent(false)
         .bind(address_id)
         .bind(filter.hash)
         .bind(filter.block_height)
