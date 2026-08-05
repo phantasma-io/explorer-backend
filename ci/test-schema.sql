@@ -718,6 +718,31 @@ CREATE TABLE public.stake_boundary_state (
 
 
 --
+-- Name: stake_snapshot_resume; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stake_snapshot_resume (
+    chain_id integer NOT NULL,
+    last_projected_day_unix_seconds bigint NOT NULL,
+    total_staked_raw numeric NOT NULL,
+    soul_supply_raw numeric NOT NULL,
+    stakers_count integer NOT NULL,
+    masters_count integer NOT NULL
+);
+
+
+--
+-- Name: stake_snapshot_resume_stakes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stake_snapshot_resume_stakes (
+    chain_id integer NOT NULL,
+    address text NOT NULL,
+    staked_amount_raw numeric NOT NULL
+);
+
+
+--
 -- Name: staking_progress_dailies; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1117,6 +1142,22 @@ ALTER TABLE ONLY public.transactions
 
 ALTER TABLE ONLY public._sqlx_migrations
     ADD CONSTRAINT _sqlx_migrations_pkey PRIMARY KEY (version);
+
+
+--
+-- Name: stake_snapshot_resume stake_snapshot_resume_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stake_snapshot_resume
+    ADD CONSTRAINT stake_snapshot_resume_pkey PRIMARY KEY (chain_id);
+
+
+--
+-- Name: stake_snapshot_resume_stakes stake_snapshot_resume_stakes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stake_snapshot_resume_stakes
+    ADD CONSTRAINT stake_snapshot_resume_stakes_pkey PRIMARY KEY (chain_id, address);
 
 
 --
@@ -2111,6 +2152,22 @@ ALTER TABLE ONLY public.stake_boundary_balances
 
 ALTER TABLE ONLY public.stake_boundary_state
     ADD CONSTRAINT stake_boundary_state_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES public.chains(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stake_snapshot_resume stake_snapshot_resume_chain_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stake_snapshot_resume
+    ADD CONSTRAINT stake_snapshot_resume_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES public.chains(id);
+
+
+--
+-- Name: stake_snapshot_resume_stakes stake_snapshot_resume_stakes_chain_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stake_snapshot_resume_stakes
+    ADD CONSTRAINT stake_snapshot_resume_stakes_chain_id_fkey FOREIGN KEY (chain_id) REFERENCES public.chains(id);
 
 
 --

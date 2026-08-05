@@ -1412,7 +1412,9 @@ impl BlockIngestionDriver {
         Ok(explorer_db::project_stake_snapshots_forward(&self.pool, chain_id).await?)
     }
 
-    async fn project_stake_snapshots_once(
+    /// One forward Soul-Masters projection pass (what the maintenance cadence
+    /// runs); public for the `--stake-projection-once` operational flag.
+    pub async fn project_stake_snapshots_once(
         &self,
     ) -> Result<explorer_db::StakeForwardBuildReport, IngestionError> {
         let mut conn = self.pool.acquire().await?;
@@ -2731,8 +2733,13 @@ impl BlockIngestionDriver {
             };
             match stake_result {
                 Ok(report) if report.daily_upserted > 0 || report.monthly_upserted > 0 => info!(
-                    "built soul-masters curve daily={} monthly={} boundary_masters={}",
-                    report.daily_upserted, report.monthly_upserted, report.boundary_masters_count
+                    "built soul-masters curve daily={} monthly={} boundary_masters={} resumed_from_day={}",
+                    report.daily_upserted,
+                    report.monthly_upserted,
+                    report.boundary_masters_count,
+                    report
+                        .resumed_from_day_unix_seconds
+                        .map_or_else(|| "boundary".to_owned(), |day| day.to_string()),
                 ),
                 Ok(_) => {}
                 Err(error) => warn!(%error, "stake projection failed"),

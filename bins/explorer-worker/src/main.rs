@@ -31,6 +31,9 @@ struct Args {
     /// One-time: capture the per-address staking snapshot seed and exit.
     #[arg(long, env = "EXPLORER_WORKER_STAKE_BOUNDARY_SLICE_CAPTURE_ONCE")]
     stake_boundary_slice_capture_once: bool,
+    /// Run one Soul-Masters forward projection pass and exit.
+    #[arg(long, env = "EXPLORER_WORKER_STAKE_PROJECTION_ONCE")]
+    stake_projection_once: bool,
     /// Mark all known addresses dirty for balance sync and exit.
     #[arg(long, env = "EXPLORER_WORKER_MARK_ALL_BALANCES_DIRTY_ONCE")]
     mark_all_balances_dirty_once: bool,
@@ -120,6 +123,19 @@ async fn main() -> anyhow::Result<()> {
             report.staked_soul_raw,
             report.soul_supply_raw,
             report.addresses_written
+        );
+        return Ok(());
+    } else if args.stake_projection_once {
+        let report = driver.project_stake_snapshots_once().await?;
+        tracing::info!(
+            "built soul-masters curve daily={} monthly={} boundary_masters={} resumed_from_day={} skipped={}",
+            report.daily_upserted,
+            report.monthly_upserted,
+            report.boundary_masters_count,
+            report
+                .resumed_from_day_unix_seconds
+                .map_or_else(|| "boundary".to_owned(), |day| day.to_string()),
+            report.skipped_reason.as_deref().unwrap_or("-"),
         );
         return Ok(());
     } else if args.mark_all_balances_dirty_once {

@@ -367,6 +367,9 @@ pub struct StakeForwardBuildReport {
     pub validated: bool,
     pub daily_upserted: u64,
     pub monthly_upserted: u64,
+    /// Day of the persisted fold state this run resumed from; `None` on a
+    /// full-from-boundary rebuild (no state, or state inconsistent with the curve).
+    pub resumed_from_day_unix_seconds: Option<i64>,
     pub skipped_reason: Option<String>,
 }
 
@@ -390,6 +393,126 @@ async fn load_max_projected_daily_day(
     .fetch_one(&mut *conn)
     .await?;
     Ok(day)
+}
+
+/// Reads the persisted fold state (see `save_stake_snapshot_resume`): the state as
+/// of the last closed projected day. `None` when no state is stored.
+async fn load_stake_snapshot_resume(
+    conn: &mut PgConnection,
+    chain_id: i32,
+) -> Result<Option<(i64, StakeSnapshotState)>, DbError> {
+    let Some(header) = sqlx::query(
+        r#"
+        SELECT
+            last_projected_day_unix_seconds,
+            total_staked_raw::text AS total_staked_raw,
+            soul_supply_raw::text AS soul_supply_raw,
+            stakers_count,
+            masters_count
+        FROM stake_snapshot_resume
+        WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let rows = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT address, staked_amount_raw::text
+        FROM stake_snapshot_resume_stakes
+        WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut stakes_by_address = HashMap::with_capacity(rows.len());
+    for (address, staked_amount_raw) in rows {
+        stakes_by_address.insert(
+            address,
+            parse_stake_snapshot_raw("staked_amount_raw", &staked_amount_raw)?,
+        );
+    }
+
+    let total_staked_raw: String = header.get("total_staked_raw");
+    let soul_supply_raw: String = header.get("soul_supply_raw");
+    Ok(Some((
+        header.get("last_projected_day_unix_seconds"),
+        StakeSnapshotState {
+            stakes_by_address,
+            total_staked_raw: parse_stake_snapshot_raw("total_staked_raw", &total_staked_raw)?,
+            soul_supply_raw: parse_stake_snapshot_raw("soul_supply_raw", &soul_supply_raw)?,
+            stakers_count: header.get("stakers_count"),
+            masters_count: header.get("masters_count"),
+        },
+    )))
+}
+
+/// Replaces the persisted fold state with `state` as of `last_projected_day` (a
+/// CLOSED day). Runs inside the same transaction as the curve upserts, so the
+/// stored state and the stored curve can never disagree; only addresses with
+/// stake > 0 are written, mirroring the in-memory map (and the boundary capture).
+async fn save_stake_snapshot_resume(
+    conn: &mut PgConnection,
+    chain_id: i32,
+    last_projected_day: i64,
+    state: &StakeSnapshotState,
+) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM stake_snapshot_resume_stakes WHERE chain_id = $1")
+        .bind(chain_id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM stake_snapshot_resume WHERE chain_id = $1")
+        .bind(chain_id)
+        .execute(&mut *conn)
+        .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO stake_snapshot_resume (
+            chain_id, last_projected_day_unix_seconds, total_staked_raw,
+            soul_supply_raw, stakers_count, masters_count
+        )
+        VALUES ($1, $2, $3::numeric, $4::numeric, $5, $6)
+        "#,
+    )
+    .bind(chain_id)
+    .bind(last_projected_day)
+    .bind(state.total_staked_raw.to_string())
+    .bind(state.soul_supply_raw.to_string())
+    .bind(state.stakers_count)
+    .bind(state.masters_count)
+    .execute(&mut *conn)
+    .await?;
+
+    let mut addresses = Vec::new();
+    let mut amounts = Vec::new();
+    for (address, staked) in &state.stakes_by_address {
+        if staked <= &BigInt::zero() {
+            continue;
+        }
+        addresses.push(address.clone());
+        amounts.push(staked.to_string());
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO stake_snapshot_resume_stakes (chain_id, address, staked_amount_raw)
+        SELECT $1, s.address, s.staked_amount_raw::numeric
+        FROM unnest($2::text[], $3::text[]) AS s(address, staked_amount_raw)
+        "#,
+    )
+    .bind(chain_id)
+    .bind(&addresses)
+    .bind(&amounts)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn project_stake_snapshots_forward(
@@ -422,6 +545,7 @@ async fn project_stake_snapshots_forward_in_tx(
         validated: false,
         daily_upserted: 0,
         monthly_upserted: 0,
+        resumed_from_day_unix_seconds: None,
         skipped_reason: Some(reason.to_owned()),
     };
 
@@ -458,7 +582,8 @@ async fn project_stake_snapshots_forward_in_tx(
     // Idempotence: if the curve is already built through the cursor day, the events
     // below it cannot have changed, so skip the full-history scan until a new block
     // advances the day.
-    if let Some(last_built_day) = load_max_projected_daily_day(conn, chain_id).await?
+    let last_built_day = load_max_projected_daily_day(conn, chain_id).await?;
+    if let Some(last_built_day) = last_built_day
         && last_built_day >= cursor_day
     {
         return Ok(skip(
@@ -468,12 +593,39 @@ async fn project_stake_snapshots_forward_in_tx(
         ));
     }
 
-    // Replay the stake events from the day after the seed to the cursor and write the
-    // whole forward curve. The build from the frozen seed + the complete on-chain stake
-    // events IS the source of truth.
-    let events = load_stake_snapshot_events(conn, chain_id, from_day, cursor_timestamp).await?;
-    let curve =
-        build_stake_snapshot_daily_points(boundary_state, &events, from_day, target_exclusive_day)?;
+    // Resume from the persisted fold state when it provably matches the stored
+    // curve: a building run always leaves the state at (last built day − 1) — the
+    // last CLOSED day — because the final built day is the open cursor day. Any
+    // other relationship (no state, a manually trimmed curve, a state older than
+    // this schema) falls back to the full-from-boundary rebuild, which remains
+    // the source of truth; resuming only shortens the replay, never changes it.
+    let resume = load_stake_snapshot_resume(conn, chain_id).await?;
+    let (replay_from_day, replay_state, resumed_from_day) = match (resume, last_built_day) {
+        (Some((resume_day, resume_state)), Some(last_built_day))
+            if resume_day + STAKE_SNAPSHOT_SECONDS_PER_DAY == last_built_day
+                && resume_day > boundary_day =>
+        {
+            (
+                resume_day + STAKE_SNAPSHOT_SECONDS_PER_DAY,
+                resume_state,
+                Some(resume_day),
+            )
+        }
+        _ => (from_day, boundary_state, None),
+    };
+
+    // Replay the stake events from the resume day (or the day after the seed) to the
+    // cursor and write the forward curve. The build from the frozen seed + the
+    // complete on-chain stake events IS the source of truth; the resume state is that
+    // same fold, persisted.
+    let events =
+        load_stake_snapshot_events(conn, chain_id, replay_from_day, cursor_timestamp).await?;
+    let (curve, closed_day_state) = build_stake_snapshot_daily_points(
+        replay_state,
+        &events,
+        replay_from_day,
+        target_exclusive_day,
+    )?;
     let daily_upserted = upsert_stake_snapshot_daily_points(conn, chain_id, &curve).await?;
     let monthly_upserted = upsert_stake_snapshot_monthlies_from_daily(
         conn,
@@ -482,6 +634,12 @@ async fn project_stake_snapshots_forward_in_tx(
         target_exclusive_day,
     )
     .await?;
+    // Persist the fold state at the window's last closed day. A single-day window
+    // (only the open cursor day was rebuilt) yields no newly closed day, and the
+    // stored state — still at the previous closed day — stays exactly right.
+    if let Some((closed_day, state)) = closed_day_state {
+        save_stake_snapshot_resume(conn, chain_id, closed_day, &state).await?;
+    }
 
     Ok(StakeForwardBuildReport {
         chain_id,
@@ -490,6 +648,7 @@ async fn project_stake_snapshots_forward_in_tx(
         validated: true,
         daily_upserted,
         monthly_upserted,
+        resumed_from_day_unix_seconds: resumed_from_day,
         skipped_reason: None,
     })
 }
@@ -737,13 +896,27 @@ fn reverse_replay_stake_snapshot_events(
     Ok(())
 }
 
+/// A built daily window plus the fold state at its last CLOSED day (`None` for a
+/// single-day window) — the anchor the next run may resume from.
+type StakeSnapshotBuildOutput = (
+    Vec<StakeSnapshotDailyPoint>,
+    Option<(i64, StakeSnapshotState)>,
+);
+
+/// Folds the stake events into one daily point per day in `[from_day,
+/// to_exclusive_day)`. Also returns the fold state as of the last CLOSED day of
+/// the window (the penultimate day; `None` when the window holds a single day):
+/// the final day is the cursor day, still open to future blocks, so its state is
+/// provisional and must never seed a resume — a resuming run re-reads the open
+/// day's events in full and corrects its daily point.
 fn build_stake_snapshot_daily_points(
     mut state: StakeSnapshotState,
     rows: &[StakeSnapshotEventRow],
     from_day: i64,
     to_exclusive_day: i64,
-) -> Result<Vec<StakeSnapshotDailyPoint>, DbError> {
+) -> Result<StakeSnapshotBuildOutput, DbError> {
     let mut snapshots = Vec::new();
+    let mut closed_day_state = None;
     let mut tx_group_start = 0;
     let mut day_cursor = from_day;
 
@@ -771,10 +944,13 @@ fn build_stake_snapshot_daily_points(
             masters_count: state.masters_count,
             captured_at_unix_seconds: day_end,
         });
+        if day_cursor + 2 * STAKE_SNAPSHOT_SECONDS_PER_DAY == to_exclusive_day {
+            closed_day_state = Some((day_cursor, state.clone()));
+        }
         day_cursor += STAKE_SNAPSHOT_SECONDS_PER_DAY;
     }
 
-    Ok(snapshots)
+    Ok((snapshots, closed_day_state))
 }
 
 fn deduplicate_stake_snapshot_tx_rows(
@@ -1210,12 +1386,20 @@ mod tests {
         assert_eq!(current_state.total_staked_raw, BigInt::zero());
         assert_eq!(current_state.stakers_count, 0);
 
-        let points = build_stake_snapshot_daily_points(current_state, &rows, day_one, day_three)?;
+        let (points, closed_day_state) =
+            build_stake_snapshot_daily_points(current_state, &rows, day_one, day_three)?;
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].date_unix_seconds, day_one);
         assert_eq!(points[0].staked_soul_raw, "50");
         assert_eq!(points[1].date_unix_seconds, day_two);
         assert_eq!(points[1].staked_soul_raw, "30");
+        // The resume anchor is the penultimate (last closed) day of the window.
+        let (closed_day, closed_state) =
+            closed_day_state.ok_or_else(|| DbError::StakeSnapshotReplay {
+                reason: "expected a closed-day state for a two-day window".to_owned(),
+            })?;
+        assert_eq!(closed_day, day_one);
+        assert_eq!(closed_state.total_staked_raw, BigInt::from(50));
 
         Ok(())
     }
@@ -1246,10 +1430,118 @@ mod tests {
         reverse_replay_stake_snapshot_events(&mut current_state, &rows)?;
         assert_eq!(current_state.total_staked_raw, BigInt::zero());
 
-        let points = build_stake_snapshot_daily_points(current_state, &rows, day_one, open_day)?;
+        let (points, closed_day_state) =
+            build_stake_snapshot_daily_points(current_state, &rows, day_one, open_day)?;
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].date_unix_seconds, day_one);
         assert_eq!(points[0].staked_soul_raw, "50");
+        // A single-day window has no newly closed day to anchor a resume on.
+        assert!(closed_day_state.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn stake_snapshot_resume_equals_full_rebuild_and_corrects_the_open_day() -> Result<(), DbError>
+    {
+        // The incremental-resume contract: folding from the persisted closed-day
+        // state over the remaining events must equal the full-from-boundary fold —
+        // including the day that was OPEN (and therefore provisional) when the
+        // state was saved. Run 1 sees day three only up to its cursor; a late
+        // day-three event lands afterwards. Run 2 resumes from the day-two state,
+        // re-reads day three in full, corrects its point, and continues into day
+        // four. The merged curve must match the one-shot full fold point for point.
+        let day_one = 1_700_000_000 - 1_700_000_000_i64.rem_euclid(86_400);
+        let day_two = day_one + 86_400;
+        let day_three = day_two + 86_400;
+        let day_four = day_three + 86_400;
+        let day_five = day_four + 86_400;
+
+        let start_state = || StakeSnapshotState {
+            stakes_by_address: std::collections::HashMap::new(),
+            total_staked_raw: BigInt::zero(),
+            soul_supply_raw: BigInt::from(1_000),
+            stakers_count: 0,
+            masters_count: 0,
+        };
+        let all_rows = vec![
+            test_stake_snapshot_token_row(1, 1, "TokenStake", day_one + 10, "PTESTA", "50")?,
+            test_stake_snapshot_token_row(2, 2, "TokenClaim", day_two + 10, "PTESTA", "20")?,
+            test_stake_snapshot_token_row(3, 3, "TokenStake", day_three + 10, "PTESTA", "10")?,
+            // The late day-three event: exists on chain only after run 1's cursor.
+            test_stake_snapshot_token_row(4, 4, "TokenStake", day_three + 80_000, "PTESTA", "7")?,
+            test_stake_snapshot_token_row(5, 5, "TokenStake", day_four + 10, "PTESTB", "3")?,
+        ];
+
+        // Run 1: cursor sits early in day three — the late event is not visible yet.
+        let run_one_rows: Vec<StakeSnapshotEventRow> = all_rows
+            .iter()
+            .filter(|row| row.timestamp_unix_seconds <= day_three + 20)
+            .cloned()
+            .collect();
+        let (run_one_points, run_one_closed) =
+            build_stake_snapshot_daily_points(start_state(), &run_one_rows, day_one, day_four)?;
+        assert_eq!(run_one_points.len(), 3);
+        assert_eq!(
+            run_one_points[2].staked_soul_raw, "40",
+            "day three is provisional at run 1's cursor"
+        );
+        let (resume_day, resume_state) =
+            run_one_closed.ok_or_else(|| DbError::StakeSnapshotReplay {
+                reason: "run 1 must anchor its resume at day two".to_owned(),
+            })?;
+        assert_eq!(resume_day, day_two);
+
+        // Run 2: resumes from the day-two state, re-reads day three IN FULL.
+        let run_two_rows: Vec<StakeSnapshotEventRow> = all_rows
+            .iter()
+            .filter(|row| row.timestamp_unix_seconds >= day_three)
+            .cloned()
+            .collect();
+        let (run_two_points, run_two_closed) =
+            build_stake_snapshot_daily_points(resume_state, &run_two_rows, day_three, day_five)?;
+        assert_eq!(run_two_points.len(), 2);
+
+        // The one-shot full fold is the truth to match.
+        let (full_points, full_closed) =
+            build_stake_snapshot_daily_points(start_state(), &all_rows, day_one, day_five)?;
+        assert_eq!(full_points.len(), 4);
+        assert_eq!(
+            full_points[2].staked_soul_raw, "47",
+            "the closed day three includes the late event"
+        );
+
+        // Merged incremental curve == full curve, field by field.
+        let merged: Vec<&StakeSnapshotDailyPoint> = run_one_points[..2]
+            .iter()
+            .chain(run_two_points.iter())
+            .collect();
+        for (merged_point, full_point) in merged.iter().zip(full_points.iter()) {
+            assert_eq!(merged_point.date_unix_seconds, full_point.date_unix_seconds);
+            assert_eq!(merged_point.staked_soul_raw, full_point.staked_soul_raw);
+            assert_eq!(merged_point.soul_supply_raw, full_point.soul_supply_raw);
+            assert_eq!(merged_point.stakers_count, full_point.stakers_count);
+            assert_eq!(merged_point.masters_count, full_point.masters_count);
+        }
+
+        // And the next resume anchor is identical on both paths.
+        let (run_two_day, run_two_state) =
+            run_two_closed.ok_or_else(|| DbError::StakeSnapshotReplay {
+                reason: "run 2 must anchor its resume at day three".to_owned(),
+            })?;
+        let (full_day, full_state) = full_closed.ok_or_else(|| DbError::StakeSnapshotReplay {
+            reason: "the full fold must anchor its resume at day three".to_owned(),
+        })?;
+        assert_eq!(run_two_day, day_three);
+        assert_eq!(full_day, day_three);
+        assert_eq!(run_two_state.total_staked_raw, full_state.total_staked_raw);
+        assert_eq!(run_two_state.soul_supply_raw, full_state.soul_supply_raw);
+        assert_eq!(run_two_state.stakers_count, full_state.stakers_count);
+        assert_eq!(run_two_state.masters_count, full_state.masters_count);
+        assert_eq!(
+            run_two_state.stakes_by_address,
+            full_state.stakes_by_address
+        );
 
         Ok(())
     }
@@ -1382,6 +1674,70 @@ mod tests {
         );
 
         tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stake_snapshot_resume_state_round_trips_and_replaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The persisted fold state must come back exactly as saved (the resumed
+        // fold's arithmetic depends on it verbatim), and a newer save must fully
+        // replace the previous run's rows — stale per-address stakes surviving a
+        // replace would corrupt every later resumed fold.
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        let chain_id = resolve_chain_id(&mut transaction, &ChainName::new("main")?).await?;
+        let day = 1_700_000_000 - 1_700_000_000_i64.rem_euclid(86_400);
+
+        let state = StakeSnapshotState {
+            stakes_by_address: std::collections::HashMap::from([
+                ("PTESTRESA".to_owned(), BigInt::from(50)),
+                // Above the master threshold, so masters_count is a real value.
+                ("PTESTRESB".to_owned(), BigInt::from(7_000_000_000_000_i64)),
+            ]),
+            total_staked_raw: BigInt::from(7_000_000_000_050_i64),
+            soul_supply_raw: BigInt::from(123_456_789),
+            stakers_count: 2,
+            masters_count: 1,
+        };
+        save_stake_snapshot_resume(&mut transaction, chain_id, day, &state).await?;
+        let (loaded_day, loaded) = load_stake_snapshot_resume(&mut transaction, chain_id)
+            .await?
+            .ok_or("saved state must load back")?;
+        assert_eq!(loaded_day, day);
+        assert_eq!(loaded.stakes_by_address, state.stakes_by_address);
+        assert_eq!(loaded.total_staked_raw, state.total_staked_raw);
+        assert_eq!(loaded.soul_supply_raw, state.soul_supply_raw);
+        assert_eq!(loaded.stakers_count, state.stakers_count);
+        assert_eq!(loaded.masters_count, state.masters_count);
+
+        let next = StakeSnapshotState {
+            stakes_by_address: std::collections::HashMap::from([(
+                "PTESTRESB".to_owned(),
+                BigInt::from(7_000_000_000_000_i64),
+            )]),
+            total_staked_raw: BigInt::from(7_000_000_000_000_i64),
+            soul_supply_raw: BigInt::from(123_456_790),
+            stakers_count: 1,
+            masters_count: 1,
+        };
+        save_stake_snapshot_resume(&mut transaction, chain_id, day + 86_400, &next).await?;
+        let (replaced_day, replaced) = load_stake_snapshot_resume(&mut transaction, chain_id)
+            .await?
+            .ok_or("replaced state must load back")?;
+        assert_eq!(replaced_day, day + 86_400);
+        assert_eq!(
+            replaced.stakes_by_address, next.stakes_by_address,
+            "the previous run's per-address rows must be fully replaced"
+        );
+
+        transaction.rollback().await?;
         Ok(())
     }
 
