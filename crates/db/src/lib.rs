@@ -1960,7 +1960,9 @@ pub async fn upsert_transaction_cached(
                 timestamp_unix_seconds = $3,
                 payload = $4,
                 script_raw = decode($5, 'hex'),
-                result = $6,
+                -- '' and NULL both mean "no result"; store the one canonical form
+                -- (legacy rows keep whichever they carry — read paths treat them alike).
+                result = NULLIF($6, ''),
                 expiration = $7,
                 state_id = $8,
                 sender_id = $9,
@@ -2023,7 +2025,7 @@ pub async fn upsert_transaction_cached(
                 debug_comment
             )
             VALUES (
-                $1, $2, $3, $4, $5, decode($6, 'hex'), $7, $8, $9, $10,
+                $1, $2, $3, $4, $5, decode($6, 'hex'), NULLIF($7, ''), $8, $9, $10,
                 $11, $12, NULLIF($13, '')::numeric, NULLIF($14, '')::numeric,
                 NULLIF($15, '')::numeric, decode($16, 'hex'), $17, $18
             )
@@ -2215,7 +2217,9 @@ pub async fn batch_upsert_transactions(
         )
         SELECT
             t.hash, t.tx_index, t.block_id, t.timestamp, t.payload, decode(t.script_raw, 'hex'),
-            t.result, t.expiration, t.state_id, t.sender_id, t.gas_payer_id, t.gas_target_id,
+            -- '' and NULL both mean "no result"; new rows store the canonical NULL.
+            NULLIF(t.result, ''), t.expiration, t.state_id, t.sender_id, t.gas_payer_id,
+            t.gas_target_id,
             NULLIF(t.fee_raw, '')::numeric, NULLIF(t.gas_limit_raw, '')::numeric,
             NULLIF(t.gas_price_raw, '')::numeric, decode(t.carbon_tx_data, 'hex'),
             t.carbon_tx_type, t.debug_comment
@@ -2670,6 +2674,118 @@ mod tests {
         .fetch_one(&mut *transaction)
         .await?;
         assert!((stored - 1.24).abs() < f64::EPSILON);
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transaction_writers_store_empty_result_as_null()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The node reports "no result" as an empty string; legacy rows stored it
+        // verbatim, so the column carries two spellings of the same fact. Every
+        // writer (single insert, single update, batch insert) now normalizes
+        // '' -> NULL for rows it writes; stored legacy rows keep whichever form
+        // they have (read paths already treat them alike).
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut transaction, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+
+        let block = upsert_block(
+            &mut transaction,
+            &mut ProjectionDimensionCache::new(),
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_500_000),
+                hash: format!("TESTRESULTBLOCK{suffix}"),
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: 1_800_500_000,
+                reward: None,
+            },
+        )
+        .await?;
+        let seed_tx = |tx_index: i32, result: Option<&str>| TransactionUpsert {
+            block_id: block.id,
+            chain_id,
+            tx_index,
+            hash: format!("TESTRESULTTX{tx_index}{suffix}"),
+            timestamp_unix_seconds: block.timestamp_unix_seconds,
+            state: "Halt".to_owned(),
+            result: result.map(str::to_owned),
+            debug_comment: None,
+            payload: None,
+            script_raw: None,
+            fee_raw: None,
+            gas_price_raw: None,
+            gas_limit_raw: None,
+            sender: None,
+            gas_payer: None,
+            gas_target: None,
+            carbon_tx_type: None,
+            carbon_tx_data: None,
+            expiration_unix_seconds: 0,
+            signatures: Vec::new(),
+        };
+        let stored_result = |id: i32| {
+            sqlx::query_scalar::<_, Option<String>>("SELECT result FROM transactions WHERE id = $1")
+                .bind(id)
+        };
+
+        // Single-insert path.
+        let empty = upsert_transaction(&mut transaction, seed_tx(0, Some(""))).await?;
+        assert_eq!(
+            stored_result(empty.id).fetch_one(&mut *transaction).await?,
+            None,
+            "single insert must store '' as NULL"
+        );
+        let real = upsert_transaction(&mut transaction, seed_tx(1, Some("2A"))).await?;
+        assert_eq!(
+            stored_result(real.id).fetch_one(&mut *transaction).await?,
+            Some("2A".to_owned()),
+            "a real result must be stored verbatim"
+        );
+
+        // Single-update path: re-projecting the same slot with an empty result.
+        let updated = upsert_transaction(&mut transaction, seed_tx(1, Some(""))).await?;
+        assert_eq!(updated.id, real.id);
+        assert_eq!(
+            stored_result(real.id).fetch_one(&mut *transaction).await?,
+            None,
+            "the update path must normalize too"
+        );
+
+        // Batch path (the production block write).
+        let batch = batch_upsert_transactions(
+            &mut transaction,
+            &mut ProjectionDimensionCache::new(),
+            vec![seed_tx(2, Some("")), seed_tx(3, Some("2B"))],
+        )
+        .await?;
+        assert_eq!(
+            stored_result(batch[0].id)
+                .fetch_one(&mut *transaction)
+                .await?,
+            None,
+            "batch insert must store '' as NULL"
+        );
+        assert_eq!(
+            stored_result(batch[1].id)
+                .fetch_one(&mut *transaction)
+                .await?,
+            Some("2B".to_owned())
+        );
 
         transaction.rollback().await?;
         Ok(())
