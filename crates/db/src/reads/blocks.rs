@@ -198,6 +198,7 @@ mod tests {
 
         let with_producer = upsert_block(
             &mut tx,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_200_000),
@@ -213,6 +214,7 @@ mod tests {
         .await?;
         let without_producer = upsert_block(
             &mut tx,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_200_001),

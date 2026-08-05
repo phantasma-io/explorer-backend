@@ -1048,6 +1048,7 @@ mod tests {
 
         let block = upsert_block(
             &mut transaction,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain,
                 height: BlockHeight::new(9_900_200_000),

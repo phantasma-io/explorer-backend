@@ -249,6 +249,9 @@ impl BlockIngestionDriver {
             settings,
             node_guard_checked: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             relief: Arc::new(RpcReliefState::default()),
+            dimensions: Arc::new(tokio::sync::Mutex::new(
+                explorer_db::ProjectionDimensionCache::new(),
+            )),
         }
     }
 
@@ -332,10 +335,14 @@ impl BlockIngestionDriver {
 
         let block = self.fetch_decoded_block_for_projection(height).await?;
         let mut transaction = self.pool.begin().await?;
+        let mut dimensions = self.dimensions.lock().await;
+        let mut dimension_cache = dimensions.take_for_block();
         let block_record = self
-            .project_decoded_block(&mut transaction, height, &block)
+            .project_decoded_block(&mut transaction, height, &block, &mut dimension_cache)
             .await?;
         transaction.commit().await?;
+        // Only after the commit: a failed block must not feed the shared cache.
+        dimensions.restore_after_commit(dimension_cache);
 
         Ok(block_record)
     }
@@ -355,12 +362,16 @@ impl BlockIngestionDriver {
 
         let block = self.fetch_decoded_block_for_projection(height).await?;
         let mut transaction = self.pool.begin().await?;
+        let mut dimensions = self.dimensions.lock().await;
+        let mut dimension_cache = dimensions.take_for_block();
         let block_record = self
-            .project_decoded_block(&mut transaction, height, &block)
+            .project_decoded_block(&mut transaction, height, &block, &mut dimension_cache)
             .await?;
         let cursor_height_after =
             explorer_db::advance_cursor(&mut transaction, block_record.chain_id, height).await?;
         transaction.commit().await?;
+        // Only after the commit: a failed block must not feed the shared cache.
+        dimensions.restore_after_commit(dimension_cache);
 
         Ok((block_record, cursor_height_after))
     }
@@ -480,19 +491,20 @@ impl BlockIngestionDriver {
         Ok(true)
     }
 
+    /// `dimension_cache` arrives via `ProjectionDimensionCache::take_for_block`
+    /// from the process-lifetime holder: addresses/states are per-block scopes,
+    /// kinds/contracts/header-addresses carry over from earlier committed
+    /// blocks. The caller restores it only after its transaction commits.
     async fn project_decoded_block(
         &self,
         conn: &mut PgConnection,
         height: BlockHeight,
         block: &SdkBlockResult,
+        dimension_cache: &mut explorer_db::ProjectionDimensionCache,
     ) -> Result<BlockRecord, IngestionError> {
         let projection = block_result_to_projection(&self.chain.chain, height, block)?;
-        let block_record = explorer_db::upsert_block(conn, projection).await?;
+        let block_record = explorer_db::upsert_block(conn, dimension_cache, projection).await?;
 
-        // One dimension cache per block: addresses/states/kinds/contracts are
-        // resolved once on first encounter (in transaction/event order) and
-        // reused across the block's transactions and events.
-        let mut dimension_cache = explorer_db::ProjectionDimensionCache::new();
         let mut transaction_projections = Vec::with_capacity(block.txs.len());
         for (tx_index, transaction) in block.txs.iter().enumerate() {
             transaction_projections.push(transaction_result_to_projection(
@@ -522,12 +534,9 @@ impl BlockIngestionDriver {
             .prefetch_addresses(conn, block_record.chain_id, &tx_addresses)
             .await?;
         // Upsert the block's transactions set-based; records come back in tx order.
-        let transaction_records = explorer_db::batch_upsert_transactions(
-            conn,
-            &mut dimension_cache,
-            transaction_projections,
-        )
-        .await?;
+        let transaction_records =
+            explorer_db::batch_upsert_transactions(conn, dimension_cache, transaction_projections)
+                .await?;
 
         let mut transaction_ids = Vec::with_capacity(transaction_records.len());
         let mut event_batches = Vec::with_capacity(transaction_records.len());
@@ -546,7 +555,7 @@ impl BlockIngestionDriver {
         // Write all of the block's events set-based, then apply each
         // transaction's stateful side effects in order, then link address
         // activity — all reading the rows just written.
-        explorer_db::project_block_events(conn, &mut dimension_cache, &event_batches).await?;
+        explorer_db::project_block_events(conn, dimension_cache, &event_batches).await?;
         explorer_db::replace_address_transactions_for_block(conn, &transaction_ids).await?;
         explorer_db::mark_block_addresses_dirty(conn, block_record.id, height).await?;
 
@@ -993,12 +1002,16 @@ impl BlockIngestionDriver {
         block: &SdkBlockResult,
     ) -> Result<BlockHeight, IngestionError> {
         let mut transaction = self.pool.begin().await?;
+        let mut dimensions = self.dimensions.lock().await;
+        let mut dimension_cache = dimensions.take_for_block();
         let block_record = self
-            .project_decoded_block(&mut transaction, height, block)
+            .project_decoded_block(&mut transaction, height, block, &mut dimension_cache)
             .await?;
         let cursor_height_after =
             explorer_db::advance_cursor(&mut transaction, block_record.chain_id, height).await?;
         transaction.commit().await?;
+        // Only after the commit: a failed block must not feed the shared cache.
+        dimensions.restore_after_commit(dimension_cache);
         Ok(cursor_height_after)
     }
 

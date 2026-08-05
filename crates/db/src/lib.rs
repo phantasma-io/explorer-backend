@@ -622,12 +622,36 @@ pub async fn advance_cursor(
         .map_err(|_| DbError::StoredBlockHeightOutOfRange { height: stored })
 }
 
+/// Resolves an address to its id, creating the row on first sight.
+///
+/// SELECT-first, like `upsert_transaction_state_id`'s idiom: the overwhelmingly
+/// common case is an address that already has a row, and the previous
+/// `ON CONFLICT … DO UPDATE SET address = addresses.address` idiom turned every
+/// such hit into a real no-op UPDATE — a dead tuple plus WAL per resolve
+/// (measured 2026-08-05 on the local full resync: 17.4M updates against a 40k-row
+/// table). The insert keeps `DO NOTHING` + re-select for the concurrent-insert
+/// race (block projection vs the balance/metadata passes on hot addresses):
+/// whichever writer loses the insert still finds the winner's row.
 pub async fn upsert_address_id(
     conn: &mut PgConnection,
     chain_id: i32,
     address: &str,
 ) -> Result<i32, DbError> {
-    let id = sqlx::query_scalar::<_, i32>(
+    let select = r#"
+        SELECT id
+        FROM addresses
+        WHERE chain_id = $1 AND address = $2
+        "#;
+    if let Some(id) = sqlx::query_scalar::<_, i32>(select)
+        .bind(chain_id)
+        .bind(address)
+        .fetch_optional(&mut *conn)
+        .await?
+    {
+        return Ok(id);
+    }
+
+    if let Some(id) = sqlx::query_scalar::<_, i32>(
         r#"
         INSERT INTO addresses (
             address,
@@ -638,15 +662,25 @@ pub async fn upsert_address_id(
             balance_dirty_block
         )
         VALUES ($1, $2, 0, 0, 0, 0)
-        ON CONFLICT (chain_id, address) DO UPDATE SET
-            address = addresses.address
+        ON CONFLICT (chain_id, address) DO NOTHING
         RETURNING id
         "#,
     )
     .bind(address)
     .bind(chain_id)
-    .fetch_one(&mut *conn)
-    .await?;
+    .fetch_optional(&mut *conn)
+    .await?
+    {
+        return Ok(id);
+    }
+
+    // The insert conflicted: a concurrent writer created the row between the
+    // select and the insert, so this select must find it.
+    let id = sqlx::query_scalar::<_, i32>(select)
+        .bind(chain_id)
+        .bind(address)
+        .fetch_one(&mut *conn)
+        .await?;
 
     Ok(id)
 }
@@ -1443,11 +1477,40 @@ async fn replace_address_balances(
     Ok(missing_symbols)
 }
 
+/// Resolves a contract (by its event-path name-as-hash) to its id, creating the
+/// row on first sight.
+///
+/// Unlike the address/event-kind upserts this one is not a pure self-assign: on
+/// conflict it also backfills an empty `name`/`symbol` from the resolved value.
+/// The SELECT therefore checks whether the stored row still needs that backfill
+/// and only falls through to the write when it does (or when the row is
+/// missing). The write statement is the previous upsert unchanged, so the
+/// backfill-and-race semantics stay exactly as before; the common
+/// already-filled case stops producing a no-op UPDATE per resolve (4.8M updates
+/// against this 179-row table over one full resync).
 pub async fn upsert_contract_id(
     conn: &mut PgConnection,
     chain_id: i32,
     contract: &str,
 ) -> Result<i32, DbError> {
+    if let Some((id, name, symbol)) = sqlx::query_as::<_, (i32, Option<String>, Option<String>)>(
+        r#"
+        SELECT id, name, symbol
+        FROM contracts
+        WHERE chain_id = $1 AND hash = $2
+        "#,
+    )
+    .bind(chain_id)
+    .bind(contract)
+    .fetch_optional(&mut *conn)
+    .await?
+    {
+        let filled = |value: Option<String>| value.is_some_and(|value| !value.is_empty());
+        if filled(name) && filled(symbol) {
+            return Ok(id);
+        }
+    }
+
     let id = sqlx::query_scalar::<_, i32>(
         r#"
         INSERT INTO contracts (name, hash, symbol, chain_id, last_updated_unix_seconds)
@@ -1476,19 +1539,44 @@ pub async fn upsert_contract_id(
 ///
 /// The dimension is global: an event kind is a protocol concept, so the same name is the
 /// same row on every chain.
+///
+/// SELECT-first for the same reason as `upsert_address_id`: the old self-assign
+/// `DO UPDATE` produced a real no-op UPDATE per resolve — 11.9M updates against
+/// this 70-row table over one full resync.
 pub async fn upsert_event_kind_id(conn: &mut PgConnection, name: &str) -> Result<i32, DbError> {
-    let id = sqlx::query_scalar::<_, i32>(
+    let select = r#"
+        SELECT id
+        FROM event_kinds
+        WHERE name = $1
+        "#;
+    if let Some(id) = sqlx::query_scalar::<_, i32>(select)
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?
+    {
+        return Ok(id);
+    }
+
+    if let Some(id) = sqlx::query_scalar::<_, i32>(
         r#"
         INSERT INTO event_kinds (name)
         VALUES ($1)
-        ON CONFLICT (name) DO UPDATE SET
-            name = event_kinds.name
+        ON CONFLICT (name) DO NOTHING
         RETURNING id
         "#,
     )
     .bind(name)
-    .fetch_one(&mut *conn)
-    .await?;
+    .fetch_optional(&mut *conn)
+    .await?
+    {
+        return Ok(id);
+    }
+
+    // Lost a concurrent-insert race; the winner's committed row must be there.
+    let id = sqlx::query_scalar::<_, i32>(select)
+        .bind(name)
+        .fetch_one(&mut *conn)
+        .await?;
 
     Ok(id)
 }
@@ -1527,17 +1615,26 @@ pub async fn upsert_transaction_state_id(
 
 pub async fn upsert_block(
     conn: &mut PgConnection,
+    cache: &mut ProjectionDimensionCache,
     block: BlockUpsert,
 ) -> Result<BlockRecord, DbError> {
     let chain_id = resolve_chain_id(conn, &block.chain).await?;
     let chain_address = block.chain_address.as_deref().unwrap_or("NULL");
     let validator_address = block.validator_address.as_deref().unwrap_or("NULL");
-    let chain_address_id = upsert_address_id(conn, chain_id, chain_address).await?;
-    let validator_address_id = upsert_address_id(conn, chain_id, validator_address).await?;
+    let chain_address_id = cache
+        .header_address_id(conn, chain_id, chain_address)
+        .await?;
+    let validator_address_id = cache
+        .header_address_id(conn, chain_id, validator_address)
+        .await?;
     // Resolved only when present — never through the "NULL" sentinel used for
     // chain/validator, or every pre-v2 block would gain a bogus address link.
     let producer_address_id = match block.producer_address.as_deref() {
-        Some(producer_address) => Some(upsert_address_id(conn, chain_id, producer_address).await?),
+        Some(producer_address) => Some(
+            cache
+                .header_address_id(conn, chain_id, producer_address)
+                .await?,
+        ),
         None => None,
     };
     let height = block_height_to_i64(block.height)?;
@@ -1627,16 +1724,34 @@ pub async fn upsert_block(
     })
 }
 
-/// Per-block memoization of dimension lookups (addresses, transaction states,
-/// event kinds, contracts) for the ingestion projection. Each distinct value is
+/// Memoization of dimension lookups (addresses, transaction states, event
+/// kinds, contracts) for the ingestion projection. Each distinct value is
 /// resolved once via the underlying upsert and then reused, removing the
 /// redundant per-transaction/per-event resolve round-trips (and their no-op WAL
 /// writes). Resolution order is unchanged — values are still resolved on first
 /// encounter in transaction/event order — so any newly inserted dimension rows
 /// receive identical surrogate ids.
+///
+/// Lifetimes differ per family. `addresses` and `transaction_states` are
+/// per-block scopes. `event_kinds`, `contracts` and `header_addresses` may
+/// survive across blocks via [`Self::take_for_block`] /
+/// [`Self::restore_after_commit`]: those dimensions are insert-only (rows are
+/// never deleted and ids never change — dimension deletes are FK-forbidden), so
+/// an entry proven committed can never go stale, and the three block-header
+/// addresses repeat block after block — re-resolving them per block was one
+/// no-op round-trip per address per block.
+///
+/// The take/restore pair exists because a cross-block cache must not outlive a
+/// rollback: an id minted inside a block transaction that later fails would
+/// poison every later block (FK breaks, or worse a re-minted id pointing at a
+/// different row). The holder therefore hands the long-lived maps TO the block
+/// write and takes them back only after its COMMIT returns; on any error or
+/// cancellation the maps die with the block cache and the next block re-reads
+/// ids from the database, which only ever costs a handful of SELECTs.
 #[derive(Default)]
 pub struct ProjectionDimensionCache {
     addresses: HashMap<(i32, String), i32>,
+    header_addresses: HashMap<(i32, String), i32>,
     transaction_states: HashMap<String, i32>,
     event_kinds: HashMap<String, i32>,
     contracts: HashMap<(i32, String), i32>,
@@ -1645,6 +1760,29 @@ pub struct ProjectionDimensionCache {
 impl ProjectionDimensionCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Moves the cross-block families into a fresh per-block cache (leaving
+    /// `self` — the process-lifetime holder — empty of them until
+    /// [`Self::restore_after_commit`] brings them back enriched).
+    pub fn take_for_block(&mut self) -> ProjectionDimensionCache {
+        ProjectionDimensionCache {
+            addresses: HashMap::new(),
+            transaction_states: HashMap::new(),
+            header_addresses: std::mem::take(&mut self.header_addresses),
+            event_kinds: std::mem::take(&mut self.event_kinds),
+            contracts: std::mem::take(&mut self.contracts),
+        }
+    }
+
+    /// Returns the cross-block families after the block's transaction has
+    /// COMMITTED — the only point where their new entries are proven durable.
+    /// Never call this on a failed block: dropping the block cache instead is
+    /// what keeps rolled-back ids out of the process-lifetime maps.
+    pub fn restore_after_commit(&mut self, block_cache: ProjectionDimensionCache) {
+        self.header_addresses = block_cache.header_addresses;
+        self.event_kinds = block_cache.event_kinds;
+        self.contracts = block_cache.contracts;
     }
 
     /// Pre-resolve a batch of (distinct) addresses in one round-trip instead of a
@@ -1693,6 +1831,25 @@ impl ProjectionDimensionCache {
             self.addresses.insert((chain_id, address), id);
         }
         Ok(())
+    }
+
+    /// Resolves a block-header address (chain/validator/producer) through the
+    /// process-lifetime header map. Kept separate from the per-block `addresses`
+    /// map so `begin_block` cannot evict it: the same handful of header
+    /// addresses recurs on every block.
+    async fn header_address_id(
+        &mut self,
+        conn: &mut PgConnection,
+        chain_id: i32,
+        address: &str,
+    ) -> Result<i32, DbError> {
+        if let Some(&id) = self.header_addresses.get(&(chain_id, address.to_owned())) {
+            return Ok(id);
+        }
+        let id = upsert_address_id(conn, chain_id, address).await?;
+        self.header_addresses
+            .insert((chain_id, address.to_owned()), id);
+        Ok(id)
     }
 
     // Public: the legacy-raw decode tool resolves its contract/target-address
@@ -2416,6 +2573,123 @@ mod tests {
         .fetch_one(&mut *transaction)
         .await?;
         assert_eq!(stored, "1100000000");
+
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dimension_upserts_do_not_update_existing_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The block projection resolves the same addresses/kinds/contracts millions
+        // of times per resync. The old `ON CONFLICT … DO UPDATE SET col = col` idiom
+        // made every such resolve a real no-op UPDATE — dead tuple + WAL (measured on
+        // a full local resync: 17.4M updates on the 40k-row addresses table, 11.9M on
+        // 70 event_kinds, 4.8M on 179 contracts). The resolvers are SELECT-first now,
+        // and this test pins that: re-resolving an existing row must perform ZERO
+        // tuple updates. `pg_stat_xact_user_tables` counts only the current
+        // transaction's actions, so the assertions are synchronous and exact.
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut transaction = pool.begin().await?;
+        let chain_id = resolve_chain_id(&mut transaction, &ChainName::new("main")?).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let address = format!("PTESTIDIOM{suffix}");
+        let kind = format!("RstIdiomKind{}", &suffix[..8]);
+        let contract = format!("rstidiom{}", &suffix[..8]);
+
+        let address_id = upsert_address_id(&mut transaction, chain_id, &address).await?;
+        let kind_id = upsert_event_kind_id(&mut transaction, &kind).await?;
+        let contract_id = upsert_contract_id(&mut transaction, chain_id, &contract).await?;
+
+        // Re-resolving must come back from the plain SELECT with the same id.
+        assert_eq!(
+            upsert_address_id(&mut transaction, chain_id, &address).await?,
+            address_id
+        );
+        assert_eq!(
+            upsert_event_kind_id(&mut transaction, &kind).await?,
+            kind_id
+        );
+        assert_eq!(
+            upsert_contract_id(&mut transaction, chain_id, &contract).await?,
+            contract_id
+        );
+
+        async fn xact_tuple_counts(
+            conn: &mut PgConnection,
+            table: &str,
+        ) -> Result<(i64, i64), DbError> {
+            let counts = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+                "SELECT n_tup_ins, n_tup_upd FROM pg_stat_xact_user_tables WHERE relname = $1",
+            )
+            .bind(table)
+            .fetch_one(&mut *conn)
+            .await?;
+            Ok((counts.0.unwrap_or(0), counts.1.unwrap_or(0)))
+        }
+
+        // Exactly one insert per dimension (the mint), zero updates anywhere.
+        assert_eq!(
+            xact_tuple_counts(&mut transaction, "addresses").await?,
+            (1, 0),
+            "address re-resolve must not touch the stored row"
+        );
+        assert_eq!(
+            xact_tuple_counts(&mut transaction, "event_kinds").await?,
+            (1, 0),
+            "event-kind re-resolve must not touch the stored row"
+        );
+        assert_eq!(
+            xact_tuple_counts(&mut transaction, "contracts").await?,
+            (1, 0),
+            "contract re-resolve must not touch the stored row"
+        );
+
+        // The one case where the contract resolver must still write: an existing row
+        // with an empty name/symbol gets them backfilled from the resolved value.
+        let hollow = format!("rsthollow{}", &suffix[..8]);
+        sqlx::query(
+            r#"
+            INSERT INTO contracts (name, hash, symbol, chain_id, last_updated_unix_seconds)
+            VALUES ('', $1, '', $2, 0)
+            "#,
+        )
+        .bind(&hollow)
+        .bind(chain_id)
+        .execute(&mut *transaction)
+        .await?;
+        let hollow_id = upsert_contract_id(&mut transaction, chain_id, &hollow).await?;
+        let (name, symbol) = sqlx::query_as::<_, (String, String)>(
+            "SELECT name, symbol FROM contracts WHERE id = $1",
+        )
+        .bind(hollow_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert_eq!(name, hollow, "empty name must be backfilled");
+        assert_eq!(symbol, hollow, "empty symbol must be backfilled");
+        assert_eq!(
+            xact_tuple_counts(&mut transaction, "contracts").await?,
+            (2, 1),
+            "the backfill is the only contract update"
+        );
+
+        // Once filled, the row drops back onto the read-only path.
+        assert_eq!(
+            upsert_contract_id(&mut transaction, chain_id, &hollow).await?,
+            hollow_id
+        );
+        assert_eq!(
+            xact_tuple_counts(&mut transaction, "contracts").await?,
+            (2, 1),
+            "a filled contract must not be rewritten again"
+        );
 
         transaction.rollback().await?;
         Ok(())

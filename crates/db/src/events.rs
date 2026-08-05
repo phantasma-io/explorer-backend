@@ -1870,6 +1870,7 @@ mod tests {
 
         let block = upsert_block(
             &mut transaction,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_100_000),
@@ -2043,6 +2044,7 @@ mod tests {
 
         let block = upsert_block(
             &mut transaction,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_000_000),
@@ -2265,6 +2267,7 @@ mod tests {
 
         let first_block = upsert_block(
             &mut transaction,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(first_height),
@@ -2342,6 +2345,7 @@ mod tests {
 
         let second_block = upsert_block(
             &mut transaction,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(first_height + 1),

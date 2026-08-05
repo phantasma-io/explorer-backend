@@ -613,6 +613,7 @@ mod tests {
 
         let block = upsert_block(
             &mut tx,
+            &mut crate::ProjectionDimensionCache::new(),
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(9_900_300_000),

@@ -94,6 +94,12 @@ pub struct BlockIngestionDriver {
     /// driver — the block loop and all maintenance tasks — so a node in distress
     /// is spared by the whole worker, not just by the task that noticed.
     relief: std::sync::Arc<driver::RpcReliefState>,
+    /// Process-lifetime dimension cache (event kinds, contracts, block-header
+    /// addresses). Block writes borrow it via take-for-block/restore-on-commit —
+    /// see `ProjectionDimensionCache` for the rollback-safety contract. Shared
+    /// across driver clones; effectively uncontended (block writes are the only
+    /// user and run sequentially).
+    dimensions: std::sync::Arc<tokio::sync::Mutex<explorer_db::ProjectionDimensionCache>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
