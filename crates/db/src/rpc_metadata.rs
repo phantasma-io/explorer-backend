@@ -11,22 +11,33 @@ pub async fn fetch_contract_rpc_metadata_candidates(
     batch_size: i64,
 ) -> Result<Vec<ContractRpcMetadataCandidate>, DbError> {
     let min_upgrade_block_height = block_height_to_i64(min_upgrade_block_height_exclusive)?;
+    // ContractUpgrade resolved to its id up front, and the upgrade names collected
+    // ONCE instead of per candidate: the previous correlated NOT EXISTS joined
+    // event_kinds by name, which the planner answered with a full events scan per
+    // contract row — measured at ~7m43s per maintenance pass on the 76M-event
+    // database (for ~120 ContractUpgrade rows). A NULL kind id (kind not seen yet)
+    // makes `upgraded` empty, which reads as "no upgrades" — same as before.
+    let upgrade_kind_id = event_kind_id_by_name(&mut *conn, "ContractUpgrade").await?;
     let rows = sqlx::query_as::<_, (i32, String, bool)>(
         r#"
+        WITH upgraded AS (
+            SELECT DISTINCT
+                NULLIF(BTRIM(event.payload_json #>> '{string_event,string_value}'), '')
+                    AS contract_hash
+            FROM events event
+            JOIN transactions tx ON tx.id = event.transaction_id
+            JOIN blocks block ON block.id = tx.block_id
+            WHERE event.chain_id = $1
+              AND event.event_kind_id = $5
+              AND block.height > $3
+        )
         SELECT
             contract.id,
             COALESCE(NULLIF(contract.name, ''), contract.hash),
             NOT EXISTS (
                 SELECT 1
-                FROM events event
-                JOIN event_kinds event_kind
-                  ON event_kind.id = event.event_kind_id
-                JOIN transactions tx ON tx.id = event.transaction_id
-                JOIN blocks block ON block.id = tx.block_id
-                WHERE event.chain_id = contract.chain_id
-                  AND event_kind.name = 'ContractUpgrade'
-                  AND block.height > $3
-                  AND NULLIF(BTRIM(event.payload_json #>> '{string_event,string_value}'), '') = contract.hash
+                FROM upgraded
+                WHERE upgraded.contract_hash = contract.hash
             ) AS insert_current_method
         FROM contracts contract
         WHERE contract.chain_id = $1
@@ -43,6 +54,7 @@ pub async fn fetch_contract_rpc_metadata_candidates(
     .bind(stale_before_unix_seconds)
     .bind(min_upgrade_block_height)
     .bind(batch_size)
+    .bind(upgrade_kind_id)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -140,6 +152,11 @@ pub async fn fetch_contract_upgrade_method_candidates(
     batch_size: i64,
 ) -> Result<Vec<ContractUpgradeMethodCandidate>, DbError> {
     let min_block_height = block_height_to_i64(min_block_height_exclusive)?;
+    // Same treatment as `fetch_contract_rpc_metadata_candidates`: the kind id is
+    // resolved up front so the (event_kind_id, …) index serves the few
+    // ContractUpgrade rows, instead of the name join's per-pass events scan
+    // (this query alone ran ~4.4s per pass). NULL id = no upgrades yet.
+    let upgrade_kind_id = event_kind_id_by_name(&mut *conn, "ContractUpgrade").await?;
     let rows = sqlx::query_as::<_, (i32, String, i64)>(
         r#"
         WITH upgrade_events AS (
@@ -151,15 +168,13 @@ pub async fn fetch_contract_upgrade_method_candidates(
                 tx.tx_index,
                 event.event_index
             FROM events event
-            JOIN event_kinds event_kind
-              ON event_kind.id = event.event_kind_id
             JOIN transactions tx ON tx.id = event.transaction_id
             JOIN blocks block ON block.id = tx.block_id
             JOIN contracts contract
               ON contract.chain_id = event.chain_id
              AND contract.hash = NULLIF(BTRIM(event.payload_json #>> '{string_event,string_value}'), '')
             WHERE event.chain_id = $1
-              AND event_kind.name = 'ContractUpgrade'
+              AND event.event_kind_id = $4
               AND block.height > $2
               AND NOT EXISTS (
                   SELECT 1
@@ -177,6 +192,7 @@ pub async fn fetch_contract_upgrade_method_candidates(
     .bind(chain_id)
     .bind(min_block_height)
     .bind(batch_size)
+    .bind(upgrade_kind_id)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -876,6 +892,172 @@ pub async fn apply_series_rpc_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn contract_upgrade_candidates_follow_the_upgrade_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Pins both ContractUpgrade-driven candidate queries after their rewrite
+        // onto a pre-resolved kind id (the name-joined correlated form scanned the
+        // whole events table per contract — ~7m43s per maintenance pass live):
+        // an upgraded contract must lose its insert_current_method flag and appear
+        // in the upgrade-method candidates exactly until its method history row
+        // exists; the height gate is strictly exclusive.
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let upgraded_hash = format!("rstupga{}", &suffix[..8]);
+        let untouched_hash = format!("rstupgb{}", &suffix[..8]);
+        let upgraded_id = upsert_contract_id(&mut tx, chain_id, &upgraded_hash).await?;
+        let untouched_id = upsert_contract_id(&mut tx, chain_id, &untouched_hash).await?;
+
+        let height = 9_900_700_000_i64;
+        let timestamp = 1_800_700_000_i64;
+        let block = upsert_block(
+            &mut tx,
+            &mut crate::ProjectionDimensionCache::new(),
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(height as u64),
+                hash: format!("TESTUPGBLOCK{suffix}"),
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: timestamp,
+                reward: None,
+            },
+        )
+        .await?;
+        let seeded_tx = upsert_transaction(
+            &mut tx,
+            TransactionUpsert {
+                block_id: block.id,
+                chain_id,
+                tx_index: 0,
+                hash: format!("TESTUPGTX{suffix}"),
+                timestamp_unix_seconds: timestamp,
+                state: "Halt".to_owned(),
+                result: None,
+                debug_comment: None,
+                payload: None,
+                script_raw: None,
+                fee_raw: None,
+                gas_price_raw: None,
+                gas_limit_raw: None,
+                sender: None,
+                gas_payer: None,
+                gas_target: None,
+                carbon_tx_type: None,
+                carbon_tx_data: None,
+                expiration_unix_seconds: 0,
+                signatures: Vec::new(),
+            },
+        )
+        .await?;
+        replace_events(
+            &mut tx,
+            seeded_tx.id,
+            &[EventUpsert {
+                transaction_id: seeded_tx.id,
+                chain_id,
+                event_index: 0,
+                event_kind: "ContractUpgrade".to_owned(),
+                event_name: None,
+                address: None,
+                target_address: None,
+                contract: Some(upgraded_hash.clone()),
+                token_id: None,
+                raw_data: None,
+                payload_format: Some("live.v1".to_owned()),
+                payload_json: Some(serde_json::json!({
+                    "string_event": { "string_value": upgraded_hash.clone() }
+                })),
+                timestamp_unix_seconds: timestamp,
+                burned: None,
+            }],
+        )
+        .await?;
+
+        let flag_of = |candidates: &[ContractRpcMetadataCandidate], id: i32| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .map(|candidate| candidate.insert_current_method)
+        };
+
+        // Below the gate the upgrade is visible: the upgraded contract keeps its
+        // current-method insert suppressed, the untouched one does not.
+        let candidates = fetch_contract_rpc_metadata_candidates(
+            &mut tx,
+            chain_id,
+            timestamp + 1_000_000,
+            BlockHeight::new(6_422_526),
+            500,
+        )
+        .await?;
+        assert_eq!(flag_of(&candidates, upgraded_id), Some(false));
+        assert_eq!(flag_of(&candidates, untouched_id), Some(true));
+
+        // The gate is strictly exclusive: at the event's own height nothing is
+        // above it, so the upgrade is invisible.
+        let gated = fetch_contract_rpc_metadata_candidates(
+            &mut tx,
+            chain_id,
+            timestamp + 1_000_000,
+            BlockHeight::new(height as u64),
+            500,
+        )
+        .await?;
+        assert_eq!(flag_of(&gated, upgraded_id), Some(true));
+
+        // The upgrade-method list carries the event until its history row exists.
+        let methods = fetch_contract_upgrade_method_candidates(
+            &mut tx,
+            chain_id,
+            BlockHeight::new(6_422_526),
+            500,
+        )
+        .await?;
+        let mine: Vec<_> = methods
+            .iter()
+            .filter(|candidate| candidate.contract_id == upgraded_id)
+            .collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].timestamp_unix_seconds, timestamp);
+
+        sqlx::query(
+            "INSERT INTO contract_methods (contract_id, methods, timestamp_unix_seconds)
+             VALUES ($1, '[]'::jsonb, $2)",
+        )
+        .bind(upgraded_id)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await?;
+        let after = fetch_contract_upgrade_method_candidates(
+            &mut tx,
+            chain_id,
+            BlockHeight::new(6_422_526),
+            500,
+        )
+        .await?;
+        assert!(
+            !after
+                .iter()
+                .any(|candidate| candidate.contract_id == upgraded_id),
+            "a recorded method history row must retire the candidate"
+        );
+
+        tx.rollback().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn nft_rpc_metadata_updates_nft_and_series_presentation_from_rpc()
