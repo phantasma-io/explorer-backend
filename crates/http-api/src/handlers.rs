@@ -1362,17 +1362,29 @@ pub(crate) async fn load_transactions(
                     && date_greater.is_none()
                     && date_less.is_none()
                 {
-                    list_transactions_for_address_timeline(&state.pool, address_id, &page).await?
+                    list_transactions_for_address_timeline(
+                        &state.pool,
+                        address_id,
+                        &page,
+                        with_script,
+                    )
+                    .await?
                 } else {
-                    list_transactions_for_filtered_address(&state.pool, address_id, &filter, &page)
-                        .await?
+                    list_transactions_for_filtered_address(
+                        &state.pool,
+                        address_id,
+                        &filter,
+                        &page,
+                        with_script,
+                    )
+                    .await?
                 }
             }
             // An unknown address has no transactions; skip the query.
             None => Vec::new(),
         }
     } else {
-        list_transactions_global(&state.pool, &filter, &page).await?
+        list_transactions_global(&state.pool, &filter, &page, with_script).await?
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, cursor_kind)?;
@@ -1426,7 +1438,7 @@ pub(crate) async fn load_transactions_by_block_ids(
     if block_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = list_transactions_by_block_ids(pool, block_ids).await?;
+    let rows = list_transactions_by_block_ids(pool, block_ids, with_script).await?;
 
     let mut transactions = rows.iter().map(transaction_from_row).collect::<Vec<_>>();
     if !with_script {

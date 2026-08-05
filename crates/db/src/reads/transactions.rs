@@ -89,6 +89,21 @@ fn transaction_q_forms(q: Option<&str>) -> (Option<i64>, Option<String>) {
     (q_height, q_like)
 }
 
+/// The `script_raw` column of a transaction LIST projection. Lists hex-encode
+/// and ship the script only when the caller will actually serve it
+/// (`with_script=1`); `NULL::text` keeps the row shape and column name identical
+/// otherwise, so the mappers need no branching. `carbon_tx_data` is NOT gated:
+/// the API serves it on every list row regardless of `with_script` (and it is
+/// small), so making it conditional would change response semantics. The detail
+/// reads (`transaction_select_sql`) keep both columns unconditionally.
+fn transaction_script_raw_column(with_script: bool) -> &'static str {
+    if with_script {
+        "upper(encode(tx.script_raw, 'hex'))"
+    } else {
+        "NULL::text"
+    }
+}
+
 /// The shared transaction projection with a caller-supplied WHERE clause. The
 /// clause is built from fixed literals in this module, never user input.
 fn transaction_select_sql(where_clause: &str) -> String {
@@ -166,10 +181,12 @@ pub async fn list_transactions_global(
     executor: impl sqlx::PgExecutor<'_>,
     filter: &TransactionFilter<'_>,
     page: &TransactionPage,
+    with_script: bool,
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
     let (q_height, q_like) = transaction_q_forms(filter.q);
+    let script_raw_column = transaction_script_raw_column(with_script);
     let sql = format!(
         r#"
         SELECT
@@ -186,7 +203,7 @@ pub async fn list_transactions_global(
             tx.timestamp_unix_seconds,
             trim_scale(tx.fee_raw * power(10::numeric, -10))::text AS fee,
             tx.fee_raw::text AS fee_raw,
-            upper(encode(tx.script_raw, 'hex')) AS script_raw,
+            {script_raw_column} AS script_raw,
             tx.result,
             tx.debug_comment,
             tx.payload,
@@ -268,7 +285,9 @@ pub async fn list_transactions_for_address_timeline(
     executor: impl sqlx::PgExecutor<'_>,
     address_id: i32,
     page: &TransactionPage,
+    with_script: bool,
 ) -> Result<Vec<PgRow>, DbError> {
+    let script_raw_column = transaction_script_raw_column(with_script);
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
     let column = page.order_by.address_column();
@@ -313,7 +332,7 @@ pub async fn list_transactions_for_address_timeline(
             tx.timestamp_unix_seconds,
             trim_scale(tx.fee_raw * power(10::numeric, -10))::text AS fee,
             tx.fee_raw::text AS fee_raw,
-            upper(encode(tx.script_raw, 'hex')) AS script_raw,
+            {script_raw_column} AS script_raw,
             tx.result,
             tx.debug_comment,
             tx.payload,
@@ -363,7 +382,9 @@ pub async fn list_transactions_for_filtered_address(
     address_id: i32,
     filter: &TransactionFilter<'_>,
     page: &TransactionPage,
+    with_script: bool,
 ) -> Result<Vec<PgRow>, DbError> {
+    let script_raw_column = transaction_script_raw_column(with_script);
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
     let (q_height, q_like) = transaction_q_forms(filter.q);
@@ -384,7 +405,7 @@ pub async fn list_transactions_for_filtered_address(
             tx.timestamp_unix_seconds,
             trim_scale(tx.fee_raw * power(10::numeric, -10))::text AS fee,
             tx.fee_raw::text AS fee_raw,
-            upper(encode(tx.script_raw, 'hex')) AS script_raw,
+            {script_raw_column} AS script_raw,
             tx.result,
             tx.debug_comment,
             tx.payload,
@@ -462,8 +483,10 @@ pub async fn list_transactions_for_filtered_address(
 pub async fn list_transactions_by_block_ids(
     executor: impl sqlx::PgExecutor<'_>,
     block_ids: &[i32],
+    with_script: bool,
 ) -> Result<Vec<PgRow>, DbError> {
-    let rows = sqlx::query(
+    let script_raw_column = transaction_script_raw_column(with_script);
+    let sql = format!(
         r#"
         SELECT
             tx.block_id AS tx_block_id,
@@ -478,7 +501,7 @@ pub async fn list_transactions_by_block_ids(
             tx.timestamp_unix_seconds,
             trim_scale(tx.fee_raw * power(10::numeric, -10))::text AS fee,
             tx.fee_raw::text AS fee_raw,
-            upper(encode(tx.script_raw, 'hex')) AS script_raw,
+            {script_raw_column} AS script_raw,
             tx.result,
             tx.debug_comment,
             tx.payload,
@@ -508,10 +531,11 @@ pub async fn list_transactions_by_block_ids(
         WHERE tx.block_id = ANY($1)
         ORDER BY block.height ASC, tx.tx_index ASC, tx.id ASC
         "#,
-    )
-    .bind(block_ids)
-    .fetch_all(executor)
-    .await?;
+    );
+    let rows = sqlx::query(&sql)
+        .bind(block_ids)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows)
 }
@@ -818,7 +842,8 @@ mod tests {
                 cursor_id: cursor.map(|(_, id)| id),
                 limit: 1,
             };
-            let rows = list_transactions_for_address_timeline(&mut *tx, address_id, &page).await?;
+            let rows =
+                list_transactions_for_address_timeline(&mut *tx, address_id, &page, false).await?;
             assert!(!rows.is_empty(), "walk page must not be empty");
             let row = &rows[0];
             let cursor_id = row.get::<i32, _>("cursor_id");
@@ -839,7 +864,7 @@ mod tests {
             limit: 1,
         };
         assert!(
-            list_transactions_for_address_timeline(&mut *tx, address_id, &exhausted)
+            list_transactions_for_address_timeline(&mut *tx, address_id, &exhausted, false)
                 .await?
                 .is_empty(),
             "the walk must end after the last link"
@@ -860,8 +885,9 @@ mod tests {
                 cursor_id: cursor.map(|(_, id)| id),
                 limit: 1,
             };
-            let rows = list_transactions_for_filtered_address(&mut *tx, address_id, &filter, &page)
-                .await?;
+            let rows =
+                list_transactions_for_filtered_address(&mut *tx, address_id, &filter, &page, false)
+                    .await?;
             assert!(!rows.is_empty(), "filtered walk page must not be empty");
             let row = &rows[0];
             let cursor_id = row.get::<i32, _>("cursor_id");
