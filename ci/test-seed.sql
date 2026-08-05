@@ -128,6 +128,18 @@ COPY public.transaction_states (id, name) FROM stdin;
 
 
 --
+-- Data for Name: organizations; Type: TABLE DATA; Schema: public; Owner: -
+-- The two stake organizations (values as stored on mainnet), so
+-- reconcile_stake_memberships is exercisable against the test database.
+--
+
+COPY public.organizations (id, organization_id, name, create_event_id, address, address_name) FROM stdin;
+2	masters	masters	\N	S3dH4Ek14E5wWXvfmae6Wb4MHAmpGV36TnLE79V9MNod79V	masters
+3	stakers	stakers	\N	S3dBJmaik2r9CoKSQeU5NE6Mjk7UCjbSBzedNCK6kNSzgqS	stakers
+\.
+
+
+--
 -- Name: chains_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
@@ -153,6 +165,13 @@ SELECT pg_catalog.setval('public.signature_kinds_id_seq', 1, true);
 --
 
 SELECT pg_catalog.setval('public.transaction_states_id_seq', 3, true);
+
+
+--
+-- Name: organizations_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
+--
+
+SELECT pg_catalog.setval('public.organizations_id_seq', 3, true);
 
 
 --

@@ -161,7 +161,13 @@ mod tests {
             0,
         )
         .await?;
-        let names: Vec<_> = all.iter().filter_map(|r| r.name.as_deref()).collect();
+        // The base seed carries real organizations (stakers/masters), so assert on
+        // the relative order of the two test rows rather than the whole listing.
+        let names: Vec<_> = all
+            .iter()
+            .filter_map(|r| r.name.as_deref())
+            .filter(|name| *name == "Alpha" || *name == "Beta")
+            .collect();
         assert_eq!(names, vec!["Alpha", "Beta"], "name ASC orders Alpha first");
         let alpha_size = all
             .iter()
