@@ -1,0 +1,20 @@
+-- Restore the (event_kind_id, id) index that 202608030003 dropped.
+--
+-- That cleanup justified the drop with "order_by=id with a kind filter is reachable only
+-- through the raw API (the UI orders by date) ... the parameter stays and answers via a
+-- sort". Both halves are wrong, and the full local resync proved it:
+--
+--   * `id` is the DEFAULT ordering on both sides — `EventOrderBy::from_api_param` falls back
+--     to "id" (crates/db/src/reads/events.rs) and the frontend's `DEFAULT_ORDER_BY` is "id"
+--     (explorer-frontend src/lib/hooks/use-table.ts). Every kind-filtered event list the UI
+--     renders takes this path; no client has to ask for it.
+--   * It does not answer "via a sort". With the index gone the planner walks PK_Events
+--     backwards and filters, so the cost scales with how far back the kind's newest rows sit,
+--     not with how many rows it has. Measured on the finished 8,937,649-block resync:
+--     ExecutionFailure (45,870 rows, last seen 2025-01-18) discarded 19,446,931 rows to
+--     return 51 and took 3.6-9.0 s; Log 2.5 s; CrownRewards 2.1 s; ChainSwap 2.1 s —
+--     8 of 48 kinds over 1.5 s, while kinds still active at the tip stayed at 12-17 ms
+--     because the backward walk finds their rows immediately.
+--
+-- The 1.67 GB this costs buys the default ordering of the busiest list in the explorer.
+CREATE INDEX "IX_Events_EventKindId_ID" ON events (event_kind_id, id);

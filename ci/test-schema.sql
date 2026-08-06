@@ -1324,6 +1324,13 @@ CREATE INDEX "IX_Events_ContractId_TOKEN_ID" ON public.events USING btree (contr
 
 
 --
+-- Name: IX_Events_EventKindId_ID; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX "IX_Events_EventKindId_ID" ON public.events USING btree (event_kind_id, id);
+
+
+--
 -- Name: IX_Events_EventKindId_Timestamp_Id; Type: INDEX; Schema: public; Owner: -
 --
 
