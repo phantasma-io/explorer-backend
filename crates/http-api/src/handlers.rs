@@ -1504,6 +1504,9 @@ pub(crate) async fn load_events(
         ))
     })?;
     let direction = parse_sort_direction(query.order_direction.as_deref())?;
+    // Resolved before the query so the list projection can leave `payload_json` out
+    // entirely when the caller does not want event data.
+    let with_event_data = query.with_event_data == Some(1);
     // The kind name is resolved to its id here so the list query filters on the indexed
     // column. Comparing the joined name instead made the planner walk the primary key,
     // which never finishes for a kind that has fewer events than one page. A name no
@@ -1574,6 +1577,7 @@ pub(crate) async fn load_events(
                     address_id,
                     &filter,
                     &page,
+                    with_event_data,
                 )
                 .await?
             }
@@ -1586,14 +1590,22 @@ pub(crate) async fn load_events(
         // gen1 / non-main events for transaction_hash/block_hash lookups, leaving
         // legacy transaction pages with an empty narrative and no events.
         let chain_name = chain.as_deref().unwrap_or_else(|| state.chain.as_str());
-        list_events_global(&state.pool, chain_filter_id, chain_name, &filter, &page).await?
+        list_events_global(
+            &state.pool,
+            chain_filter_id,
+            chain_name,
+            &filter,
+            &page,
+            with_event_data,
+        )
+        .await?
     };
 
     let (rows, next_cursor) = trim_page_rows(rows, limit, "event")?;
     let events = events_from_rows(
         &state.pool,
         &rows,
-        query.with_event_data == Some(1),
+        with_event_data,
         query.with_metadata == Some(1),
         query.with_series == Some(1),
         query.with_fiat == Some(1),
@@ -1730,7 +1742,7 @@ pub(crate) async fn load_events_by_transaction_ids(
     if transaction_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = list_events_by_transaction_ids(pool, transaction_ids).await?;
+    let rows = list_events_by_transaction_ids(pool, transaction_ids, with_event_data).await?;
 
     let token_symbols = collect_event_token_symbols(&rows);
     let tokens = load_event_tokens_by_symbols(pool, token_symbols).await?;

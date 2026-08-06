@@ -89,11 +89,38 @@ fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>) {
     (q_like, q_height)
 }
 
+/// The `payload_json` column of an event LIST projection.
+///
+/// The API only builds `event_data` and the served payload string when the caller asks for
+/// them (`with_event_data=1`); without that, selecting the column still makes PostgreSQL
+/// detoast and ship every payload on the page. One stored `SpecialResolution` payload is
+/// 36 MB, so a 50-row page of that kind cost 1.26 s either way — measured on the finished
+/// resync, identical with and without `with_event_data`. `NULL::jsonb` keeps the row shape
+/// and column name identical so the row mapper needs no branch.
+///
+/// `raw_data` deliberately stays unconditional: the API serves it on every list row
+/// regardless of `with_event_data`, and its largest value on this chain is 17 bytes.
+fn event_payload_json_column(with_event_data: bool) -> &'static str {
+    if with_event_data {
+        "event.payload_json"
+    } else {
+        "NULL::jsonb"
+    }
+}
+
 /// Columns every event-list answer projects, after `event.id` and the cursor value.
-/// Shared by both list variants so they cannot drift apart.
-const EVENT_LIST_PROJECTION: &str = r#"            event.event_index,
+///
+/// Built once for all three list variants so they cannot drift apart — they had already
+/// drifted as literal copies, which is how the `payload_json` gate below would have landed
+/// in one list and not the others. The two expressions that legitimately differ are
+/// arguments: the global list falls back to its requested chain name when the row carries
+/// none (`$2`), while the address- and transaction-scoped lists span chains and always read
+/// the joined name.
+fn event_list_projection(chain_name_expr: &str, payload_json_column: &str) -> String {
+    format!(
+        r#"            event.event_index,
             'legacy'::text AS event_source,
-            COALESCE(chain.name, $2::text) AS chain_name,
+            {chain_name_expr} AS chain_name,
             event.timestamp_unix_seconds,
             block.hash AS block_hash,
             tx.hash AS transaction_hash,
@@ -106,7 +133,7 @@ const EVENT_LIST_PROJECTION: &str = r#"            event.event_index,
             contract.symbol AS contract_symbol,
             contract.hash AS raw_contract,
             event.token_id,
-            event.payload_json,
+            {payload_json_column} AS payload_json,
             event.raw_data,
             CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
                 'description', nft.description, 'name', nft.name,
@@ -127,7 +154,9 @@ const EVENT_LIST_PROJECTION: &str = r#"            event.event_index,
                 'attr_type_3', series.attr_type_3, 'attr_value_3', series.attr_value_3,
                 'metadata', series.metadata
             ) END AS series_json
-"#;
+"#
+    )
+}
 
 /// The presentation joins behind that projection.
 const EVENT_LIST_JOINS: &str = r#"        FROM events event
@@ -191,6 +220,7 @@ pub async fn list_events_global(
     chain_name: &str,
     filter: &EventFilter<'_>,
     page: &EventPage,
+    with_event_data: bool,
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
@@ -230,7 +260,10 @@ pub async fn list_events_global(
         LIMIT $8
         "#,
         column = page.order_by.column(),
-        projection = EVENT_LIST_PROJECTION,
+        projection = event_list_projection(
+            "COALESCE(chain.name, $2::text)",
+            event_payload_json_column(with_event_data)
+        ),
         joins = EVENT_LIST_JOINS,
         kind_predicate =
             event_kind_id_predicate("event.event_kind_id", "$20", filter.event_kind_id),
@@ -285,6 +318,7 @@ pub async fn list_events_by_address(
     address_id: i32,
     filter: &EventFilter<'_>,
     page: &EventPage,
+    with_event_data: bool,
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
@@ -295,42 +329,7 @@ pub async fn list_events_by_address(
             event.id,
             event.id AS cursor_id,
             {column}::bigint AS cursor_sort_value,
-            event.event_index,
-            'legacy'::text AS event_source,
-            chain.name AS chain_name,
-            event.timestamp_unix_seconds,
-            block.hash AS block_hash,
-            tx.hash AS transaction_hash,
-            event_kind.name AS event_kind,
-            COALESCE(event.event_name, event_kind.name) AS event_name,
-            address.address,
-            address.address_name,
-            contract.hash AS contract_hash,
-            contract.name AS contract_name,
-            contract.symbol AS contract_symbol,
-            contract.hash AS raw_contract,
-            event.token_id,
-            event.payload_json,
-            event.raw_data,
-            CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
-                'description', nft.description, 'name', nft.name,
-                'imageURL', nft.image, 'videoURL', nft.video, 'infoURL', nft.info_url,
-                'rom', nft.rom, 'ram', nft.ram,
-                'mint_date', nft.mint_date_unix_seconds::text,
-                'mint_number', nft.mint_number::text, 'metadata', nft.metadata
-            ) END AS nft_metadata_json,
-            CASE WHEN series.id IS NOT NULL THEN jsonb_build_object(
-                'id', series.id, 'series_id', series.series_id, 'creator', series_creator.address,
-                'created_unix_seconds', series.series_created_unix_seconds,
-                'current_supply', series.current_supply, 'max_supply', series.max_supply,
-                'mode_name', series_mode.mode_name, 'name', series.name,
-                'description', series.description, 'image', series.image,
-                'royalties', series.royalties::text, 'type', series.type,
-                'attr_type_1', series.attr_type_1, 'attr_value_1', series.attr_value_1,
-                'attr_type_2', series.attr_type_2, 'attr_value_2', series.attr_value_2,
-                'attr_type_3', series.attr_type_3, 'attr_value_3', series.attr_value_3,
-                'metadata', series.metadata
-            ) END AS series_json
+{projection}
         FROM events event
         JOIN transactions tx ON tx.id = event.transaction_id
         JOIN blocks block ON block.id = tx.block_id
@@ -372,6 +371,8 @@ pub async fn list_events_by_address(
         LIMIT $8
         "#,
         column = page.order_by.column(),
+        projection =
+            event_list_projection("chain.name", event_payload_json_column(with_event_data)),
         kind_predicate =
             event_kind_id_predicate("event.event_kind_id", "$21", filter.event_kind_id),
         kind_partial_predicate =
@@ -420,48 +421,14 @@ pub async fn list_events_by_address(
 pub async fn list_events_by_transaction_ids(
     executor: impl sqlx::PgExecutor<'_>,
     transaction_ids: &[i32],
+    with_event_data: bool,
 ) -> Result<Vec<PgRow>, DbError> {
-    let rows = sqlx::query(
+    let sql = format!(
         r#"
         SELECT
             event.transaction_id AS event_transaction_id,
             event.id,
-            event.event_index,
-            'legacy'::text AS event_source,
-            chain.name AS chain_name,
-            event.timestamp_unix_seconds,
-            block.hash AS block_hash,
-            tx.hash AS transaction_hash,
-            event_kind.name AS event_kind,
-            COALESCE(event.event_name, event_kind.name) AS event_name,
-            address.address,
-            address.address_name,
-            contract.hash AS contract_hash,
-            contract.name AS contract_name,
-            contract.symbol AS contract_symbol,
-            contract.hash AS raw_contract,
-            event.token_id,
-            event.payload_json,
-            event.raw_data,
-            CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
-                'description', nft.description, 'name', nft.name,
-                'imageURL', nft.image, 'videoURL', nft.video, 'infoURL', nft.info_url,
-                'rom', nft.rom, 'ram', nft.ram,
-                'mint_date', nft.mint_date_unix_seconds::text,
-                'mint_number', nft.mint_number::text, 'metadata', nft.metadata
-            ) END AS nft_metadata_json,
-            CASE WHEN series.id IS NOT NULL THEN jsonb_build_object(
-                'id', series.id, 'series_id', series.series_id, 'creator', series_creator.address,
-                'created_unix_seconds', series.series_created_unix_seconds,
-                'current_supply', series.current_supply, 'max_supply', series.max_supply,
-                'mode_name', series_mode.mode_name, 'name', series.name,
-                'description', series.description, 'image', series.image,
-                'royalties', series.royalties::text, 'type', series.type,
-                'attr_type_1', series.attr_type_1, 'attr_value_1', series.attr_value_1,
-                'attr_type_2', series.attr_type_2, 'attr_value_2', series.attr_value_2,
-                'attr_type_3', series.attr_type_3, 'attr_value_3', series.attr_value_3,
-                'metadata', series.metadata
-            ) END AS series_json
+{projection}
         FROM events event
         JOIN transactions tx ON tx.id = event.transaction_id
         JOIN blocks block ON block.id = tx.block_id
@@ -476,10 +443,13 @@ pub async fn list_events_by_transaction_ids(
         WHERE event.transaction_id = ANY($1)
         ORDER BY event.transaction_id ASC, event.event_index ASC
         "#,
-    )
-    .bind(transaction_ids)
-    .fetch_all(executor)
-    .await?;
+        projection =
+            event_list_projection("chain.name", event_payload_json_column(with_event_data)),
+    );
+    let rows = sqlx::query(&sql)
+        .bind(transaction_ids)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows)
 }
@@ -653,7 +623,7 @@ mod tests {
                 token_id: None,
                 raw_data: None,
                 payload_format: Some("live.v1".to_owned()),
-                payload_json: None,
+                payload_json: Some(serde_json::json!({"symbol": "SOUL", "value": "1"})),
                 timestamp_unix_seconds: block.timestamp_unix_seconds,
                 burned: None,
             },
@@ -695,9 +665,15 @@ mod tests {
             limit: 10,
         };
 
-        let unfiltered =
-            list_events_by_address(&mut *tx, "main", address_id, &EventFilter::default(), &page)
-                .await?;
+        let unfiltered = list_events_by_address(
+            &mut *tx,
+            "main",
+            address_id,
+            &EventFilter::default(),
+            &page,
+            true,
+        )
+        .await?;
         assert_eq!(unfiltered.len(), 2);
 
         let kind_filtered = list_events_by_address(
@@ -709,6 +685,7 @@ mod tests {
                 ..EventFilter::default()
             },
             &page,
+            true,
         )
         .await?;
         assert_eq!(kind_filtered.len(), 1);
@@ -747,7 +724,8 @@ mod tests {
             chain_id: Some(chain_id),
         };
         let fully_filtered =
-            list_events_by_address(&mut *tx, "main", address_id, &loaded_filter, &page).await?;
+            list_events_by_address(&mut *tx, "main", address_id, &loaded_filter, &page, true)
+                .await?;
         assert_eq!(fully_filtered.len(), 1, "all filters must agree on the row");
         assert_eq!(
             fully_filtered[0].get::<String, _>("event_kind"),
@@ -755,8 +733,15 @@ mod tests {
         );
 
         // The same fully-loaded walk through the global list.
-        let fully_filtered_global =
-            list_events_global(&mut *tx, Some(chain_id), "main", &loaded_filter, &page).await?;
+        let fully_filtered_global = list_events_global(
+            &mut *tx,
+            Some(chain_id),
+            "main",
+            &loaded_filter,
+            &page,
+            true,
+        )
+        .await?;
         assert_eq!(fully_filtered_global.len(), 1);
         assert_eq!(
             fully_filtered_global[0].get::<String, _>("event_kind"),
@@ -765,6 +750,49 @@ mod tests {
         assert_eq!(
             fully_filtered_global[0].get::<i32, _>("cursor_id"),
             fully_filtered_global[0].get::<i32, _>("id")
+        );
+
+        // The payload gate. `with_event_data = false` must leave payload_json out of the
+        // projection entirely: the API drops the value anyway, but selecting the column
+        // makes PostgreSQL detoast every payload on the page, and one stored
+        // SpecialResolution payload is 36 MB (measured: 1.26 s per page either way).
+        // Both list variants are asserted because they used to carry literal copies of
+        // the projection, which is exactly how a gate lands in one list and not the other.
+        for (label, rows) in [
+            (
+                "address-scoped",
+                list_events_by_address(&mut *tx, "main", address_id, &loaded_filter, &page, false)
+                    .await?,
+            ),
+            (
+                "global",
+                list_events_global(
+                    &mut *tx,
+                    Some(chain_id),
+                    "main",
+                    &loaded_filter,
+                    &page,
+                    false,
+                )
+                .await?,
+            ),
+        ] {
+            assert_eq!(rows.len(), 1, "{label}: the gate must not change the rows");
+            assert_eq!(
+                rows[0].get::<Option<Value>, _>("payload_json"),
+                None,
+                "{label}: payload_json must not be selected without with_event_data"
+            );
+            assert_eq!(
+                rows[0].get::<String, _>("event_kind"),
+                "TokenSend",
+                "{label}: every other column stays"
+            );
+        }
+        assert_eq!(
+            fully_filtered[0].get::<Option<Value>, _>("payload_json"),
+            Some(serde_json::json!({"symbol": "SOUL", "value": "1"})),
+            "with_event_data must still serve the stored payload"
         );
 
         Ok(())
