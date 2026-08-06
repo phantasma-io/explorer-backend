@@ -83,12 +83,16 @@ pub async fn list_contracts(
                 'burnable', token.burnable,
                 'mintable', token.mintable,
                 'decimals', token.decimals,
-                'current_supply', token.current_supply,
-                'current_supply_raw', token.current_supply_raw,
-                'max_supply', token.max_supply,
-                'max_supply_raw', token.max_supply_raw,
-                'burned_supply', token.burned_supply,
-                'burned_supply_raw', token.burned_supply_raw,
+                -- Same shape the /tokens projection serves: the formatted columns are gone
+                -- (202608040001), so the decimal string is derived, and the raw numerics are
+                -- cast back to text — jsonb_build_object would otherwise emit them as JSON
+                -- numbers where this embed has always carried strings.
+                'current_supply', trim_scale(token.current_supply_raw * power(10::numeric, -token.decimals))::text,
+                'current_supply_raw', token.current_supply_raw::text,
+                'max_supply', trim_scale(token.max_supply_raw * power(10::numeric, -token.decimals))::text,
+                'max_supply_raw', token.max_supply_raw::text,
+                'burned_supply', trim_scale(token.burned_supply_raw * power(10::numeric, -token.decimals))::text,
+                'burned_supply_raw', token.burned_supply_raw::text,
                 'script_raw', NULL,
                 'price', NULL,
                 'token_logos', NULL
@@ -96,7 +100,9 @@ pub async fn list_contracts(
         FROM contracts contract
         LEFT JOIN addresses address ON address.id = contract.address_id
         LEFT JOIN contract_methods method ON method.id = contract.contract_method_id
-        LEFT JOIN tokens token ON token.id = contract.token_id
+        -- `contracts.token_id` was the unmaintained half of a circular 1:1 and is gone
+        -- (202608030004); `tokens.contract_id` is the side the write path maintains.
+        LEFT JOIN tokens token ON token.contract_id = contract.id
         WHERE contract.chain_id = $1
           AND ($2::text IS NULL OR contract.symbol = $2)
           AND ($3::text IS NULL OR lower(contract.hash) = lower($3))
@@ -120,4 +126,58 @@ pub async fn list_contracts(
         .await?;
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The contracts list must PLAN against the current schema, with every embed on.
+    //
+    // This projection is the one place that still read `contracts.token_id` and the
+    // formatted `tokens.current_supply/max_supply/burned_supply` after the 2026-08 batch
+    // dropped all four, which made every `/contracts` request a 500 — a whole endpoint
+    // dead with nothing failing in CI. PostgreSQL rejects an unknown column while parsing,
+    // so the query does not need matching rows to catch it: executing it at all is the
+    // assertion. Rows are read too, so a projection that parses but cannot decode also
+    // fails here. Runs inside a rolled-back transaction.
+    #[tokio::test]
+    async fn contracts_list_projection_matches_the_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let filter = ContractFilter {
+            chain_id,
+            symbol: None,
+            hash: None,
+            q: None,
+            with_script: true,
+            with_methods: true,
+            with_token: true,
+        };
+
+        for order_by in [
+            ContractOrderBy::Id,
+            ContractOrderBy::Name,
+            ContractOrderBy::Symbol,
+        ] {
+            let rows =
+                list_contracts(&mut *tx, &filter, order_by, SortDirection::Desc, 5, 0).await?;
+            for row in &rows {
+                // Touch the embed so a column that parses but no longer decodes fails here.
+                let _: Option<serde_json::Value> = row.get("token_json");
+            }
+        }
+
+        Ok(())
+    }
 }
