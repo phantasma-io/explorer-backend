@@ -44,6 +44,8 @@ api:
 api-local:
     ./target/release/explorer-api --config config/local-api.toml
 
+alias ra := api-local
+
 [group('run')]
 api-local-build:
     cargo build --release -p explorer-api
@@ -61,6 +63,8 @@ worker-local-sync-build:
 [group('run')]
 worker-local-sync:
     ./target/release/explorer-worker --config config/local-sync.toml
+
+alias rw := worker-local-sync
 
 [group('run')]
 worker-local-balance-sync:
