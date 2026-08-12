@@ -14,6 +14,9 @@ acquire_timeout_seconds = 30
 
 [rpc]
 # EXPLORER_RPC_ENDPOINTS — one or more node JSON-RPC URLs (round-robin).
+# Two dialects of the same method set: /rpc packs a struct or array property value into a
+# JSON string, /rpc/v2 answers it as real JSON. Point here at /rpc/v2 only for a node that
+# serves it (RPC 0.15.0 and newer); a bare node root resolves to /rpc.
 endpoints = ["http://localhost:5172/rpc"]
 # EXPLORER_RPC_TIMEOUT_SECONDS
 timeout_seconds = 30

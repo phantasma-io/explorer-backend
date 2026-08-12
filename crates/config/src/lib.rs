@@ -640,7 +640,7 @@ pub enum ConfigError {
     #[error("environment variable {name} must contain at least one URL")]
     EmptyUrlList { name: &'static str },
     #[error(
-        "environment variable {name} contains unsupported JSON-RPC endpoint path in {value:?}; use /rpc or a node root URL"
+        "environment variable {name} contains unsupported JSON-RPC endpoint path in {value:?}; use /rpc, /rpc/v2, or a node root URL"
     )]
     UnsupportedRpcEndpointPath { name: &'static str, value: String },
     #[error("failed to read config file {path}")]
@@ -907,6 +907,16 @@ fn parse_rpc_endpoint_values(
     Ok(urls)
 }
 
+/// Accepts the two JSON-RPC routes a node serves and rejects everything else.
+///
+/// `/rpc` is the legacy dialect: a VM struct or array inside a property list arrives as a JSON
+/// document packed into a string. `/rpc/v2` answers the same method set with that value as real
+/// JSON, which is the only way to store a non-scalar property in its true shape. Both are live
+/// contracts, so the choice belongs to the deployment, not to us.
+///
+/// A bare node root still resolves to `/rpc` on purpose: the default must keep working against
+/// every node ever deployed, and `/rpc/v2` does not exist before RPC 0.15.0. Ask for v2 by
+/// writing it out.
 fn normalize_rpc_endpoint(name: &'static str, mut url: Url) -> Result<Url, ConfigError> {
     let normalized_path = url.path().trim_end_matches('/');
     match normalized_path {
@@ -914,7 +924,7 @@ fn normalize_rpc_endpoint(name: &'static str, mut url: Url) -> Result<Url, Confi
             url.set_path("rpc");
             Ok(url)
         }
-        "/rpc" => Ok(url),
+        "/rpc" | "/rpc/v2" => Ok(url),
         _ => Err(ConfigError::UnsupportedRpcEndpointPath {
             name,
             value: url.to_string(),
@@ -942,17 +952,39 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_structured_v2_route_and_leaves_the_root_on_v1() {
+        // `/rpc/v2` is the structured dialect: the same methods, but a VM struct or array in a
+        // property list arrives as real JSON instead of a JSON document packed into a string.
+        // It must survive normalization verbatim, and a bare root must NOT be upgraded to it —
+        // nodes older than RPC 0.15.0 have no v2 route at all.
+        let urls = parse_rpc_endpoint_list(
+            "EXPLORER_RPC_ENDPOINTS",
+            "https://rpc-a.example.invalid/rpc/v2, https://rpc-b.example.invalid",
+        )
+        .unwrap_or_default();
+
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].as_str(), "https://rpc-a.example.invalid/rpc/v2");
+        assert_eq!(urls[1].as_str(), "https://rpc-b.example.invalid/rpc");
+    }
+
+    #[test]
     fn rejects_non_rpc_paths() {
         // SDK-backed RPC calls post JSON-RPC bodies to `/rpc`; accepting REST
         // paths would make configuration errors surface later as node failures.
-        let urls = parse_rpc_endpoint_list(
-            "EXPLORER_RPC_ENDPOINTS",
+        for endpoint in [
             "https://rpc-a.example.invalid/api/v1",
-        );
-
-        assert!(matches!(
-            urls,
-            Err(ConfigError::UnsupportedRpcEndpointPath { .. })
-        ));
+            "https://rpc-a.example.invalid/api/v2",
+            // A dialect we do not speak must fail here, not on the first call.
+            "https://rpc-a.example.invalid/rpc/v3",
+        ] {
+            assert!(
+                matches!(
+                    parse_rpc_endpoint_list("EXPLORER_RPC_ENDPOINTS", endpoint),
+                    Err(ConfigError::UnsupportedRpcEndpointPath { .. })
+                ),
+                "{endpoint} must be rejected"
+            );
+        }
     }
 }
