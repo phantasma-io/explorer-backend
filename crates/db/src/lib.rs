@@ -34,6 +34,11 @@ pub use events::*;
 mod reads;
 pub use reads::*;
 
+// Rejected-transaction candidate capture (the /rejected-transactions endpoint's
+// storage). Public items re-exported to keep the `explorer_db::*` API flat.
+mod rejected;
+pub use rejected::*;
+
 const LEGACY_TOKEN_BURN_EVENT_KIND: &str = "TokenBurn";
 
 fn is_nft_side_effect_event_kind(event_kind: &str) -> bool {

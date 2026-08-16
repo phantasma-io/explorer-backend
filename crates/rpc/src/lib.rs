@@ -332,6 +332,24 @@ impl PhantasmaSdkClient {
         .await
     }
 
+    /// `get_transaction` plus the untouched JSON-RPC result, for consumers that
+    /// archive the node's exact answer (the rejected-transaction capture).
+    pub async fn get_transaction_payload(
+        &self,
+        hash: &str,
+    ) -> Result<SdkPayload<SdkTransactionResult>, RpcError> {
+        let response = self
+            .with_failover("get_transaction_payload", |endpoint| async move {
+                endpoint
+                    .rpc
+                    .get_transaction_with_raw(hash)
+                    .await
+                    .map_err(RpcError::Sdk)
+            })
+            .await?;
+        Ok(payload_from_sdk_response(response))
+    }
+
     /// Lightweight account overview (name + stake) for one address. Cost is
     /// independent of the address's holdings; balances travel separately through
     /// the cursor-paginated account endpoints below.

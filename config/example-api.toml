@@ -66,3 +66,14 @@ chain = "main"
 # EXPLORER_LOG_CONSOLE / EXPLORER_LOG_FILE
 console = true
 file = "logs/api.log"
+
+[rejected_transactions]
+# EXPLORER_REJECTED_TX_CAPTURE_ENABLED. When true, /rejected-transactions?capture=1
+# may ask the node about a hash the canonical history does not contain and store
+# the node's answer as a rejected candidate. Requires an [rpc] section (or
+# EXPLORER_RPC_ENDPOINTS) — the API refuses to start without one while this is on.
+# Stored candidates are served regardless of this flag.
+capture_enabled = false
+
+# [rpc]
+# rpc_endpoints = ["http://localhost:5172/rpc/v2"]

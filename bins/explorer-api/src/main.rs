@@ -25,10 +25,19 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = config.http.bind_addr;
     let pool = explorer_db::connect(&config.database).await?;
     let rate_limiter = RateLimiter::new(&config.rate_limiting);
-    let app = router(
-        ApiState::new(config.service_name, pool, config.chain.chain),
-        rate_limiter,
+    let mut state = ApiState::new(
+        config.service_name,
+        pool,
+        config.chain.chain,
+        &config.chain.nexus,
     );
+    // config.rpc is Some exactly when the rejected-transaction capture is enabled
+    // (ApiConfig ties the two together at parse time).
+    if let Some(rpc_config) = &config.rpc {
+        state = state.with_rejected_capture(explorer_rpc::PhantasmaSdkClient::new(rpc_config)?);
+        info!("rejected-transaction capture enabled");
+    }
+    let app = router(state, rate_limiter);
 
     serve(bind_addr, app).await
 }

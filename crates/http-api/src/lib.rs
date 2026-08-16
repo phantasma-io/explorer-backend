@@ -12,23 +12,25 @@ use explorer_db::{
     ContractMethodHistoryFilter, ContractMethodHistoryOrderBy, ContractOrderBy, DbError,
     EventFilter, EventKindOrderBy, EventOrderBy, EventPage, HistoryPriceFilter,
     HistoryPriceOrderBy, NftFilter, NftOrderBy, OrganizationFilter, OrganizationOrderBy,
-    OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy, SeriesFilter, SeriesOrderBy,
-    SortDirection, TokenFilter, TokenOrderBy, TransactionFilter, TransactionOrderBy,
-    TransactionPage, address_id_by_address, block_detail, chain_ids_by_name, check_health,
-    circulating_soul_supply, count_chains, count_contract_method_histories, count_event_kinds,
-    count_history_prices, count_platforms, event_kind_id_by_name, event_kind_ids_by_name_like,
-    event_payload_by_id, list_addresses, list_blocks, list_chains, list_contract_method_histories,
-    list_contracts, list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
+    OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy, RejectedCandidateRecord,
+    RejectedCandidateUpsert, SeriesFilter, SeriesOrderBy, SortDirection, TokenFilter, TokenOrderBy,
+    TransactionFilter, TransactionOrderBy, TransactionPage, address_id_by_address, block_detail,
+    canonical_transaction_exists, chain_ids_by_name, check_health, circulating_soul_supply,
+    count_chains, count_contract_method_histories, count_event_kinds, count_history_prices,
+    count_platforms, event_kind_id_by_name, event_kind_ids_by_name_like, event_payload_by_id,
+    list_addresses, list_blocks, list_chains, list_contract_method_histories, list_contracts,
+    list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
     list_events_by_address, list_events_by_transaction_ids, list_events_global,
-    list_history_prices, list_nfts, list_organizations, list_platforms, list_series,
-    list_signatures, list_soul_masters_monthlies, list_staking_dailies, list_tokens,
+    list_history_prices, list_nfts, list_organizations, list_platforms, list_rejected_candidates,
+    list_series, list_signatures, list_soul_masters_monthlies, list_staking_dailies, list_tokens,
     list_transaction_occurrences, list_transactions_by_block_ids,
     list_transactions_for_address_timeline, list_transactions_for_filtered_address,
     list_transactions_global, new_address_dailies, overview_counts, search_existence,
     single_transaction_by_hash, transaction_by_hash_block_index, transaction_neighbors,
     transaction_occurrence_count, transaction_row_by_block_index, transaction_state_id_by_name,
+    upsert_rejected_candidate,
 };
-use explorer_domain::ChainName;
+use explorer_domain::{BlockHeight, ChainName, NexusName};
 use num_bigint::BigInt;
 use phantasma_sdk::{Address as PhantasmaAddress, Ed25519Signature};
 use serde::de::DeserializeOwned;
@@ -69,6 +71,12 @@ pub struct ApiState {
     started_at: DateTime<Utc>,
     pool: PgPool,
     chain: ChainName,
+    /// Lowercased nexus identity stamped onto rejected-transaction candidates
+    /// (part of their storage key even when capture itself is disabled).
+    nexus: String,
+    /// RPC client for the rejected-transaction capture; `None` disables capture
+    /// while stored candidates keep being served.
+    rejected_capture: Option<Arc<explorer_rpc::PhantasmaSdkClient>>,
     overview_cache: Arc<Mutex<HashMap<OverviewCacheKey, (Instant, OverviewCounts)>>>,
     /// Serializes the expensive overview recompute so a cold/expired cache triggers a
     /// single full-table count, not one per concurrent caller (single-flight).
@@ -76,15 +84,28 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    pub fn new(service_name: impl Into<String>, pool: PgPool, chain: ChainName) -> Self {
+    pub fn new(
+        service_name: impl Into<String>,
+        pool: PgPool,
+        chain: ChainName,
+        nexus: &NexusName,
+    ) -> Self {
         Self {
             service_name: service_name.into(),
             started_at: Utc::now(),
             pool,
             chain,
+            nexus: nexus.as_str().to_lowercase(),
+            rejected_capture: None,
             overview_cache: Arc::new(Mutex::new(HashMap::new())),
             overview_flight: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Enable the on-demand rejected-transaction capture with the given node client.
+    pub fn with_rejected_capture(mut self, client: explorer_rpc::PhantasmaSdkClient) -> Self {
+        self.rejected_capture = Some(Arc::new(client));
+        self
     }
 }
 
@@ -895,6 +916,49 @@ struct TransactionListResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RejectedTransactionListQuery {
+    hash: Option<String>,
+    chain: Option<String>,
+    /// 1 (the default, matching C#) lets the endpoint query the node and store a
+    /// new candidate; 0 serves only already-stored rows.
+    capture: Option<i32>,
+}
+
+/// One rejected-transaction candidate, serialized with the C# ExplorerBackend
+/// field names the frontend already consumes.
+#[derive(Debug, Serialize)]
+struct RejectedTransactionCandidateResponse {
+    hash: String,
+    nexus: String,
+    chain: String,
+    block_height: Option<String>,
+    block_hash: Option<String>,
+    date: Option<String>,
+    state: Option<String>,
+    result: Option<String>,
+    debug_comment: Option<String>,
+    payload: Option<String>,
+    script_raw: Option<String>,
+    fee_raw: Option<String>,
+    expiration: Option<String>,
+    gas_price_raw: Option<String>,
+    gas_limit_raw: Option<String>,
+    sender: Option<String>,
+    gas_payer: Option<String>,
+    gas_target: Option<String>,
+    canonical_status: Option<String>,
+    captured_at: String,
+    updated_at: String,
+    rpc_response_json: Option<String>,
+    block_response_json: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RejectedTransactionListResponse {
+    rejected_transactions: Vec<RejectedTransactionCandidateResponse>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 struct TransactionDetailResponse {
     transaction: TransactionResponse,
@@ -1244,6 +1308,7 @@ pub fn router(state: ApiState, rate_limiter: RateLimiter) -> Router {
         .route("/api/v1/searches", get(searches))
         .route("/api/v1/raw-blocks/{height}", get(raw_block_by_height))
         .route("/api/v1/transaction", get(transaction_legacy))
+        .route("/api/v1/rejected-transactions", get(rejected_transactions))
         .route("/api/v1/transactions", get(transactions))
         .route("/api/v1/transactions/{hash}", get(transaction_by_hash))
         .route("/api/v1/events", get(events))

@@ -1768,3 +1768,276 @@ pub(crate) async fn load_events_by_transaction_ids(
     }
     Ok(grouped)
 }
+
+/// A transaction hash is exactly 64 hex chars (32 bytes); every stored hash on
+/// both chains matches `^[0-9A-F]{64}$`. Rejecting anything else up front keeps
+/// junk requests from reaching the node lookup at all.
+fn is_valid_rejected_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// C# `ArgValidation.CheckChain`: lowercase alnum start, then alnum/hyphen, max 64.
+fn is_valid_rejected_chain(chain: &str) -> bool {
+    let mut chars = chain.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chain.len() <= 64 && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Empty strings from the node's tolerant decode become absent columns.
+fn non_empty_owned(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// The canonical-status verdict for a fetched block: `None` when the hash IS in
+/// the block's transaction list (a canonical transaction, so no candidate is
+/// stored), otherwise the C# `not_in_block_txs` marker.
+fn rejected_status_for_block_txs<'a>(
+    block_tx_hashes: impl IntoIterator<Item = &'a str>,
+    hash: &str,
+) -> Option<&'static str> {
+    for block_hash in block_tx_hashes {
+        if block_hash.eq_ignore_ascii_case(hash) {
+            return None;
+        }
+    }
+    Some("not_in_block_txs")
+}
+
+fn rejected_candidate_response(
+    record: &RejectedCandidateRecord,
+) -> RejectedTransactionCandidateResponse {
+    RejectedTransactionCandidateResponse {
+        hash: record.hash.clone(),
+        nexus: record.nexus.clone(),
+        chain: record.chain.clone(),
+        block_height: record.block_height.map(|value| value.to_string()),
+        block_hash: record.block_hash.clone().filter(|hash| !hash.is_empty()),
+        date: record.timestamp_unix_seconds.map(|value| value.to_string()),
+        state: record.state.clone(),
+        result: record.result.clone(),
+        debug_comment: record.debug_comment.clone(),
+        payload: record.payload.clone(),
+        script_raw: record.script_raw.clone(),
+        fee_raw: record.fee_raw.clone(),
+        expiration: record.expiration.map(|value| value.to_string()),
+        gas_price_raw: record.gas_price_raw.clone(),
+        gas_limit_raw: record.gas_limit_raw.clone(),
+        sender: record.sender.clone(),
+        gas_payer: record.gas_payer.clone(),
+        gas_target: record.gas_target.clone(),
+        canonical_status: record.canonical_status.clone(),
+        captured_at: record.captured_at_unix_seconds.to_string(),
+        updated_at: record.updated_at_unix_seconds.to_string(),
+        rpc_response_json: record.rpc_response_json.clone(),
+        block_response_json: record.block_response_json.clone(),
+    }
+}
+
+/// Rejected transaction candidates (C# `EP.RejectedTransactions` port): serve
+/// stored candidates for a hash the canonical history does not contain, and —
+/// when capture is enabled — ask the node about the hash on demand and store
+/// what it still knows about the rejected candidate.
+pub(crate) async fn rejected_transactions(
+    State(state): State<ApiState>,
+    Query(query): Query<RejectedTransactionListQuery>,
+) -> Result<Json<RejectedTransactionListResponse>, ApiError> {
+    let hash = empty_to_none(query.hash)
+        .map(|value| value.trim().to_uppercase())
+        .filter(|value| is_valid_rejected_hash(value))
+        .ok_or_else(|| {
+            ApiError::BadRequest("Unsupported value for 'hash' parameter.".to_owned())
+        })?;
+    let chain = match empty_to_none(query.chain) {
+        Some(value) => {
+            let normalized = value.trim().to_lowercase();
+            if !is_valid_rejected_chain(&normalized) {
+                return Err(ApiError::BadRequest(
+                    "Unsupported value for 'chain' parameter.".to_owned(),
+                ));
+            }
+            normalized
+        }
+        None => state.chain.as_str().to_lowercase(),
+    };
+    let nexus = state.nexus.clone();
+
+    let empty = || {
+        Json(RejectedTransactionListResponse {
+            rejected_transactions: Vec::new(),
+        })
+    };
+
+    // A canonical transaction can never be a rejected candidate.
+    if canonical_transaction_exists(&state.pool, &hash, &chain).await? {
+        return Ok(empty());
+    }
+
+    let existing = list_rejected_candidates(&state.pool, &hash, &nexus, &chain).await?;
+    if !existing.is_empty() {
+        return Ok(Json(RejectedTransactionListResponse {
+            rejected_transactions: existing.iter().map(rejected_candidate_response).collect(),
+        }));
+    }
+
+    // Capture defaults to on (C# `capture = 1`); it still needs the RPC client,
+    // which exists only when the deployment enabled the capture.
+    if query.capture.unwrap_or(1) != 1 {
+        return Ok(empty());
+    }
+    let Some(rpc) = state.rejected_capture.clone() else {
+        return Ok(empty());
+    };
+
+    match capture_rejected_candidate(&state, &rpc, &hash, &nexus, &chain).await? {
+        Some(record) => Ok(Json(RejectedTransactionListResponse {
+            rejected_transactions: vec![rejected_candidate_response(&record)],
+        })),
+        None => Ok(empty()),
+    }
+}
+
+/// Ask the node about the hash and store a candidate row unless the answer shows
+/// the transaction is canonical after all. Node errors (including "not found")
+/// end the capture quietly — the endpoint then reports no candidates, exactly
+/// like the C# capture on a failed fetch.
+async fn capture_rejected_candidate(
+    state: &ApiState,
+    rpc: &explorer_rpc::PhantasmaSdkClient,
+    hash: &str,
+    nexus: &str,
+    chain: &str,
+) -> Result<Option<RejectedCandidateRecord>, ApiError> {
+    let tx_payload = match rpc.get_transaction_payload(hash).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::debug!(%hash, %chain, %error, "rejected-tx capture: node lookup failed");
+            return Ok(None);
+        }
+    };
+    let tx = &tx_payload.value;
+    if !tx.hash.eq_ignore_ascii_case(hash) {
+        return Ok(None);
+    }
+
+    let mut block_hash = non_empty_owned(&tx.block_hash);
+    let mut block_response_json = None;
+    let mut canonical_status = "block_unavailable";
+
+    if tx.block_height > 0 {
+        let chain_name =
+            ChainName::new(chain).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        match rpc
+            .get_block_by_height_payload(&chain_name, BlockHeight::new(tx.block_height))
+            .await
+        {
+            Ok(block_payload) => {
+                let block = &block_payload.value;
+                block_response_json = serde_json::to_string(&block_payload.raw_value).ok();
+                if let Some(canonical_hash) = non_empty_owned(&block.hash) {
+                    block_hash = Some(canonical_hash);
+                }
+                match rejected_status_for_block_txs(
+                    block.txs.iter().map(|tx| tx.hash.as_str()),
+                    hash,
+                ) {
+                    Some(status) => canonical_status = status,
+                    None => {
+                        tracing::info!(
+                            %hash, %nexus, %chain,
+                            "rejected-tx capture: hash is in the canonical block; not stored"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%hash, %chain, %error, "rejected-tx capture: block fetch failed");
+            }
+        }
+    }
+
+    let candidate = RejectedCandidateUpsert {
+        hash: hash.to_owned(),
+        nexus: nexus.to_owned(),
+        chain: chain.to_owned(),
+        block_height: (tx.block_height > 0).then_some(tx.block_height as i64),
+        block_hash,
+        timestamp_unix_seconds: (tx.timestamp > 0).then_some(tx.timestamp as i64),
+        state: non_empty_owned(&tx.state),
+        result: non_empty_owned(&tx.result),
+        debug_comment: tx.debug_comment.as_deref().and_then(non_empty_owned),
+        payload: non_empty_owned(&tx.payload),
+        script_raw: non_empty_owned(&tx.script),
+        fee_raw: non_empty_owned(&tx.fee),
+        expiration: (tx.expiration > 0).then_some(tx.expiration as i64),
+        gas_price_raw: non_empty_owned(&tx.gas_price),
+        gas_limit_raw: non_empty_owned(&tx.gas_limit),
+        sender: non_empty_owned(&tx.sender),
+        gas_payer: non_empty_owned(&tx.gas_payer),
+        gas_target: non_empty_owned(&tx.gas_target),
+        canonical_status: Some(canonical_status.to_owned()),
+        rpc_response_json: serde_json::to_string(&tx_payload.raw_value).ok(),
+        block_response_json,
+    };
+    let record = upsert_rejected_candidate(&state.pool, &candidate, Utc::now().timestamp()).await?;
+    tracing::info!(
+        %hash, %nexus, %chain,
+        block_height = ?record.block_height,
+        status = canonical_status,
+        "rejected-tx capture: candidate stored"
+    );
+    Ok(Some(record))
+}
+
+#[cfg(test)]
+mod rejected_tests {
+    use super::*;
+
+    // Behavior: the block verdict decides between "canonical after all" (None,
+    // nothing stored) and the not_in_block_txs status, case-insensitively.
+    #[test]
+    fn block_verdict_spots_the_canonical_hash() {
+        assert_eq!(
+            rejected_status_for_block_txs(["AA", "BB"], "cc"),
+            Some("not_in_block_txs")
+        );
+        assert_eq!(rejected_status_for_block_txs(["AA", "bb"], "BB"), None);
+        assert_eq!(
+            rejected_status_for_block_txs([], "BB"),
+            Some("not_in_block_txs")
+        );
+    }
+
+    // Behavior: a hash must be exactly 64 hex chars; a chain is lowercase alnum
+    // with hyphens (covers "main-generation-1"), max 64.
+    #[test]
+    fn validation_accepts_real_identifiers_only() {
+        assert!(is_valid_rejected_hash(
+            "1046EBBBD6356036D6B4C07CD977998CFF54188E7BE4FBB75705696F609F6E51"
+        ));
+        assert!(!is_valid_rejected_hash(""));
+        assert!(!is_valid_rejected_hash("1046EBBB75"), "too short");
+        assert!(
+            !is_valid_rejected_hash(
+                "ZZ46EBBBD6356036D6B4C07CD977998CFF54188E7BE4FBB75705696F609F6E51"
+            ),
+            "not hex"
+        );
+        assert!(is_valid_rejected_chain("main"));
+        assert!(is_valid_rejected_chain("main-generation-1"));
+        assert!(!is_valid_rejected_chain("-main"));
+        assert!(!is_valid_rejected_chain("Main"));
+        assert!(!is_valid_rejected_chain(""));
+    }
+
+    // Behavior: empty node strings become absent columns, not empty ones.
+    #[test]
+    fn empty_node_strings_are_dropped() {
+        assert_eq!(non_empty_owned("  "), None);
+        assert_eq!(non_empty_owned("x"), Some("x".to_owned()));
+    }
+}

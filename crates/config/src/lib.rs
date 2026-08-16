@@ -51,6 +51,12 @@ pub struct ApiConfig {
     pub database: DatabaseConfig,
     pub chain: ChainConfig,
     pub logging: LoggingConfig,
+    pub rejected_transactions: RejectedTransactionsConfig,
+    /// RPC client settings for the rejected-transaction capture. `Some` only when
+    /// that capture is enabled: a plain API deployment must not be forced to
+    /// configure node endpoints, while an enabled capture with no endpoints dies
+    /// here at parse time instead of on the first captured request.
+    pub rpc: Option<RpcConfig>,
 }
 
 impl ApiConfig {
@@ -63,6 +69,13 @@ impl ApiConfig {
         config_file_path: Option<&Path>,
     ) -> Result<Self, ConfigError> {
         let file = ExplorerConfigFile::load_optional(config_file_path)?;
+        let rejected_transactions =
+            RejectedTransactionsConfig::from_file_or_env(file.rejected_transactions.as_ref())?;
+        let rpc = if rejected_transactions.capture_enabled {
+            Some(RpcConfig::from_file_or_env(file.rpc.as_ref())?)
+        } else {
+            None
+        };
         Ok(Self {
             service_name: service_name.into(),
             http: HttpConfig::from_file_or_env(file.http.as_ref())?,
@@ -70,6 +83,40 @@ impl ApiConfig {
             database: DatabaseConfig::from_file_or_env(file.database.as_ref())?,
             chain: ChainConfig::from_file_or_env(file.chain.as_ref())?,
             logging: LoggingConfig::from_file_or_env(file.logging.as_ref())?,
+            rejected_transactions,
+            rpc,
+        })
+    }
+}
+
+/// Settings for the `/rejected-transactions` on-demand capture (the C#
+/// `RejectedTransactionCandidates` settings, minus the fields our config
+/// already carries elsewhere: the nexus/chain identity lives in [`ChainConfig`]
+/// and the node endpoints in [`RpcConfig`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RejectedTransactionsConfig {
+    /// Whether a `capture=1` request may query the node and store a candidate.
+    /// Off by default: serving already-stored rows needs no node access.
+    pub capture_enabled: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct RejectedTransactionsFileConfig {
+    capture_enabled: Option<bool>,
+}
+
+impl RejectedTransactionsConfig {
+    fn from_file_or_env(
+        file: Option<&RejectedTransactionsFileConfig>,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
+            capture_enabled: env_or_file_or_default(
+                "EXPLORER_REJECTED_TX_CAPTURE_ENABLED",
+                "rejected_transactions.capture_enabled",
+                file.and_then(|file| file.capture_enabled),
+                false,
+            )?,
         })
     }
 }
@@ -135,6 +182,7 @@ struct ExplorerConfigFile {
     rpc: Option<RpcFileConfig>,
     worker: Option<WorkerFileConfig>,
     logging: Option<LoggingFileConfig>,
+    rejected_transactions: Option<RejectedTransactionsFileConfig>,
 }
 
 impl ExplorerConfigFile {
