@@ -287,6 +287,46 @@ pub(crate) fn organization_from_row(
     row: &OrganizationRow,
     with_address: bool,
 ) -> OrganizationResponse {
+    // Same creation-event shape as platform_from_row; the columns are NULL when
+    // the query ran without with_creation_event or the organization predates
+    // event coverage.
+    let create_event = row.create_event_id.map(|event_id| EventResponse {
+        event_id,
+        event_index: row.create_event_index.unwrap_or_default(),
+        event_source: "legacy".to_owned(),
+        chain: row
+            .create_chain
+            .clone()
+            .unwrap_or_else(|| "main".to_owned()),
+        date: row
+            .create_timestamp_unix_seconds
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        block_hash: row.create_block_hash.clone().unwrap_or_default(),
+        transaction_hash: row.create_transaction_hash.clone().unwrap_or_default(),
+        event_kind: row.create_event_kind.clone().unwrap_or_default(),
+        event_name: row.create_event_kind.clone(),
+        address: row.create_address.clone(),
+        address_name: row.create_address_name.clone(),
+        contract: row
+            .create_contract_hash
+            .clone()
+            .map(|hash| ContractRefResponse {
+                hash,
+                name: row.create_contract_name.clone(),
+                symbol: row.create_contract_symbol.clone(),
+            }),
+        token_id: row.create_token_id.clone(),
+        payload_json: row
+            .create_payload_json
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok()),
+        raw_data: row.create_raw_data.clone(),
+        nft_metadata: None,
+        series: None,
+        event_data: EventDataFields::default(),
+    });
+
     OrganizationResponse {
         id: row.organization_id.clone(),
         name: row.name.clone(),
@@ -301,6 +341,7 @@ pub(crate) fn organization_from_row(
             stakes: None,
             balances: None,
         }),
+        create_event,
     }
 }
 

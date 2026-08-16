@@ -703,6 +703,7 @@ pub(crate) async fn organizations(
         empty_to_none(query.organization_name_partial).map(|value| format!("%{value}%"));
     let q = empty_to_none(query.q).map(|value| format!("%{value}%"));
     let with_address = query.with_address == Some(1);
+    let with_creation_event = query.with_creation_event == Some(1);
 
     let filter = OrganizationFilter {
         organization_id: organization_id.as_deref(),
@@ -710,6 +711,7 @@ pub(crate) async fn organizations(
         organization_name: organization_name.as_deref(),
         organization_name_partial: organization_name_partial.as_deref(),
         q: q.as_deref(),
+        with_creation_event,
     };
     let rows =
         list_organizations(&state.pool, &filter, order_by, direction, limit + 1, offset).await?;

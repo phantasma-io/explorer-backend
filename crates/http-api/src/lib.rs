@@ -543,14 +543,19 @@ struct OrganizationListQuery {
     organization_name_partial: Option<String>,
     q: Option<String>,
     with_address: Option<i32>,
+    with_creation_event: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 struct OrganizationResponse {
     id: Option<String>,
     name: Option<String>,
     size: i64,
     address: Option<AddressResponse>,
+    /// The OrganizationCreate event, present only with `with_creation_event=1`
+    /// and only for organizations created after event coverage begins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    create_event: Option<EventResponse>,
 }
 
 #[derive(Debug, Serialize)]
