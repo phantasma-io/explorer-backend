@@ -142,6 +142,7 @@ struct StakeSnapshotEventRow {
     kind: String,
     timestamp_unix_seconds: i64,
     payload_identity: String,
+    payload_format: i16,
     token_symbol: Option<String>,
     value_raw: Option<BigInt>,
     address: Option<String>,
@@ -755,6 +756,7 @@ async fn load_stake_snapshot_events(
             event_kind.name AS kind,
             tx.timestamp_unix_seconds AS timestamp_unix_seconds,
             COALESCE(event.raw_data, event.payload_json::text, '') AS payload_identity,
+            event.payload_format AS payload_format,
             event.payload_json->'token_event'->>'token' AS token_symbol,
             event.payload_json->'token_event'->>'value_raw' AS value_raw,
             address.address AS address,
@@ -865,6 +867,7 @@ async fn load_stake_snapshot_events(
                 kind: row.get("kind"),
                 timestamp_unix_seconds: row.get("timestamp_unix_seconds"),
                 payload_identity: row.get("payload_identity"),
+                payload_format: row.get("payload_format"),
                 token_symbol: row.get("token_symbol"),
                 value_raw,
                 address: row.get("address"),
@@ -953,12 +956,30 @@ fn build_stake_snapshot_daily_points(
     Ok((snapshots, closed_day_state))
 }
 
+/// `events.payload_format` storage code for the backfilled gen1/gen2 history
+/// (see `events::payload_format_code`). It is the only format that is
+/// de-duplicated; gen3 rows are taken as written.
+const LEGACY_BACKFILL_PAYLOAD_FORMAT: i16 = 1;
+
 fn deduplicate_stake_snapshot_tx_rows(
     rows: &[StakeSnapshotEventRow],
 ) -> Vec<StakeSnapshotEventRow> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::with_capacity(rows.len());
     for row in rows {
+        // gen3 rows are never de-duplicated: the duplicated-event defect this
+        // collapse exists for was fixed at the source, so an identical row
+        // repeated inside one gen3 transaction is a REAL repeated operation.
+        // Proven live on 2026-08-16: testnet tx 43B0CC45… unstakes 0.5 SOUL and
+        // then stakes 0.1 SOUL twice (event_index 4 and 5, byte-identical
+        // raw_data), and the node's own account balance counts both. Collapsing
+        // them under-counted the address's stake, the next claim went below zero,
+        // and the guard killed the whole Soul-Masters curve on devnet and testnet
+        // every 30 s from 2026-08-13 until this fix.
+        if row.payload_format != LEGACY_BACKFILL_PAYLOAD_FORMAT {
+            deduped.push(row.clone());
+            continue;
+        }
         // The identity may fall back to payload_json::text, which since migration
         // 202608040003 no longer stores the event address; appending the
         // relational address keeps two same-shaped events from different
@@ -1358,6 +1379,10 @@ fn stake_snapshot_master_threshold() -> BigInt {
 
 #[cfg(test)]
 mod tests {
+    /// `events.payload_format` storage code for gen3 rows written by our own
+    /// ingestion (`live.v1`); the default for rows these tests build.
+    const LIVE_PAYLOAD_FORMAT: i16 = 2;
+
     use super::*;
     #[test]
     fn stake_snapshot_replay_builds_closed_daily_points_from_anchor_state() -> Result<(), DbError> {
@@ -1899,6 +1924,130 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn stake_snapshot_replay_keeps_repeated_gen3_rows_in_one_transaction() -> Result<(), DbError> {
+        // A gen3 transaction may legitimately call stake twice for the same
+        // amount; both events are then byte-identical and differ only by
+        // event_index, so a content-keyed collapse would silently drop half the
+        // stake. Only the backfilled gen1/gen2 history is de-duplicated.
+        let mut first =
+            test_stake_snapshot_token_row(1, 1, "TokenStake", 1_700_000_010, "PTESTA", "10000000")?;
+        let mut second =
+            test_stake_snapshot_token_row(2, 1, "TokenStake", 1_700_000_010, "PTESTA", "10000000")?;
+        // What the node writes for two identical stakes: the same raw event image.
+        first.payload_identity = "04534F554C0480969800046D61696E".to_owned();
+        second.payload_identity = first.payload_identity.clone();
+        let rows = deduplicate_stake_snapshot_tx_rows(&[first, second]);
+        assert_eq!(rows.len(), 2);
+
+        let mut state = StakeSnapshotState {
+            stakes_by_address: std::collections::HashMap::new(),
+            total_staked_raw: BigInt::zero(),
+            soul_supply_raw: BigInt::from(1_000_000_000),
+            stakers_count: 0,
+            masters_count: 0,
+        };
+        apply_stake_snapshot_transaction(&mut state, &rows, false)?;
+        assert_eq!(state.total_staked_raw, BigInt::from(20_000_000));
+
+        Ok(())
+    }
+
+    #[test]
+    fn stake_snapshot_replay_collapses_duplicate_legacy_rows() -> Result<(), DbError> {
+        // The gen1/gen2 backfill can carry the same on-chain event twice with no
+        // field left to tell the copies apart; those must still collapse.
+        let mut first =
+            test_stake_snapshot_token_row(1, 1, "TokenStake", 1_700_000_010, "PTESTA", "10000000")?;
+        let mut second =
+            test_stake_snapshot_token_row(2, 1, "TokenStake", 1_700_000_010, "PTESTA", "10000000")?;
+        first.payload_format = LEGACY_BACKFILL_PAYLOAD_FORMAT;
+        second.payload_format = LEGACY_BACKFILL_PAYLOAD_FORMAT;
+        first.payload_identity = "legacy-image".to_owned();
+        second.payload_identity = first.payload_identity.clone();
+
+        let rows = deduplicate_stake_snapshot_tx_rows(&[first, second]);
+        assert_eq!(rows.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn stake_snapshot_replay_survives_unstake_before_restake_in_one_transaction()
+    -> Result<(), DbError> {
+        // The live failure this fixes (testnet tx 43B0CC45…, devnet 9A195B20…):
+        // an address stakes 0.1 SOUL twice per transaction, then one transaction
+        // unstakes 0.5 (event_index 2, before that transaction's own stakes) and
+        // stakes 0.1 twice again. With the repeated rows collapsed the running
+        // balance held only 0.3 when the 0.5 claim landed, the replay went
+        // negative and the whole curve stopped being written. The node reports
+        // 0.4 SOUL staked for this sequence — 0.9 staked minus 0.5 claimed.
+        let stake_image = "04534F554C0480969800046D61696E";
+        let mut event_id = 0;
+        let mut stake_row =
+            |tx_id: i32, timestamp: i64| -> Result<StakeSnapshotEventRow, DbError> {
+                event_id += 1;
+                let mut row = test_stake_snapshot_token_row(
+                    event_id,
+                    tx_id,
+                    "TokenStake",
+                    timestamp,
+                    "PTESTA",
+                    "10000000",
+                )?;
+                row.payload_identity = stake_image.to_owned();
+                row.tx_has_stake_call = true;
+                Ok(row)
+            };
+
+        let mut rows = vec![
+            stake_row(1, 1_700_000_010)?,
+            stake_row(2, 1_700_000_020)?,
+            stake_row(2, 1_700_000_020)?,
+            stake_row(3, 1_700_000_030)?,
+            stake_row(3, 1_700_000_030)?,
+        ];
+        // The unstake transaction: the claim precedes its own restakes, exactly
+        // as the event_index order on chain.
+        let mut claim = test_stake_snapshot_token_row(
+            100,
+            4,
+            "TokenClaim",
+            1_700_000_040,
+            "PTESTA",
+            "50000000",
+        )?;
+        claim.tx_has_unstake_call = true;
+        claim.tx_has_stake_call = true;
+        rows.push(claim);
+        for _ in 0..2 {
+            let mut row = stake_row(4, 1_700_000_040)?;
+            row.tx_has_unstake_call = true;
+            rows.push(row);
+        }
+        // One more ordinary stake transaction after it, as on chain.
+        rows.push(stake_row(5, 1_700_000_050)?);
+        rows.push(stake_row(5, 1_700_000_050)?);
+
+        let day = stake_snapshot_day_start(1_700_000_010);
+        let (curve, _) = build_stake_snapshot_daily_points(
+            StakeSnapshotState {
+                stakes_by_address: std::collections::HashMap::new(),
+                total_staked_raw: BigInt::zero(),
+                soul_supply_raw: BigInt::from(1_000_000_000),
+                stakers_count: 0,
+                masters_count: 0,
+            },
+            &rows,
+            day,
+            day + STAKE_SNAPSHOT_SECONDS_PER_DAY,
+        )?;
+        assert_eq!(curve.len(), 1);
+        assert_eq!(curve[0].staked_soul_raw, "40000000");
+
+        Ok(())
+    }
+
     fn test_stake_snapshot_token_row(
         event_id: i32,
         tx_id: i32,
@@ -1913,6 +2062,7 @@ mod tests {
             kind: kind.to_owned(),
             timestamp_unix_seconds,
             payload_identity: format!("{event_id}:{kind}:{address}:{value_raw}"),
+            payload_format: LIVE_PAYLOAD_FORMAT,
             token_symbol: Some("SOUL".to_owned()),
             value_raw: Some(parse_stake_snapshot_raw("value_raw", value_raw)?),
             address: Some(address.to_owned()),
@@ -1937,6 +2087,7 @@ mod tests {
             kind: "TokenMint".to_owned(),
             timestamp_unix_seconds,
             payload_identity: format!("{event_id}:TokenMint:{address}:{value_raw}"),
+            payload_format: LIVE_PAYLOAD_FORMAT,
             token_symbol: Some("KCAL".to_owned()),
             value_raw: Some(parse_stake_snapshot_raw("value_raw", value_raw)?),
             address: Some(address.to_owned()),
