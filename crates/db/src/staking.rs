@@ -220,9 +220,12 @@ async fn capture_stake_boundary_slice_in_tx(
     // Walk the stake events (day after the seed day .. cursor) back from the known current state
     // to the end of the seed day. `state` then holds the per-address stake at the seed day.
     let from_ts = boundary_day + STAKE_SNAPSHOT_SECONDS_PER_DAY;
-    let events = load_stake_snapshot_events(conn, chain_id, from_ts, cursor_timestamp).await?;
+    let mut anomalies = StakeSnapshotAnomalies::default();
+    let events =
+        load_stake_snapshot_events(conn, chain_id, from_ts, cursor_timestamp, &mut anomalies)
+            .await?;
     let mut state = load_current_stake_snapshot_state(conn, chain_id).await?;
-    reverse_replay_stake_snapshot_events(&mut state, &events)?;
+    reverse_replay_stake_snapshot_events(&mut state, &events, &mut anomalies)?;
 
     // Freeze the slice. Replace any prior capture for this chain so re-running is idempotent.
     sqlx::query("DELETE FROM stake_boundary_balances WHERE chain_id = $1")
@@ -372,6 +375,43 @@ pub struct StakeForwardBuildReport {
     /// full-from-boundary rebuild (no state, or state inconsistent with the curve).
     pub resumed_from_day_unix_seconds: Option<i64>,
     pub skipped_reason: Option<String>,
+    /// Inconsistencies the replay had to clamp to finish; 0 on a clean build.
+    pub anomalies: StakeSnapshotAnomalies,
+}
+
+/// What the replay had to paper over to finish.
+///
+/// The Soul-Masters curve is a derived view, so a single inconsistent address
+/// must not cost a whole network its chart: the replay clamps the impossible
+/// value and keeps building. The clamp is never swallowed — it is counted here
+/// and logged by the caller, because an impossible value means our inputs
+/// disagree with the chain and someone has to look. (Before 2026-08-16 the same
+/// situation aborted the entire pass, so devnet and testnet had no curve at all
+/// for four days over one address.)
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StakeSnapshotAnomalies {
+    pub count: u32,
+    /// The first few reasons, for the log; the rest are only counted.
+    pub samples: Vec<String>,
+}
+
+impl StakeSnapshotAnomalies {
+    const MAX_SAMPLES: usize = 5;
+
+    fn record(&mut self, reason: String) {
+        self.count = self.count.saturating_add(1);
+        if self.samples.len() < Self::MAX_SAMPLES {
+            self.samples.push(reason);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn joined_samples(&self) -> String {
+        self.samples.join("; ")
+    }
 }
 
 /// The latest day the forward projector has already written. Used to make the
@@ -548,6 +588,7 @@ async fn project_stake_snapshots_forward_in_tx(
         monthly_upserted: 0,
         resumed_from_day_unix_seconds: None,
         skipped_reason: Some(reason.to_owned()),
+        anomalies: StakeSnapshotAnomalies::default(),
     };
 
     let Some((boundary_day, boundary_state)) = load_stake_boundary_slice(conn, chain_id).await?
@@ -619,13 +660,21 @@ async fn project_stake_snapshots_forward_in_tx(
     // cursor and write the forward curve. The build from the frozen seed + the
     // complete on-chain stake events IS the source of truth; the resume state is that
     // same fold, persisted.
-    let events =
-        load_stake_snapshot_events(conn, chain_id, replay_from_day, cursor_timestamp).await?;
+    let mut anomalies = StakeSnapshotAnomalies::default();
+    let events = load_stake_snapshot_events(
+        conn,
+        chain_id,
+        replay_from_day,
+        cursor_timestamp,
+        &mut anomalies,
+    )
+    .await?;
     let (curve, closed_day_state) = build_stake_snapshot_daily_points(
         replay_state,
         &events,
         replay_from_day,
         target_exclusive_day,
+        &mut anomalies,
     )?;
     let daily_upserted = upsert_stake_snapshot_daily_points(conn, chain_id, &curve).await?;
     let monthly_upserted = upsert_stake_snapshot_monthlies_from_daily(
@@ -651,6 +700,7 @@ async fn project_stake_snapshots_forward_in_tx(
         monthly_upserted,
         resumed_from_day_unix_seconds: resumed_from_day,
         skipped_reason: None,
+        anomalies,
     })
 }
 
@@ -747,6 +797,7 @@ async fn load_stake_snapshot_events(
     chain_id: i32,
     from_ts: i64,
     to_ts: i64,
+    anomalies: &mut StakeSnapshotAnomalies,
 ) -> Result<Vec<StakeSnapshotEventRow>, DbError> {
     let rows = sqlx::query(
         r#"
@@ -846,18 +897,30 @@ async fn load_stake_snapshot_events(
                 .map(|value| parse_stake_snapshot_raw("value_raw", &value))
                 .transpose()?;
             let tx_is_soul_apply_inflation: bool = row.get("tx_is_soul_apply_inflation");
+            // The inflation result carries the exact SOUL supply delta. When it is
+            // missing or undecodable the supply falls back to the mint event's own
+            // value below — a worse number, but not a reason to drop the curve.
             let tx_apply_inflation_result_soul_delta_raw = if tx_is_soul_apply_inflation {
                 let tx_result: Option<String> = row.get("tx_result");
-                let tx_result =
-                    tx_result
-                        .as_deref()
-                        .ok_or_else(|| DbError::StakeSnapshotReplay {
-                            reason: format!(
-                                "missing Token.ApplyInflation SOUL result in tx {}",
+                match tx_result.as_deref() {
+                    None => {
+                        anomalies.record(format!(
+                            "missing Token.ApplyInflation SOUL result in tx {}",
+                            row.get::<i32, _>("tx_id")
+                        ));
+                        None
+                    }
+                    Some(tx_result) => match parse_carbon_intx_i64_raw("tx.result", tx_result) {
+                        Ok(delta) => Some(delta),
+                        Err(error) => {
+                            anomalies.record(format!(
+                                "tx {} Token.ApplyInflation result: {error}",
                                 row.get::<i32, _>("tx_id")
-                            ),
-                        })?;
-                Some(parse_carbon_intx_i64_raw("tx.result", tx_result)?)
+                            ));
+                            None
+                        }
+                    },
+                }
             } else {
                 None
             };
@@ -884,6 +947,7 @@ async fn load_stake_snapshot_events(
 fn reverse_replay_stake_snapshot_events(
     state: &mut StakeSnapshotState,
     rows: &[StakeSnapshotEventRow],
+    anomalies: &mut StakeSnapshotAnomalies,
 ) -> Result<(), DbError> {
     let mut tx_group_end = rows.len();
     while tx_group_end > 0 {
@@ -893,7 +957,7 @@ fn reverse_replay_stake_snapshot_events(
             tx_group_start -= 1;
         }
         let tx_rows = deduplicate_stake_snapshot_tx_rows(&rows[tx_group_start..tx_group_end]);
-        apply_stake_snapshot_transaction(state, &tx_rows, true)?;
+        apply_stake_snapshot_transaction(state, &tx_rows, true, anomalies)?;
         tx_group_end = tx_group_start;
     }
     Ok(())
@@ -917,6 +981,7 @@ fn build_stake_snapshot_daily_points(
     rows: &[StakeSnapshotEventRow],
     from_day: i64,
     to_exclusive_day: i64,
+    anomalies: &mut StakeSnapshotAnomalies,
 ) -> Result<StakeSnapshotBuildOutput, DbError> {
     let mut snapshots = Vec::new();
     let mut closed_day_state = None;
@@ -935,7 +1000,7 @@ fn build_stake_snapshot_daily_points(
                 break;
             }
             let tx_rows = deduplicate_stake_snapshot_tx_rows(&rows[tx_group_start..tx_group_end]);
-            apply_stake_snapshot_transaction(&mut state, &tx_rows, false)?;
+            apply_stake_snapshot_transaction(&mut state, &tx_rows, false, anomalies)?;
             tx_group_start = tx_group_end;
         }
 
@@ -1002,6 +1067,7 @@ fn apply_stake_snapshot_transaction(
     state: &mut StakeSnapshotState,
     rows: &[StakeSnapshotEventRow],
     reverse: bool,
+    anomalies: &mut StakeSnapshotAnomalies,
 ) -> Result<(), DbError> {
     let tx_kind = classify_stake_snapshot_transaction(rows);
     let apply_inflation_result_soul_delta = rows
@@ -1036,10 +1102,10 @@ fn apply_stake_snapshot_transaction(
 
         match (row.kind.as_str(), reverse) {
             ("TokenStake", false) | ("TokenClaim", true) => {
-                apply_stake_snapshot_stake_delta(state, row, value_raw)?;
+                apply_stake_snapshot_stake_delta(state, row, value_raw, anomalies)?;
             }
             ("TokenStake", true) | ("TokenClaim", false) => {
-                apply_stake_snapshot_stake_delta(state, row, &-value_raw)?;
+                apply_stake_snapshot_stake_delta(state, row, &-value_raw, anomalies)?;
             }
             ("TokenMint", false) | ("TokenBurn", true) => {
                 if let Some(delta) = apply_inflation_result_soul_delta {
@@ -1061,13 +1127,12 @@ fn apply_stake_snapshot_transaction(
                     state.soul_supply_raw -= value_raw;
                 }
                 if state.soul_supply_raw < BigInt::zero() {
-                    return Err(DbError::StakeSnapshotReplay {
-                        reason: format!(
-                            "negative SOUL supply after {} event {}",
-                            if reverse { "reverse" } else { "forward" },
-                            row.event_id
-                        ),
-                    });
+                    anomalies.record(format!(
+                        "negative SOUL supply after {} event {} clamped to 0",
+                        if reverse { "reverse" } else { "forward" },
+                        row.event_id
+                    ));
+                    state.soul_supply_raw = BigInt::zero();
                 }
             }
             _ => {}
@@ -1152,27 +1217,33 @@ fn apply_stake_snapshot_stake_delta(
     state: &mut StakeSnapshotState,
     row: &StakeSnapshotEventRow,
     delta: &BigInt,
+    anomalies: &mut StakeSnapshotAnomalies,
 ) -> Result<(), DbError> {
-    let address = row
+    let Some(address) = row
         .address
         .as_deref()
         .filter(|address| !address.trim().is_empty())
-        .ok_or_else(|| DbError::StakeSnapshotReplay {
-            reason: format!("empty address in staking event {}", row.event_id),
-        })?;
+    else {
+        // An address-less staking event cannot be attributed to anyone; skip the
+        // row rather than lose the rest of the curve over it.
+        anomalies.record(format!("empty address in staking event {}", row.event_id));
+        return Ok(());
+    };
     let old_value = state
         .stakes_by_address
         .get(address)
         .cloned()
         .unwrap_or_else(BigInt::zero);
-    let new_value = &old_value + delta;
+    let mut new_value = &old_value + delta;
     if new_value < BigInt::zero() {
-        return Err(DbError::StakeSnapshotReplay {
-            reason: format!(
-                "negative staked amount for address {address} at event {}",
-                row.event_id
-            ),
-        });
+        // The chain released more than our replay believes was staked, so an
+        // input of ours is wrong. Take the address down to zero (the most the
+        // chain could have released) and carry on with the rest of the curve.
+        anomalies.record(format!(
+            "negative staked amount for address {address} at event {}: {} + {delta} clamped to 0",
+            row.event_id, old_value
+        ));
+        new_value = BigInt::zero();
     }
 
     let master_threshold = stake_snapshot_master_threshold();
@@ -1189,9 +1260,11 @@ fn apply_stake_snapshot_stake_delta(
 
     state.total_staked_raw += &new_value - &old_value;
     if state.total_staked_raw < BigInt::zero() {
-        return Err(DbError::StakeSnapshotReplay {
-            reason: "negative total staked amount".to_owned(),
-        });
+        anomalies.record(format!(
+            "negative total staked amount at event {} clamped to 0",
+            row.event_id
+        ));
+        state.total_staked_raw = BigInt::zero();
     }
     if new_value.is_zero() {
         state.stakes_by_address.remove(address);
@@ -1379,6 +1452,12 @@ fn stake_snapshot_master_threshold() -> BigInt {
 
 #[cfg(test)]
 mod tests {
+    /// A throwaway collector for tests that assert on the replay result rather
+    /// than on what it had to clamp.
+    fn anomalies() -> StakeSnapshotAnomalies {
+        StakeSnapshotAnomalies::default()
+    }
+
     /// `events.payload_format` storage code for gen3 rows written by our own
     /// ingestion (`live.v1`); the default for rows these tests build.
     const LIVE_PAYLOAD_FORMAT: i16 = 2;
@@ -1407,12 +1486,17 @@ mod tests {
             masters_count: 0,
         };
 
-        reverse_replay_stake_snapshot_events(&mut current_state, &rows)?;
+        reverse_replay_stake_snapshot_events(&mut current_state, &rows, &mut anomalies())?;
         assert_eq!(current_state.total_staked_raw, BigInt::zero());
         assert_eq!(current_state.stakers_count, 0);
 
-        let (points, closed_day_state) =
-            build_stake_snapshot_daily_points(current_state, &rows, day_one, day_three)?;
+        let (points, closed_day_state) = build_stake_snapshot_daily_points(
+            current_state,
+            &rows,
+            day_one,
+            day_three,
+            &mut anomalies(),
+        )?;
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].date_unix_seconds, day_one);
         assert_eq!(points[0].staked_soul_raw, "50");
@@ -1452,11 +1536,16 @@ mod tests {
             masters_count: 0,
         };
 
-        reverse_replay_stake_snapshot_events(&mut current_state, &rows)?;
+        reverse_replay_stake_snapshot_events(&mut current_state, &rows, &mut anomalies())?;
         assert_eq!(current_state.total_staked_raw, BigInt::zero());
 
-        let (points, closed_day_state) =
-            build_stake_snapshot_daily_points(current_state, &rows, day_one, open_day)?;
+        let (points, closed_day_state) = build_stake_snapshot_daily_points(
+            current_state,
+            &rows,
+            day_one,
+            open_day,
+            &mut anomalies(),
+        )?;
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].date_unix_seconds, day_one);
         assert_eq!(points[0].staked_soul_raw, "50");
@@ -1504,8 +1593,13 @@ mod tests {
             .filter(|row| row.timestamp_unix_seconds <= day_three + 20)
             .cloned()
             .collect();
-        let (run_one_points, run_one_closed) =
-            build_stake_snapshot_daily_points(start_state(), &run_one_rows, day_one, day_four)?;
+        let (run_one_points, run_one_closed) = build_stake_snapshot_daily_points(
+            start_state(),
+            &run_one_rows,
+            day_one,
+            day_four,
+            &mut anomalies(),
+        )?;
         assert_eq!(run_one_points.len(), 3);
         assert_eq!(
             run_one_points[2].staked_soul_raw, "40",
@@ -1523,13 +1617,23 @@ mod tests {
             .filter(|row| row.timestamp_unix_seconds >= day_three)
             .cloned()
             .collect();
-        let (run_two_points, run_two_closed) =
-            build_stake_snapshot_daily_points(resume_state, &run_two_rows, day_three, day_five)?;
+        let (run_two_points, run_two_closed) = build_stake_snapshot_daily_points(
+            resume_state,
+            &run_two_rows,
+            day_three,
+            day_five,
+            &mut anomalies(),
+        )?;
         assert_eq!(run_two_points.len(), 2);
 
         // The one-shot full fold is the truth to match.
-        let (full_points, full_closed) =
-            build_stake_snapshot_daily_points(start_state(), &all_rows, day_one, day_five)?;
+        let (full_points, full_closed) = build_stake_snapshot_daily_points(
+            start_state(),
+            &all_rows,
+            day_one,
+            day_five,
+            &mut anomalies(),
+        )?;
         assert_eq!(full_points.len(), 4);
         assert_eq!(
             full_points[2].staked_soul_raw, "47",
@@ -1677,8 +1781,14 @@ mod tests {
         )
         .await?;
 
-        let rows =
-            load_stake_snapshot_events(&mut tx, chain_id, timestamp - 5, timestamp + 5).await?;
+        let rows = load_stake_snapshot_events(
+            &mut tx,
+            chain_id,
+            timestamp - 5,
+            timestamp + 5,
+            &mut anomalies(),
+        )
+        .await?;
         let stake_row = rows
             .iter()
             .find(|row| row.tx_id == stake_tx.id)
@@ -1789,7 +1899,7 @@ mod tests {
         kcal_row.tx_has_claim_call = true;
         let rows = vec![reward_row, kcal_row];
 
-        apply_stake_snapshot_transaction(&mut state, &rows, false)?;
+        apply_stake_snapshot_transaction(&mut state, &rows, false, &mut anomalies())?;
         assert_eq!(state.total_staked_raw, BigInt::from(90));
         assert_eq!(
             state.stakes_by_address.get("PTESTA"),
@@ -1829,7 +1939,7 @@ mod tests {
         unstake_kcal_row.tx_has_unstake_call = true;
         let rows = vec![stake_row, stake_kcal_row, unstake_row, unstake_kcal_row];
 
-        apply_stake_snapshot_transaction(&mut state, &rows, false)?;
+        apply_stake_snapshot_transaction(&mut state, &rows, false, &mut anomalies())?;
         assert_eq!(state.total_staked_raw, BigInt::from(130));
         assert_eq!(
             state.stakes_by_address.get("PTESTA"),
@@ -1868,11 +1978,11 @@ mod tests {
             stakers_count: 0,
             masters_count: 0,
         };
-        apply_stake_snapshot_transaction(&mut forward_state, &rows, false)?;
+        apply_stake_snapshot_transaction(&mut forward_state, &rows, false, &mut anomalies())?;
         assert_eq!(forward_state.soul_supply_raw, BigInt::from(1_010));
         assert_eq!(forward_state.total_staked_raw, BigInt::zero());
 
-        apply_stake_snapshot_transaction(&mut forward_state, &rows, true)?;
+        apply_stake_snapshot_transaction(&mut forward_state, &rows, true, &mut anomalies())?;
         assert_eq!(forward_state.soul_supply_raw, BigInt::from(1_000));
         assert_eq!(forward_state.total_staked_raw, BigInt::zero());
 
@@ -1947,7 +2057,7 @@ mod tests {
             stakers_count: 0,
             masters_count: 0,
         };
-        apply_stake_snapshot_transaction(&mut state, &rows, false)?;
+        apply_stake_snapshot_transaction(&mut state, &rows, false, &mut anomalies())?;
         assert_eq!(state.total_staked_raw, BigInt::from(20_000_000));
 
         Ok(())
@@ -2041,9 +2151,78 @@ mod tests {
             &rows,
             day,
             day + STAKE_SNAPSHOT_SECONDS_PER_DAY,
+            &mut anomalies(),
         )?;
         assert_eq!(curve.len(), 1);
         assert_eq!(curve[0].staked_soul_raw, "40000000");
+
+        Ok(())
+    }
+
+    #[test]
+    fn stake_snapshot_replay_clamps_an_impossible_claim_and_reports_it() -> Result<(), DbError> {
+        // The chain released more than the replay believes was staked: one of our
+        // inputs is wrong. Take the address to zero and count it — aborting here
+        // would cost the whole network its curve over a single address, which is
+        // exactly what happened on devnet and testnet in 2026-08.
+        let mut state = StakeSnapshotState {
+            stakes_by_address: std::collections::HashMap::from([(
+                "PTESTA".to_owned(),
+                BigInt::from(10),
+            )]),
+            total_staked_raw: BigInt::from(10),
+            soul_supply_raw: BigInt::from(1_000),
+            stakers_count: 1,
+            masters_count: 0,
+        };
+        let claim =
+            test_stake_snapshot_token_row(1, 1, "TokenClaim", 1_700_000_010, "PTESTA", "50")?;
+        let mut anomalies = StakeSnapshotAnomalies::default();
+
+        apply_stake_snapshot_transaction(&mut state, &[claim], false, &mut anomalies)?;
+
+        assert_eq!(state.stakes_by_address.get("PTESTA"), None);
+        assert_eq!(state.total_staked_raw, BigInt::zero());
+        assert_eq!(state.stakers_count, 0);
+        assert_eq!(anomalies.count, 1);
+        assert!(
+            anomalies.joined_samples().contains("PTESTA"),
+            "the report must name the address so it can be investigated: {}",
+            anomalies.joined_samples()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stake_snapshot_replay_builds_the_curve_around_an_impossible_address() -> Result<(), DbError>
+    {
+        // One inconsistent address must not stop the other addresses' curve.
+        let rows = vec![
+            test_stake_snapshot_token_row(1, 1, "TokenStake", 1_700_000_010, "PTESTB", "70")?,
+            test_stake_snapshot_token_row(2, 2, "TokenClaim", 1_700_000_020, "PTESTA", "50")?,
+        ];
+        let day = stake_snapshot_day_start(1_700_000_010);
+        let mut anomalies = StakeSnapshotAnomalies::default();
+
+        let (curve, _) = build_stake_snapshot_daily_points(
+            StakeSnapshotState {
+                stakes_by_address: std::collections::HashMap::new(),
+                total_staked_raw: BigInt::zero(),
+                soul_supply_raw: BigInt::from(1_000),
+                stakers_count: 0,
+                masters_count: 0,
+            },
+            &rows,
+            day,
+            day + STAKE_SNAPSHOT_SECONDS_PER_DAY,
+            &mut anomalies,
+        )?;
+
+        assert_eq!(curve.len(), 1);
+        assert_eq!(curve[0].staked_soul_raw, "70");
+        assert_eq!(curve[0].stakers_count, 1);
+        assert_eq!(anomalies.count, 1);
 
         Ok(())
     }

@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     } else if args.stake_projection_once {
         let report = driver.project_stake_snapshots_once().await?;
         tracing::info!(
-            "built soul-masters curve daily={} monthly={} boundary_masters={} resumed_from_day={} skipped={}",
+            "built soul-masters curve daily={} monthly={} boundary_masters={} resumed_from_day={} skipped={} anomalies={}",
             report.daily_upserted,
             report.monthly_upserted,
             report.boundary_masters_count,
@@ -136,7 +136,14 @@ async fn main() -> anyhow::Result<()> {
                 .resumed_from_day_unix_seconds
                 .map_or_else(|| "boundary".to_owned(), |day| day.to_string()),
             report.skipped_reason.as_deref().unwrap_or("-"),
+            report.anomalies.count,
         );
+        if !report.anomalies.is_empty() {
+            tracing::error!(
+                examples = %report.anomalies.joined_samples(),
+                "stake projection clamped impossible values"
+            );
+        }
         return Ok(());
     } else if args.mark_all_balances_dirty_once {
         let report = driver.mark_all_balances_dirty_once().await?;

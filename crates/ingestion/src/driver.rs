@@ -2736,16 +2736,31 @@ impl BlockIngestionDriver {
                 return;
             };
             match stake_result {
-                Ok(report) if report.daily_upserted > 0 || report.monthly_upserted > 0 => info!(
-                    "built soul-masters curve daily={} monthly={} boundary_masters={} resumed_from_day={}",
-                    report.daily_upserted,
-                    report.monthly_upserted,
-                    report.boundary_masters_count,
-                    report
-                        .resumed_from_day_unix_seconds
-                        .map_or_else(|| "boundary".to_owned(), |day| day.to_string()),
-                ),
-                Ok(_) => {}
+                Ok(report) => {
+                    // A clamp means our inputs disagree with the chain for those
+                    // addresses. The curve is still built — losing a whole
+                    // network's chart over one address is worse — but this must
+                    // be loud enough to be found: it is a data bug, not noise.
+                    if !report.anomalies.is_empty() {
+                        error!(
+                            anomalies = report.anomalies.count,
+                            examples = %report.anomalies.joined_samples(),
+                            "stake projection clamped impossible values; the curve is built but wrong for those addresses"
+                        );
+                    }
+                    if report.daily_upserted > 0 || report.monthly_upserted > 0 {
+                        info!(
+                            "built soul-masters curve daily={} monthly={} boundary_masters={} resumed_from_day={} anomalies={}",
+                            report.daily_upserted,
+                            report.monthly_upserted,
+                            report.boundary_masters_count,
+                            report
+                                .resumed_from_day_unix_seconds
+                                .map_or_else(|| "boundary".to_owned(), |day| day.to_string()),
+                            report.anomalies.count,
+                        );
+                    }
+                }
                 Err(error) => {
                     warn!(error = %explorer_runtime::error_chain(&error), "stake projection failed")
                 }
