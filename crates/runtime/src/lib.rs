@@ -101,3 +101,21 @@ pub async fn wait_for_shutdown_signal() {
     }
     let _ = tokio::signal::ctrl_c().await;
 }
+
+/// Render an error together with every source beneath it, joined by `: `.
+///
+/// `tracing`'s `%error` prints only the outermost `Display`, so a wrapper such as
+/// `#[error("database write failed")]` swallows the reason it wraps. That is what
+/// made the 2026-08 devnet/testnet stake-projection failure unreadable for four
+/// days: the log repeated the wrapper text and the actual cause never appeared.
+/// Log failures through this instead of `%error`.
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        rendered.push_str(": ");
+        rendered.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    rendered
+}

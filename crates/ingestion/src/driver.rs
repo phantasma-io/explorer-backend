@@ -225,10 +225,10 @@ fn record_nft_metadata_fetch_failure(
     error: &RpcError,
 ) {
     if explorer_rpc::is_transient_rpc_error(error) {
-        warn!(%error, symbol, token_id, "single NFT RPC metadata fetch failed");
+        warn!(error = %explorer_runtime::error_chain(error), symbol, token_id, "single NFT RPC metadata fetch failed");
     } else {
         warn!(
-            %error,
+            error = %explorer_runtime::error_chain(error),
             symbol, token_id, "single NFT RPC metadata fetch failed; storing error response"
         );
         upserts.push(nft_error_to_metadata_upsert(symbol, token_id, error));
@@ -820,7 +820,7 @@ impl BlockIngestionDriver {
                 Err(error) if keeps_committed_prefix(projected_blocks, &error) => {
                     warn!(
                         height,
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         "block projection stalled mid-window; kept the committed prefix"
                     );
                     return Ok(WindowOutcome {
@@ -937,7 +937,7 @@ impl BlockIngestionDriver {
                     Err(error) if keeps_committed_prefix(projected_blocks, &error) => {
                         warn!(
                             height = next_to_write,
-                            %error,
+                            error = %explorer_runtime::error_chain(&error),
                             "block projection stalled mid-window; kept the committed prefix"
                         );
                         return Ok(WindowOutcome {
@@ -975,7 +975,7 @@ impl BlockIngestionDriver {
             }
             warn!(
                 height = stalled_height,
-                %error,
+                error = %explorer_runtime::error_chain(&error),
                 "block fetch stalled mid-window; kept the committed prefix, retrying the failed height next pass"
             );
             return Ok(WindowOutcome {
@@ -1284,7 +1284,7 @@ impl BlockIngestionDriver {
                         contract_id = candidate.contract_id,
                         contract = candidate.name,
                         timestamp = candidate.timestamp_unix_seconds,
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         "contract upgrade method sync failed"
                     );
                 }
@@ -1353,7 +1353,7 @@ impl BlockIngestionDriver {
                     warn!(
                         contract_id = candidate.id,
                         contract = candidate.name,
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         "contract RPC metadata sync failed"
                     );
                 }
@@ -1538,7 +1538,7 @@ impl BlockIngestionDriver {
                 Ok(chunk_infos) => infos.extend(chunk_infos),
                 Err(error) if addresses.len() > 1 => {
                     warn!(
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         count = addresses.len(),
                         "batch account info fetch failed; retrying addresses one by one"
                     );
@@ -1546,7 +1546,7 @@ impl BlockIngestionDriver {
                         match self.rpc.get_account_info(&address, false).await {
                             Ok(info) => infos.push(info),
                             Err(error) => warn!(
-                                %error,
+                                error = %explorer_runtime::error_chain(&error),
                                 address,
                                 "single account info fetch failed; keeping address dirty"
                             ),
@@ -1559,7 +1559,7 @@ impl BlockIngestionDriver {
                 // costs one address or every address in the batch would otherwise
                 // depend on nothing but where the chunk boundary happened to fall.
                 Err(error) => warn!(
-                    %error,
+                    error = %explorer_runtime::error_chain(&error),
                     "account info fetch failed for a single-address chunk; keeping it dirty"
                 ),
             }
@@ -1591,7 +1591,7 @@ impl BlockIngestionDriver {
                     accounts.push(FetchedBalanceAccount { info, balances });
                 }
                 Ok((info, Err(error))) => warn!(
-                    %error,
+                    error = %explorer_runtime::error_chain(&error),
                     address = %info.address,
                     "address balance fetch failed; keeping address dirty"
                 ),
@@ -2130,7 +2130,7 @@ impl BlockIngestionDriver {
                 }
                 Err(error) => {
                     warn!(
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         symbol,
                         count = token_ids.len(),
                         "batch NFT RPC metadata fetch failed; retrying one by one"
@@ -2307,7 +2307,7 @@ impl BlockIngestionDriver {
                 }
                 Err(error) => {
                     warn!(
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         symbol = candidate.symbol,
                         series_id = candidate.series_id,
                         "series RPC metadata fetch failed; storing error response"
@@ -2363,7 +2363,7 @@ impl BlockIngestionDriver {
                 Ok(transaction) => transaction,
                 Err(error) => {
                     warn!(
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         hash,
                         "failed transaction debug-comment fetch failed"
                     );
@@ -2414,7 +2414,9 @@ impl BlockIngestionDriver {
         // stop the worker from syncing.
         match explorer_db::analyze_database(&self.pool).await {
             Ok(()) => info!("database analyzed at startup"),
-            Err(error) => warn!(%error, "startup database analyze failed; continuing"),
+            Err(error) => {
+                warn!(error = %explorer_runtime::error_chain(&error), "startup database analyze failed; continuing")
+            }
         }
 
         // Maintenance (balance/stake, token supply/price, NFT/series/contract
@@ -2554,7 +2556,7 @@ impl BlockIngestionDriver {
                 Err(error) => {
                     consecutive_sync_failures = consecutive_sync_failures.saturating_add(1);
                     error!(
-                        %error,
+                        error = %explorer_runtime::error_chain(&error),
                         consecutive_failures = consecutive_sync_failures,
                         "worker sync batch failed"
                     );
@@ -2700,7 +2702,9 @@ impl BlockIngestionDriver {
                     balance_report.lag,
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "balance sync batch failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "balance sync batch failed")
+                }
             }
         }
     }
@@ -2742,7 +2746,9 @@ impl BlockIngestionDriver {
                         .map_or_else(|| "boundary".to_owned(), |day| day.to_string()),
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "stake projection failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "stake projection failed")
+                }
             }
         }
     }
@@ -2781,7 +2787,9 @@ impl BlockIngestionDriver {
                     token_report.fetched_tokens, token_report.updated_tokens
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "token supply sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "token supply sync failed")
+                }
             }
         }
     }
@@ -2817,7 +2825,9 @@ impl BlockIngestionDriver {
                     report.fetched_tokens, report.updated_tokens
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "token metadata sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "token metadata sync failed")
+                }
             }
         }
     }
@@ -2858,7 +2868,9 @@ impl BlockIngestionDriver {
                     )
                 }
                 Ok(_) => {}
-                Err(error) => warn!(%error, "token price sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "token price sync failed")
+                }
             }
         }
     }
@@ -2887,7 +2899,9 @@ impl BlockIngestionDriver {
                     ttrs_report.selected, ttrs_report.fetched, ttrs_report.updated
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "TTRS off-chain NFT sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "TTRS off-chain NFT sync failed")
+                }
             }
         }
     }
@@ -2932,7 +2946,9 @@ impl BlockIngestionDriver {
                     )
                 }
                 Ok(_) => {}
-                Err(error) => warn!(%error, "contract upgrade method sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "contract upgrade method sync failed")
+                }
             }
             let Some(contract_metadata_result) =
                 pass_or_shutdown(self.sync_contract_rpc_metadata_once(), &mut shutdown).await
@@ -2954,7 +2970,9 @@ impl BlockIngestionDriver {
                     )
                 }
                 Ok(_) => {}
-                Err(error) => warn!(%error, "contract RPC metadata sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "contract RPC metadata sync failed")
+                }
             }
         }
     }
@@ -2993,7 +3011,9 @@ impl BlockIngestionDriver {
                     nft_report.lag
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "NFT RPC metadata sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "NFT RPC metadata sync failed")
+                }
             }
         }
     }
@@ -3032,7 +3052,9 @@ impl BlockIngestionDriver {
                     series_report.lag
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "series RPC metadata sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "series RPC metadata sync failed")
+                }
             }
         }
     }
@@ -3073,7 +3095,9 @@ impl BlockIngestionDriver {
                     debug_report.lag
                 ),
                 Ok(_) => {}
-                Err(error) => warn!(%error, "failed tx debug-comment sync failed"),
+                Err(error) => {
+                    warn!(error = %explorer_runtime::error_chain(&error), "failed tx debug-comment sync failed")
+                }
             }
         }
     }
