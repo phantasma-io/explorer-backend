@@ -1286,6 +1286,23 @@ pub(crate) fn trim_offset_rows<T>(
     Ok((rows, next_cursor))
 }
 
+/// Canonical form of a *chain hash* query parameter: trimmed and upper-cased.
+///
+/// Stored hashes are uppercase 64-hex without exception (measured 2026-08-27:
+/// 9,306,327 transactions and 9,348,886 blocks, every one matching
+/// `^[0-9A-F]{64}$`), and the read path compares them with `=` so the unique hash
+/// index is used. Normalizing the INPUT is therefore what makes a lowercase hash —
+/// from a wallet, a log line, or a hand-typed URL — resolve at all; wrapping the
+/// column in `upper()` instead would cost the index. Until 2026-08-27 only
+/// `/blocks` normalized, so `/tx/<lowercase hash>` answered "not found" while the
+/// same hash in uppercase opened.
+///
+/// NOT for contract hashes (that column holds names and symbols such as `stake`,
+/// `gas`, `SOUL`) and NOT for addresses (base58 is case-significant).
+pub(crate) fn normalize_hash_param(value: Option<String>) -> Option<String> {
+    empty_to_none(value).map(|value| value.to_uppercase())
+}
+
 pub(crate) fn empty_to_none(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -1925,6 +1942,26 @@ pub(crate) fn apply_staking_supply_adjustment(item: &mut StakingDailyStatRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A hash parameter is upper-cased because that is how hashes are stored, and
+    // the read path compares them with `=`. Without this, `/tx/<lowercase>` found
+    // nothing while the same hash in uppercase opened — the case-sensitivity bug
+    // reported on mainnet on 2026-08-27.
+    #[test]
+    fn hash_parameters_are_upper_cased() {
+        let hash = "1fcecc1945ac8a2fdbc46099f0f78e718cceb7d80fc49492c9015c8c3b95cdd6";
+        assert_eq!(
+            normalize_hash_param(Some(hash.to_owned())).as_deref(),
+            Some("1FCECC1945AC8A2FDBC46099F0F78E718CCEB7D80FC49492C9015C8C3B95CDD6")
+        );
+        // Mixed case and surrounding whitespace resolve to the same stored form.
+        assert_eq!(
+            normalize_hash_param(Some(format!("  {}  ", hash.to_uppercase()))).as_deref(),
+            normalize_hash_param(Some(hash.to_owned())).as_deref()
+        );
+        assert_eq!(normalize_hash_param(Some("   ".to_owned())), None);
+        assert_eq!(normalize_hash_param(None), None);
+    }
 
     // Strip + rehydrate must round-trip to the exact pre-strip JSON string: the
     // re-inserted keys land in sorted-map position, so serialization matches the

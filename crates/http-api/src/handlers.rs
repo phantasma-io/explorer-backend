@@ -278,7 +278,7 @@ pub(crate) async fn blocks(
     let direction = parse_sort_direction(query.order_direction.as_deref())?;
     let id = empty_to_none(query.id).map(normalize_block_id);
     let id_height = id.as_deref().and_then(|value| value.parse::<i64>().ok());
-    let hash = empty_to_none(query.hash).map(|value| value.to_uppercase());
+    let hash = normalize_hash_param(query.hash);
     let height = parse_optional_i64(empty_to_none(query.height).as_deref(), "height")?;
     let q = empty_to_none(query.q);
     let q_height = parse_optional_i64(q.as_deref(), "q").ok().flatten();
@@ -992,7 +992,19 @@ pub(crate) async fn searches(
         ));
     }
     let value_lower = value.to_lowercase();
-    let existence = search_existence(&state.pool, value.as_str(), value_lower.as_str()).await?;
+    let value_upper = value.to_uppercase();
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(explorer_db::DbError::from)?;
+    let existence = search_existence(
+        &mut conn,
+        value.as_str(),
+        value_lower.as_str(),
+        value_upper.as_str(),
+    )
+    .await?;
     let result = vec![
         SearchResponse {
             endpoint_name: "addresses".to_owned(),
@@ -1202,7 +1214,12 @@ pub(crate) async fn transaction_by_hash(
     Path(hash): Path<String>,
     Query(query): Query<TransactionDetailQuery>,
 ) -> Result<Json<TransactionDetailResponse>, ApiError> {
-    let hash = normalized_required_path("hash", hash)?;
+    // The hash arrives in the path here rather than as a query parameter, but it
+    // is the same value and needs the same normalization — `/blocks/{id}` has
+    // always upper-cased it, and without this `/transactions/<lowercase hash>`
+    // answered 404 while the uppercase form resolved.
+    let hash = normalize_hash_param(Some(normalized_required_path("hash", hash)?))
+        .ok_or_else(|| ApiError::BadRequest("hash cannot be empty".to_owned()))?;
 
     match (query.block_height, query.index) {
         (Some(block_height), Some(index)) => {
@@ -1296,8 +1313,8 @@ pub(crate) async fn load_transactions(
     query: TransactionListQuery,
 ) -> Result<TransactionListResponse, ApiError> {
     let limit = clamp_limit(query.limit);
-    let hash = empty_to_none(query.hash);
-    let block_hash = empty_to_none(query.block_hash);
+    let hash = normalize_hash_param(query.hash);
+    let block_hash = normalize_hash_param(query.block_hash);
     let address = empty_to_none(query.address);
     // Both transaction lists seek on the transaction id (the address-scoped one
     // via address_transactions' natural key), but they keep distinct cursor kinds
@@ -1475,14 +1492,14 @@ pub(crate) async fn load_events(
 ) -> Result<EventListResponse, ApiError> {
     let limit = clamp_limit(query.limit);
     let cursor = PageCursor::parse_optional(query.cursor, "event")?;
-    let transaction_hash = empty_to_none(query.transaction_hash);
+    let transaction_hash = normalize_hash_param(query.transaction_hash);
     let event_kind = empty_to_none(query.event_kind);
     let event_source = empty_to_none(query.event_source);
     let address = empty_to_none(query.address);
     let contract = empty_to_none(query.contract);
     let q = empty_to_none(query.q);
     let token_id = empty_to_none(query.token_id);
-    let block_hash = empty_to_none(query.block_hash);
+    let block_hash = normalize_hash_param(query.block_hash);
     let date_less = parse_optional_i64(empty_to_none(query.date_less).as_deref(), "date_less")?;
     let date_greater =
         parse_optional_i64(empty_to_none(query.date_greater).as_deref(), "date_greater")?;
@@ -1845,8 +1862,7 @@ pub(crate) async fn rejected_transactions(
     State(state): State<ApiState>,
     Query(query): Query<RejectedTransactionListQuery>,
 ) -> Result<Json<RejectedTransactionListResponse>, ApiError> {
-    let hash = empty_to_none(query.hash)
-        .map(|value| value.trim().to_uppercase())
+    let hash = normalize_hash_param(query.hash)
         .filter(|value| is_valid_rejected_hash(value))
         .ok_or_else(|| {
             ApiError::BadRequest("Unsupported value for 'hash' parameter.".to_owned())
