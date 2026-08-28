@@ -1286,6 +1286,34 @@ pub(crate) fn trim_offset_rows<T>(
     Ok((rows, next_cursor))
 }
 
+/// What a transaction-list search value (`q`) can mean.
+///
+/// `q` is a block height or a whole hash — the hash may be the transaction's own
+/// or its block's, and which one it is takes a probe (see
+/// `resolve_transaction_search`). Anything else matches nothing, and the caller
+/// answers with an empty list without touching the database.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TransactionSearch {
+    BlockHeight(i64),
+    Hash(String),
+    Unmatchable,
+}
+
+/// Classify a transaction-list search value. Purely syntactic: digits are a block
+/// height, 64 hex characters are a hash (normalized to the stored upper case),
+/// everything else cannot match a row. Partial hashes are deliberately not a
+/// search input — the indexes for that were dropped in migration 202608030003.
+pub(crate) fn classify_transaction_search(value: &str) -> TransactionSearch {
+    let value = value.trim();
+    if let Ok(height) = value.parse::<i64>() {
+        return TransactionSearch::BlockHeight(height);
+    }
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return TransactionSearch::Hash(value.to_uppercase());
+    }
+    TransactionSearch::Unmatchable
+}
+
 /// Canonical form of a *chain hash* query parameter: trimmed and upper-cased.
 ///
 /// Stored hashes are uppercase 64-hex without exception (measured 2026-08-27:
@@ -1942,6 +1970,36 @@ pub(crate) fn apply_staking_supply_adjustment(item: &mut StakingDailyStatRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The transaction-list search value is a block height or a whole hash, and
+    // nothing else reaches the database. A hash fragment is deliberately not a
+    // search input: partial hash search was ruled out and its indexes dropped.
+    #[test]
+    fn transaction_search_values_are_heights_or_whole_hashes() {
+        let hash = "1fcecc1945ac8a2fdbc46099f0f78e718cceb7d80fc49492c9015c8c3b95cdd6";
+        assert_eq!(
+            classify_transaction_search(hash),
+            TransactionSearch::Hash(hash.to_uppercase())
+        );
+        assert_eq!(
+            classify_transaction_search("  8938519 "),
+            TransactionSearch::BlockHeight(8_938_519)
+        );
+        assert_eq!(
+            classify_transaction_search(&hash[..16]),
+            TransactionSearch::Unmatchable,
+            "a fragment of a hash is not a search value"
+        );
+        // 64 characters, but not all of them hex.
+        assert_eq!(
+            classify_transaction_search(&"z".repeat(64)),
+            TransactionSearch::Unmatchable
+        );
+        assert_eq!(
+            classify_transaction_search("SOUL"),
+            TransactionSearch::Unmatchable
+        );
+    }
 
     // A hash parameter is upper-cased because that is how hashes are stored, and
     // the read path compares them with `=`. Without this, `/tx/<lowercase>` found

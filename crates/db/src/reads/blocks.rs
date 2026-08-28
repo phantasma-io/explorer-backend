@@ -169,6 +169,17 @@ pub async fn block_detail(
     Ok(row)
 }
 
+/// Whether a block with this exact hash exists. The caller passes the stored
+/// (upper-cased) form; the probe stays `hash = $1` so it uses `IX_Blocks_HASH`.
+pub async fn block_hash_exists(conn: &mut PgConnection, hash: &str) -> Result<bool, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM blocks WHERE hash = $1)")
+            .bind(hash)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

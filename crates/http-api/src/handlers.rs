@@ -1308,6 +1308,16 @@ pub(crate) async fn events(
     Ok(Json(load_events(&state, query).await?))
 }
 
+/// The answer for a search value that cannot match any row: a list endpoint says
+/// "nothing found" rather than erroring, and no query is issued.
+fn empty_transaction_list() -> TransactionListResponse {
+    TransactionListResponse {
+        total_results: None,
+        transactions: Vec::new(),
+        next_cursor: None,
+    }
+}
+
 pub(crate) async fn load_transactions(
     state: &ApiState,
     query: TransactionListQuery,
@@ -1345,13 +1355,41 @@ pub(crate) async fn load_transactions(
             ))
         })?;
     let direction = parse_sort_direction(query.order_direction.as_deref())?;
+    // Resolve the free-text search into one of the indexed filters. The list query
+    // has no free-text branch: matching `tx.hash OR block.hash` across the join
+    // could not use either hash index and scanned the whole table (measured 6.5 s
+    // against 0.074 ms for the same hash through `hash`). Which of the two a hash
+    // belongs to is decided once, by an index probe, so the answer cannot change
+    // between pages of the same search.
+    let mut search_hash = None;
+    let mut search_block_hash = None;
+    let mut search_block_height = None;
+    if let Some(q) = q.as_deref() {
+        match classify_transaction_search(q) {
+            TransactionSearch::BlockHeight(height) => search_block_height = Some(height),
+            TransactionSearch::Hash(hash) => {
+                let mut conn = state
+                    .pool
+                    .acquire()
+                    .await
+                    .map_err(explorer_db::DbError::from)?;
+                if transaction_hash_exists(&mut conn, &hash).await? {
+                    search_hash = Some(hash);
+                } else if block_hash_exists(&mut conn, &hash).await? {
+                    search_block_hash = Some(hash);
+                } else {
+                    return Ok(empty_transaction_list());
+                }
+            }
+            TransactionSearch::Unmatchable => return Ok(empty_transaction_list()),
+        }
+    }
     let filter = TransactionFilter {
-        hash: hash.as_deref(),
-        block_height: query.block_height,
-        block_hash: block_hash.as_deref(),
+        hash: hash.as_deref().or(search_hash.as_deref()),
+        block_height: query.block_height.or(search_block_height),
+        block_hash: block_hash.as_deref().or(search_block_hash.as_deref()),
         chain_id,
         state_id,
-        q: q.as_deref(),
         date_greater,
         date_less,
     };

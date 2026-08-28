@@ -49,12 +49,7 @@ pub async fn search_existence(
                 .fetch_one(&mut *conn)
                 .await?
         }
-        _ => {
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM blocks WHERE hash = $1)")
-                .bind(value_upper)
-                .fetch_one(&mut *conn)
-                .await?
-        }
+        _ => block_hash_exists(&mut *conn, value_upper).await?,
     };
     let chains =
         sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM chains WHERE name = $1)")
@@ -84,11 +79,7 @@ pub async fn search_existence(
     .bind(value_lower)
     .fetch_one(&mut *conn)
     .await?;
-    let transactions =
-        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM transactions WHERE hash = $1)")
-            .bind(value_upper)
-            .fetch_one(&mut *conn)
-            .await?;
+    let transactions = transaction_hash_exists(&mut *conn, value_upper).await?;
 
     Ok(SearchExistence {
         addresses,

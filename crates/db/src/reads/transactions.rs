@@ -62,8 +62,13 @@ pub struct TransactionPage {
     pub limit: i64,
 }
 
-/// Filters shared by the global and filtered-address transaction lists. `q` is
-/// the raw free-text value (the read fn derives the numeric/substring forms).
+/// Filters shared by the global and filtered-address transaction lists.
+///
+/// There is no free-text filter here: the API layer resolves a search value into
+/// `hash`, `block_hash` or `block_height` before calling, so every search runs as
+/// an index probe. The former `q` matched `tx.hash OR block.hash` across the join,
+/// which no index can serve — measured at 6.5 s against 0.074 ms for the same hash
+/// through `hash`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TransactionFilter<'a> {
     pub hash: Option<&'a str>,
@@ -71,30 +76,8 @@ pub struct TransactionFilter<'a> {
     pub block_hash: Option<&'a str>,
     pub chain_id: Option<i32>,
     pub state_id: Option<i32>,
-    pub q: Option<&'a str>,
     pub date_greater: Option<i64>,
     pub date_less: Option<i64>,
-}
-
-// Derive the numeric (`q_height`) and hash (`q_hash`) forms of the free-text `q`
-// for the transaction lists: a purely-numeric `q` is a block height, anything
-// else is a transaction or block hash.
-//
-// The hash form is matched by EQUALITY, never as a substring. Partial hash search
-// was ruled out by the owner and its indexes were dropped with the trigram GINs in
-// migration 202608030003, so a `%q%` ILIKE here had nothing to use and scanned all
-// 9.3M transactions. Stored hashes are uppercase 64-hex without exception
-// (measured: 9,306,327 transactions and 9,348,886 blocks, all matching
-// `^[0-9A-F]{64}$`), so the input is upper-cased to match them and a `q` that is
-// not a hash simply matches nothing.
-fn transaction_q_forms(q: Option<&str>) -> (Option<i64>, Option<String>) {
-    let q_height = q.and_then(|value| value.parse::<i64>().ok());
-    let q_hash = if q_height.is_none() {
-        q.map(|value| value.trim().to_uppercase())
-    } else {
-        None
-    };
-    (q_height, q_hash)
 }
 
 /// The `script_raw` column of a transaction LIST projection. Lists hex-encode
@@ -193,7 +176,6 @@ pub async fn list_transactions_global(
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
-    let (q_height, q_hash) = transaction_q_forms(filter.q);
     let script_raw_column = transaction_script_raw_column(with_script);
     let sql = format!(
         r#"
@@ -246,11 +228,6 @@ pub async fn list_transactions_global(
           AND ($6::bigint IS NULL OR tx.timestamp_unix_seconds >= $6)
           AND ($7::bigint IS NULL OR tx.timestamp_unix_seconds <= $7)
           AND (
-              ($11::text IS NULL AND $12::bigint IS NULL)
-              OR ($11::text IS NOT NULL AND (tx.hash = $11 OR block.hash = $11))
-              OR ($12::bigint IS NOT NULL AND block.height = $12)
-          )
-          AND (
               $8::bigint IS NULL
               OR {column} {op} $8
               OR ({column} = $8 AND tx.id {op} $9)
@@ -278,8 +255,6 @@ pub async fn list_transactions_global(
         .bind(page.cursor_sort_value)
         .bind(page.cursor_id)
         .bind(page.limit + 1)
-        .bind(q_hash.as_deref())
-        .bind(q_height)
         .fetch_all(executor)
         .await?;
 
@@ -395,7 +370,6 @@ pub async fn list_transactions_for_filtered_address(
     let script_raw_column = transaction_script_raw_column(with_script);
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
-    let (q_height, q_hash) = transaction_q_forms(filter.q);
     let column = page.order_by.address_column();
     let sql = format!(
         r#"
@@ -450,11 +424,6 @@ pub async fn list_transactions_for_filtered_address(
           AND ($7::bigint IS NULL OR tx.timestamp_unix_seconds >= $7)
           AND ($8::bigint IS NULL OR tx.timestamp_unix_seconds <= $8)
           AND (
-              ($12::text IS NULL AND $13::bigint IS NULL)
-              OR ($12::text IS NOT NULL AND (tx.hash = $12 OR block.hash = $12))
-              OR ($13::bigint IS NOT NULL AND block.height = $13)
-          )
-          AND (
               $9::bigint IS NULL
               OR {column} {op} $9
               OR ({column} = $9 AND address_tx.transaction_id {op} $10)
@@ -477,8 +446,6 @@ pub async fn list_transactions_for_filtered_address(
         .bind(page.cursor_sort_value)
         .bind(page.cursor_id)
         .bind(page.limit + 1)
-        .bind(q_hash.as_deref())
-        .bind(q_height)
         .fetch_all(executor)
         .await?;
 
@@ -573,6 +540,18 @@ pub async fn transaction_row_by_block_index(
 }
 
 /// Single transaction occurrence disambiguated by hash + block height + index.
+/// Whether a transaction with this exact hash exists. The caller passes the
+/// stored (upper-cased) form; the probe stays `hash = $1` so it uses
+/// `IX_Transactions_HASH` (0.07 ms) instead of scanning.
+pub async fn transaction_hash_exists(conn: &mut PgConnection, hash: &str) -> Result<bool, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM transactions WHERE hash = $1)")
+            .bind(hash)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
 pub async fn transaction_by_hash_block_index(
     executor: impl sqlx::PgExecutor<'_>,
     chain: &str,
@@ -759,14 +738,12 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    // `q` on the transaction lists is a WHOLE hash (in any case) or a block height —
-    // never a fragment. Partial hash search was ruled out and the trigram GINs that
-    // could serve it were dropped in 202608030003, so a substring match here would be
-    // both unsupported semantics and a full scan. Stored hashes are uppercase, so the
-    // lowercase form of the same hash must still find the row. Runs inside a
-    // rolled-back transaction.
+    // The two probes the API layer routes a search value with: a hash belongs to a
+    // transaction or to a block, never to both, and the answer must come from the
+    // hash indexes. Then the resolved filter must actually return the row. Runs
+    // inside a rolled-back transaction.
     #[tokio::test]
-    async fn transaction_search_takes_a_whole_hash_in_any_case_only()
+    async fn hash_probes_separate_transactions_from_blocks()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
             return Ok(());
@@ -780,8 +757,8 @@ mod tests {
         let chain = ChainName::new("main")?;
         let chain_id = resolve_chain_id(&mut tx, &chain).await?;
         let suffix = Uuid::now_v7().simple().to_string();
-        // A unique, realistically shaped hash: 64 uppercase hex characters.
-        let tx_hash = format!("{suffix}{suffix}").to_uppercase();
+        let block_hash = format!("{suffix}{suffix}").to_uppercase();
+        let tx_hash = block_hash.replace('0', "F");
         let height = 9_900_600_000_i64;
 
         let block = upsert_block(
@@ -790,7 +767,7 @@ mod tests {
             BlockUpsert {
                 chain: chain.clone(),
                 height: BlockHeight::new(height as u64),
-                hash: format!("{suffix}{suffix}").to_uppercase(),
+                hash: block_hash.clone(),
                 protocol: Some(19),
                 chain_address: Some("NULL".to_owned()),
                 validator_address: Some("NULL".to_owned()),
@@ -827,6 +804,11 @@ mod tests {
         )
         .await?;
 
+        assert!(transaction_hash_exists(&mut tx, &tx_hash).await?);
+        assert!(!transaction_hash_exists(&mut tx, &block_hash).await?);
+        assert!(crate::block_hash_exists(&mut tx, &block_hash).await?);
+        assert!(!crate::block_hash_exists(&mut tx, &tx_hash).await?);
+
         let page = TransactionPage {
             order_by: TransactionOrderBy::Date,
             direction: SortDirection::Desc,
@@ -834,48 +816,31 @@ mod tests {
             cursor_id: None,
             limit: 10,
         };
-        let lowercase_hash = tx_hash.to_lowercase();
-        let lowercase = list_transactions_global(
+        let by_tx_hash = list_transactions_global(
             &mut *tx,
             &TransactionFilter {
-                q: Some(lowercase_hash.as_str()),
+                hash: Some(tx_hash.as_str()),
                 ..TransactionFilter::default()
             },
             &page,
             false,
         )
         .await?;
-        assert_eq!(lowercase.len(), 1, "the whole hash must match in any case");
-        assert_eq!(lowercase[0].get::<String, _>("hash"), tx_hash);
+        assert_eq!(by_tx_hash.len(), 1);
+        assert_eq!(by_tx_hash[0].get::<String, _>("hash"), tx_hash);
 
-        let fragment = list_transactions_global(
+        let by_block_hash = list_transactions_global(
             &mut *tx,
             &TransactionFilter {
-                q: Some(&tx_hash[..16]),
+                block_hash: Some(block_hash.as_str()),
                 ..TransactionFilter::default()
             },
             &page,
             false,
         )
         .await?;
-        assert!(
-            fragment.is_empty(),
-            "a hash fragment must not match: partial hash search is not supported"
-        );
-
-        let height_text = height.to_string();
-        let by_height = list_transactions_global(
-            &mut *tx,
-            &TransactionFilter {
-                q: Some(height_text.as_str()),
-                ..TransactionFilter::default()
-            },
-            &page,
-            false,
-        )
-        .await?;
-        assert_eq!(by_height.len(), 1, "a numeric q is the block height");
-        assert_eq!(by_height[0].get::<String, _>("hash"), tx_hash);
+        assert_eq!(by_block_hash.len(), 1);
+        assert_eq!(by_block_hash[0].get::<String, _>("hash"), tx_hash);
 
         tx.rollback().await?;
         Ok(())
