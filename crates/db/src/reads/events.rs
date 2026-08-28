@@ -79,14 +79,22 @@ pub struct EventFilter<'a> {
     pub chain_id: Option<i32>,
 }
 
-// Derive the substring (`q_like`) and numeric (`q_height`) forms of the
-// free-text `q` for the event lists. Unlike the transaction lists, the substring
-// form is always present when `q` is set (a numeric `q` matches both height and
-// substring), matching the previous in-handler logic.
-fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>) {
+// Derive the substring (`q_like`), numeric (`q_height`) and hash (`q_hash`) forms
+// of the free-text `q` for the event lists. Unlike the transaction lists, the
+// substring form is always present when `q` is set (a numeric `q` matches both
+// height and substring), matching the previous in-handler logic.
+//
+// The transaction and block hash columns are matched by EQUALITY against
+// `q_hash`, never by the substring form: partial hash search was ruled out by the
+// owner and the trigram GINs that could serve it were dropped in migration
+// 202608030003. Stored hashes are uppercase 64-hex without exception, so the
+// input is upper-cased; the name-ish columns (kind, address, contract, token id)
+// keep the substring match, which is what `q` is actually for.
+fn event_q_forms(q: Option<&str>) -> (Option<String>, Option<i64>, Option<String>) {
     let q_like = q.map(|value| format!("%{value}%"));
     let q_height = q.and_then(|value| value.parse::<i64>().ok());
-    (q_like, q_height)
+    let q_hash = q.map(|value| value.trim().to_uppercase());
+    (q_like, q_height, q_hash)
 }
 
 /// The `payload_json` column of an event LIST projection.
@@ -224,7 +232,7 @@ pub async fn list_events_global(
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
-    let (q_like, q_height) = event_q_forms(filter.q);
+    let (q_like, q_height, q_hash) = event_q_forms(filter.q);
     let sql = format!(
         r#"
         SELECT
@@ -238,7 +246,7 @@ pub async fn list_events_global(
           AND ($4::bigint IS NULL OR block.height = $4)
           AND ($5::text IS NULL OR contract.hash = $5 OR contract.name = $5 OR contract.symbol = $5)
           AND ($9::integer IS NULL OR event.id = $9)
-          AND ($10::text IS NULL OR tx.hash ILIKE $10 OR block.hash ILIKE $10 OR block.height = $11 OR event_kind.name ILIKE $10 OR address.address ILIKE $10 OR address.address_name ILIKE $10 OR contract.hash ILIKE $10 OR contract.name ILIKE $10 OR contract.symbol ILIKE $10 OR event.token_id ILIKE $10)
+          AND ($10::text IS NULL OR tx.hash = $21 OR block.hash = $21 OR block.height = $11 OR event_kind.name ILIKE $10 OR address.address ILIKE $10 OR address.address_name ILIKE $10 OR contract.hash ILIKE $10 OR contract.name ILIKE $10 OR contract.symbol ILIKE $10 OR event.token_id ILIKE $10)
           AND ($12::text IS NULL OR event.token_id = $12)
           AND ($13::text IS NULL OR block.hash = $13)
           AND ($14::bigint IS NULL OR event.timestamp_unix_seconds <= $14)
@@ -301,6 +309,7 @@ pub async fn list_events_global(
         .bind(filter.nft_description_partial)
         .bind(filter.address_partial)
         .bind(filter.event_kind_id)
+        .bind(q_hash.as_deref())
         .fetch_all(executor)
         .await?;
 
@@ -322,7 +331,7 @@ pub async fn list_events_by_address(
 ) -> Result<Vec<PgRow>, DbError> {
     let dir = page.direction.as_sql();
     let op = page.direction.cursor_operator();
-    let (q_like, q_height) = event_q_forms(filter.q);
+    let (q_like, q_height, q_hash) = event_q_forms(filter.q);
     let sql = format!(
         r#"
         SELECT
@@ -349,7 +358,7 @@ pub async fn list_events_by_address(
           AND ($20::integer IS NULL OR event.chain_id = $20)
           AND ($5::text IS NULL OR contract.hash = $5 OR contract.name = $5 OR contract.symbol = $5)
           AND ($9::integer IS NULL OR event.id = $9)
-          AND ($10::text IS NULL OR tx.hash ILIKE $10 OR block.hash ILIKE $10 OR block.height = $11 OR event_kind.name ILIKE $10 OR address.address ILIKE $10 OR target_address.address ILIKE $10 OR address.address_name ILIKE $10 OR contract.hash ILIKE $10 OR contract.name ILIKE $10 OR contract.symbol ILIKE $10 OR event.token_id ILIKE $10)
+          AND ($10::text IS NULL OR tx.hash = $22 OR block.hash = $22 OR block.height = $11 OR event_kind.name ILIKE $10 OR address.address ILIKE $10 OR target_address.address ILIKE $10 OR address.address_name ILIKE $10 OR contract.hash ILIKE $10 OR contract.name ILIKE $10 OR contract.symbol ILIKE $10 OR event.token_id ILIKE $10)
           AND ($12::text IS NULL OR event.token_id = $12)
           AND ($13::text IS NULL OR block.hash = $13)
           AND ($14::bigint IS NULL OR event.timestamp_unix_seconds <= $14)
@@ -410,6 +419,7 @@ pub async fn list_events_by_address(
         .bind(filter.address_partial)
         .bind(filter.chain_id)
         .bind(filter.event_kind_id)
+        .bind(q_hash.as_deref())
         .fetch_all(executor)
         .await?;
 
@@ -543,6 +553,193 @@ pub async fn list_event_tokens_by_symbols(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    // The event lists match the transaction/block hash columns on the WHOLE hash
+    // (any case) and never on a fragment — partial hash search is not supported and
+    // has no index — while the name-ish columns keep the substring match `q` exists
+    // for. Also guards the bind positions: the hash form is its own placeholder at
+    // the end of both statements, so a wrong bind order would break every `q`
+    // search. Runs inside a rolled-back transaction.
+    #[tokio::test]
+    async fn event_search_takes_a_whole_hash_in_any_case_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let actor = format!("PTESTEVQ{suffix}");
+        // The hash must share no prefix with the address, or the untouched substring
+        // columns would match the fragment under test and mask the assertion. UUIDv7
+        // is time-ordered, so two of them minted here share their leading hex —
+        // reversing one moves its random tail to the front.
+        let hash_suffix = Uuid::now_v7()
+            .simple()
+            .to_string()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let tx_hash = format!("{hash_suffix}{hash_suffix}").to_uppercase();
+
+        let block = upsert_block(
+            &mut tx,
+            &mut crate::ProjectionDimensionCache::new(),
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_700_000),
+                hash: format!("TESTEVQBLOCK{suffix}").to_uppercase(),
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: 1_800_700_000,
+                reward: None,
+            },
+        )
+        .await?;
+        let seeded_tx = upsert_transaction(
+            &mut tx,
+            TransactionUpsert {
+                block_id: block.id,
+                chain_id,
+                tx_index: 0,
+                hash: tx_hash.clone(),
+                timestamp_unix_seconds: block.timestamp_unix_seconds,
+                state: "Halt".to_owned(),
+                result: None,
+                debug_comment: None,
+                payload: None,
+                script_raw: None,
+                fee_raw: None,
+                gas_price_raw: None,
+                gas_limit_raw: None,
+                sender: Some(actor.clone()),
+                gas_payer: Some(actor.clone()),
+                gas_target: Some(actor.clone()),
+                carbon_tx_type: None,
+                carbon_tx_data: None,
+                expiration_unix_seconds: 0,
+                signatures: Vec::new(),
+            },
+        )
+        .await?;
+        replace_events(
+            &mut tx,
+            seeded_tx.id,
+            &[EventUpsert {
+                transaction_id: seeded_tx.id,
+                chain_id,
+                event_index: 1,
+                event_kind: "TokenSend".to_owned(),
+                event_name: None,
+                address: Some(actor.clone()),
+                target_address: None,
+                contract: Some("SOUL".to_owned()),
+                token_id: None,
+                raw_data: None,
+                payload_format: Some("live.v1".to_owned()),
+                payload_json: None,
+                timestamp_unix_seconds: block.timestamp_unix_seconds,
+                burned: None,
+            }],
+        )
+        .await?;
+        let address_id = sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM addresses WHERE chain_id = $1 AND address = $2",
+        )
+        .bind(chain_id)
+        .bind(&actor)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let page = EventPage {
+            order_by: EventOrderBy::Id,
+            direction: SortDirection::Desc,
+            cursor_sort_value: None,
+            cursor_id: None,
+            limit: 10,
+        };
+        let lowercase_hash = tx_hash.to_lowercase();
+
+        let by_hash = list_events_global(
+            &mut *tx,
+            Some(chain_id),
+            "main",
+            &EventFilter {
+                q: Some(lowercase_hash.as_str()),
+                ..EventFilter::default()
+            },
+            &page,
+            true,
+        )
+        .await?;
+        assert_eq!(by_hash.len(), 1, "the whole hash must match in any case");
+
+        let by_fragment = list_events_global(
+            &mut *tx,
+            Some(chain_id),
+            "main",
+            &EventFilter {
+                q: Some(&tx_hash[..16]),
+                ..EventFilter::default()
+            },
+            &page,
+            true,
+        )
+        .await?;
+        assert!(
+            by_fragment.is_empty(),
+            "a hash fragment must not match: partial hash search is not supported"
+        );
+
+        let address_scoped = list_events_by_address(
+            &mut *tx,
+            "main",
+            address_id,
+            &EventFilter {
+                q: Some(lowercase_hash.as_str()),
+                ..EventFilter::default()
+            },
+            &page,
+            true,
+        )
+        .await?;
+        assert_eq!(
+            address_scoped.len(),
+            1,
+            "the address-scoped list must match the whole hash too"
+        );
+
+        // The substring match `q` exists for is untouched: a fragment of the
+        // address still finds the event.
+        let by_address_fragment = list_events_by_address(
+            &mut *tx,
+            "main",
+            address_id,
+            &EventFilter {
+                q: Some(&actor[..12]),
+                ..EventFilter::default()
+            },
+            &page,
+            true,
+        )
+        .await?;
+        assert_eq!(
+            by_address_fragment.len(),
+            1,
+            "name-ish columns keep the substring match"
+        );
+
+        tx.rollback().await?;
+        Ok(())
+    }
 
     // Address-scoped event list round-trip: seed one transaction with two events for
     // a fresh address, then list them by the resolved address id — unfiltered (both
