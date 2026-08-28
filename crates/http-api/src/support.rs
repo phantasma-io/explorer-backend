@@ -1411,9 +1411,10 @@ pub(crate) fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, ApiE
     }
 
     let mut bytes = Vec::with_capacity(normalized.len() / 2);
-    for chunk in normalized.as_bytes().chunks_exact(2) {
-        let hi = hex_nibble(chunk[0], field)?;
-        let lo = hex_nibble(chunk[1], field)?;
+    // The length is already checked to be even, so `as_chunks` leaves no remainder.
+    for [hi, lo] in normalized.as_bytes().as_chunks::<2>().0 {
+        let hi = hex_nibble(*hi, field)?;
+        let lo = hex_nibble(*lo, field)?;
         bytes.push((hi << 4) | lo);
     }
     Ok(bytes)

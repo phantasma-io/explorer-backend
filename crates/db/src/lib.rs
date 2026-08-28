@@ -2269,7 +2269,7 @@ pub async fn batch_upsert_transactions(
 
     let mut records = Vec::with_capacity(transactions.len());
     for (transaction, (_, resolved_sender, resolved_gas_payer, resolved_gas_target)) in
-        transactions.into_iter().zip(resolved.into_iter())
+        transactions.into_iter().zip(resolved)
     {
         let id = id_by_tx_index
             .get(&transaction.tx_index)
