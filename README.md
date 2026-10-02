@@ -158,6 +158,10 @@ fungible token's values and the part of the transaction sender, and the first ev
 worker writes these rows with every block, so their cost does not depend on how many events
 a transaction has, and a description built from them never needs the events.
 
+A transaction response never embeds an unbounded list. `with_events=1` and the detail route
+`GET /api/v1/transactions/{hash}` carry the first 100 events of a transaction and its
+`event_count`; `GET /api/v1/events?transaction_hash=` pages through the rest.
+
 ## Parity Tooling
 
 `explorer-parity` compares two Explorer databases by semantic digest, ignoring

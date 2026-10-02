@@ -1476,8 +1476,9 @@ pub(crate) async fn load_transactions(
         )
         .await?;
     }
-    if with_summary {
-        attach_transaction_summaries(&state.pool, &mut transactions, true).await?;
+    // An embedded event list is one page, so it comes with the full event count.
+    if with_events || with_summary {
+        attach_transaction_summaries(&state.pool, &mut transactions, with_summary).await?;
     }
 
     Ok(TransactionListResponse {
@@ -1516,6 +1517,7 @@ pub(crate) async fn load_transactions_by_block_ids(
             with_fiat,
         )
         .await?;
+        attach_transaction_summaries(pool, &mut transactions, false).await?;
     }
 
     let mut grouped: HashMap<i32, Vec<TransactionResponse>> = HashMap::new();
@@ -1735,11 +1737,14 @@ pub(crate) async fn load_transaction_occurrences_by_hash(
 
 pub(crate) async fn load_transaction_detail(
     state: &ApiState,
-    transaction: TransactionResponse,
+    mut transaction: TransactionResponse,
 ) -> Result<TransactionDetailResponse, ApiError> {
     let transaction_id = parse_i32_id("transaction_id", &transaction.transaction_id)?;
     let signatures = load_signatures(&state.pool, transaction_id).await?;
     let events = load_transaction_events(&state.pool, transaction_id).await?;
+    // The detail carries one page of events, so it carries the full count as well.
+    attach_transaction_summaries(&state.pool, std::slice::from_mut(&mut transaction), false)
+        .await?;
 
     Ok(TransactionDetailResponse {
         transaction,
@@ -1773,6 +1778,8 @@ pub(crate) async fn load_transaction_events(
     Ok(grouped.remove(&transaction_id).unwrap_or_default())
 }
 
+/// Embeds the first events of every transaction, at most [`MAX_LIST_LIMIT`] each. The
+/// callers add `event_count`, so a client can see when a transaction holds more.
 pub(crate) async fn attach_events_to_transactions(
     pool: &PgPool,
     transactions: &mut [TransactionResponse],
@@ -1803,7 +1810,9 @@ pub(crate) async fn load_events_by_transaction_ids(
     if transaction_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = list_events_by_transaction_ids(pool, transaction_ids, with_event_data).await?;
+    let rows =
+        list_events_by_transaction_ids(pool, transaction_ids, MAX_LIST_LIMIT, with_event_data)
+            .await?;
 
     let token_symbols = collect_event_token_symbols(&rows);
     let tokens = load_event_tokens_by_symbols(pool, token_symbols).await?;

@@ -895,6 +895,8 @@ struct TransactionListQuery {
     date_greater: Option<String>,
     date_less: Option<String>,
     with_neighbors: Option<i32>,
+    /// 1 embeds the first events of every transaction, at most 100 each, and adds
+    /// `event_count`. `/events?transaction_hash=` pages through the rest.
     with_events: Option<i32>,
     with_event_data: Option<i32>,
     with_script: Option<i32>,
@@ -971,6 +973,8 @@ struct RejectedTransactionListResponse {
 struct TransactionDetailResponse {
     transaction: TransactionResponse,
     signatures: Vec<SignatureResponse>,
+    /// The first events of the transaction, at most 100; `transaction.event_count`
+    /// says how many there are.
     events: Vec<EventResponse>,
 }
 
@@ -1019,6 +1023,7 @@ struct TransactionResponse {
     carbon_tx_type: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     carbon_tx_data: Option<String>,
+    /// The first events of the transaction, at most 100 (`with_events=1`).
     #[serde(skip_serializing_if = "Option::is_none")]
     events: Option<Vec<EventResponse>>,
     /// The number of events of the transaction, from its stored summary.

@@ -1249,8 +1249,12 @@ pub(crate) fn format_token_amount(amount: &str, token_decimals: usize) -> String
     }
 }
 
+/// The largest page a list serves. Events embedded in a transaction response are
+/// bounded by it too; the rest is paged through the event list.
+pub(crate) const MAX_LIST_LIMIT: i64 = 100;
+
 pub(crate) fn clamp_limit(limit: Option<i64>) -> i64 {
-    limit.unwrap_or(50).clamp(1, 100)
+    limit.unwrap_or(50).clamp(1, MAX_LIST_LIMIT)
 }
 
 pub(crate) fn history_price_limit(limit: Option<i64>) -> Result<Option<i64>, ApiError> {
