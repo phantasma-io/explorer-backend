@@ -552,11 +552,13 @@ impl BlockIngestionDriver {
             transaction_ids.push(transaction_record.id);
             event_batches.push((transaction_record.id, event_projections));
         }
-        // Write all of the block's events set-based, then apply each
-        // transaction's stateful side effects in order, then link address
-        // activity — all reading the rows just written.
+        // Writes all events of the block in one statement, then applies the effects of
+        // each transaction on tokens, NFTs, series and infusions in order, then links
+        // the addresses to their transactions and writes the summary of each
+        // transaction. Every step reads the rows that the steps before it wrote.
         explorer_db::project_block_events(conn, dimension_cache, &event_batches).await?;
         explorer_db::replace_address_transactions_for_block(conn, &transaction_ids).await?;
+        explorer_db::replace_transaction_summaries(conn, &transaction_ids).await?;
         explorer_db::mark_block_addresses_dirty(conn, block_record.id, height).await?;
 
         Ok(block_record)

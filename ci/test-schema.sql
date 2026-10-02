@@ -2221,3 +2221,28 @@ CREATE INDEX ix_rejected_transaction_candidates_hash
     ON public.rejected_transaction_candidates (hash);
 CREATE INDEX ix_rejected_transaction_candidates_captured_at
     ON public.rejected_transaction_candidates (captured_at_unix_seconds);
+
+
+--
+-- Name: transaction_summaries; Type: TABLE; Schema: public; Owner: -
+-- (202610020001: one row per transaction, event kind and token)
+--
+
+CREATE TABLE public.transaction_summaries (
+    transaction_id integer NOT NULL,
+    event_kind_id integer NOT NULL,
+    token_symbol text,
+    event_count integer NOT NULL,
+    address_count integer NOT NULL,
+    address_id integer,
+    sender_event_count integer NOT NULL,
+    amount_raw numeric,
+    sender_amount_raw numeric,
+    first_event_index integer NOT NULL
+);
+
+CREATE UNIQUE INDEX ux_transaction_summaries_transaction_kind_token
+    ON public.transaction_summaries (transaction_id, event_kind_id, token_symbol) NULLS NOT DISTINCT;
+
+ALTER TABLE public.transaction_summaries
+    ADD FOREIGN KEY (transaction_id) REFERENCES public.transactions (id) ON DELETE CASCADE;

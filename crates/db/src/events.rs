@@ -1798,8 +1798,9 @@ pub struct LegacyDecodedRowUpdate {
     pub target_address_id: Option<i32>,
 }
 
-/// Apply one decoded batch. The `payload_format = 3` guard makes the tool
-/// idempotent: a re-run cannot touch rows a previous run already flipped.
+/// Writes one batch of decoded events and returns how many events it changed. It
+/// changes only rows with `payload_format = 3`, so a second run of the worker's
+/// `--decode-legacy-raw-once` skips the rows that the first run already changed.
 pub async fn apply_legacy_decoded_events(
     conn: &mut PgConnection,
     updates: &[LegacyDecodedRowUpdate],
@@ -1820,7 +1821,7 @@ pub async fn apply_legacy_decoded_events(
         target_address_ids.push(update.target_address_id);
     }
 
-    let result = sqlx::query(
+    let mut transaction_ids = sqlx::query_scalar::<_, i32>(
         r#"
         UPDATE events
         SET payload_json = data.payload_json::jsonb,
@@ -1832,6 +1833,7 @@ pub async fn apply_legacy_decoded_events(
              AS data(id, payload_json, token_id, contract_id, target_address_id)
         WHERE events.id = data.id
           AND events.payload_format = 3
+        RETURNING events.transaction_id
         "#,
     )
     .bind(&ids)
@@ -1839,10 +1841,17 @@ pub async fn apply_legacy_decoded_events(
     .bind(&token_ids)
     .bind(&contract_ids)
     .bind(&target_address_ids)
-    .execute(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
+    let converted = transaction_ids.len() as u64;
 
-    Ok(result.rows_affected())
+    // The decoded payload carries the token and the value the transaction summary
+    // counts and sums, so the summaries of the changed transactions are recomputed.
+    transaction_ids.sort_unstable();
+    transaction_ids.dedup();
+    replace_transaction_summaries(conn, &transaction_ids).await?;
+
+    Ok(converted)
 }
 
 #[cfg(test)]

@@ -39,6 +39,12 @@ pub use reads::*;
 mod rejected;
 pub use rejected::*;
 
+// The summary of each transaction's events: the worker writes it with every block,
+// and the API reads it for transaction descriptions. The crate root exposes its
+// public items, as it does for the modules above.
+mod transaction_summaries;
+pub use transaction_summaries::*;
+
 const LEGACY_TOKEN_BURN_EVENT_KIND: &str = "TokenBurn";
 
 fn is_nft_side_effect_event_kind(event_kind: &str) -> bool {

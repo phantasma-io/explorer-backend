@@ -17,8 +17,10 @@ It runs against the Explorer Postgres schema (snake_case).
   `TransactionRecord`, `EventUpsert`, …), and core block/transaction/address/balance
   CRUD; subsystems live in submodules: `db::staking` (current-stake upsert plus the
   forward Soul-Masters daily/monthly projector), `db::rpc_metadata`
-  (contract/NFT/series RPC metadata), and `db::events` (event projection and its
-  side effects). `db::reads` is the API read-model layer: one submodule per resource
+  (contract/NFT/series RPC metadata), `db::events` (event projection and its
+  side effects), and `db::transaction_summaries` (one row per transaction, event kind
+  and token, written with every block and read for transaction descriptions).
+  `db::reads` is the API read-model layer: one submodule per resource
   owns that resource's read SQL, so the HTTP crate embeds no SQL.
 - `crates/rpc` – Phantasma SDK-backed JSON-RPC client with round-robin + failover
   across the configured endpoints.
