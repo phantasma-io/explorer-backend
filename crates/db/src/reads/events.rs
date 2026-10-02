@@ -166,9 +166,11 @@ fn event_list_projection(chain_name_expr: &str, payload_json_column: &str) -> St
     )
 }
 
-/// The presentation joins behind that projection.
-const EVENT_LIST_JOINS: &str = r#"        FROM events event
-        JOIN transactions tx ON tx.id = event.transaction_id
+/// The joins that add to each event its transaction, block, chain, kind, address,
+/// contract, NFT and series, for the columns of `event_list_projection`. Each query
+/// puts its own source of event rows, named `event`, in front of them: the whole table,
+/// one page per transaction, or single positions.
+const EVENT_LIST_JOINS: &str = r#"        JOIN transactions tx ON tx.id = event.transaction_id
         JOIN blocks block ON block.id = tx.block_id
         JOIN chains chain ON chain.id = event.chain_id
         JOIN event_kinds event_kind ON event_kind.id = event.event_kind_id
@@ -240,6 +242,7 @@ pub async fn list_events_global(
             event.id AS cursor_id,
             {column}::bigint AS cursor_sort_value,
 {projection}
+        FROM events event
 {joins}
         WHERE ($1::integer IS NULL OR event.chain_id = $1)
 {kind_predicate}{kind_partial_predicate}          AND ($3::text IS NULL OR tx.hash = $3)
@@ -458,6 +461,40 @@ pub async fn list_events_by_transaction_ids(
     );
     let rows = sqlx::query(&sql)
         .bind(transaction_ids)
+        .fetch_all(executor)
+        .await?;
+
+    Ok(rows)
+}
+
+/// Loads the events at the given positions, with their event data: event `i` is
+/// `event_index[i]` of transaction `transaction_ids[i]`, found through the unique
+/// index `(transaction_id, event_index)`. Serves the first event of each
+/// transaction summary row.
+pub async fn list_events_at_positions(
+    executor: impl sqlx::PgExecutor<'_>,
+    transaction_ids: &[i32],
+    event_indexes: &[i32],
+) -> Result<Vec<PgRow>, DbError> {
+    let sql = format!(
+        r#"
+        SELECT
+            event.transaction_id AS event_transaction_id,
+            event.id,
+{projection}
+        FROM unnest($1::integer[], $2::integer[]) AS position(transaction_id, event_index)
+        JOIN events event
+          ON event.transaction_id = position.transaction_id
+         AND event.event_index = position.event_index
+{joins}
+        ORDER BY event.transaction_id ASC, event.event_index ASC
+        "#,
+        projection = event_list_projection("chain.name", event_payload_json_column(true)),
+        joins = EVENT_LIST_JOINS,
+    );
+    let rows = sqlx::query(&sql)
+        .bind(transaction_ids)
+        .bind(event_indexes)
         .fetch_all(executor)
         .await?;
 
@@ -992,6 +1029,112 @@ mod tests {
             "with_event_data must still serve the stored payload"
         );
 
+        Ok(())
+    }
+
+    // Reads events by their transaction and event index. Real event indexes have gaps.
+    // The read must return the events at the named positions only, in index order and
+    // with their stored payload, and skip a position that holds no event.
+    #[tokio::test]
+    async fn events_at_positions_are_read_by_transaction_and_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+
+        let chain = ChainName::new("main")?;
+        let chain_id = resolve_chain_id(&mut tx, &chain).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let actor = format!("PTESTEVPOS{suffix}");
+        let block = upsert_block(
+            &mut tx,
+            &mut crate::ProjectionDimensionCache::new(),
+            BlockUpsert {
+                chain: chain.clone(),
+                height: BlockHeight::new(9_900_900_000),
+                hash: format!("TESTEVPOSBLOCK{suffix}").to_uppercase(),
+                protocol: Some(19),
+                chain_address: Some("NULL".to_owned()),
+                validator_address: Some("NULL".to_owned()),
+                producer_address: None,
+                timestamp_unix_seconds: 1_800_900_000,
+                reward: None,
+            },
+        )
+        .await?;
+        let seeded_tx = upsert_transaction(
+            &mut tx,
+            TransactionUpsert {
+                block_id: block.id,
+                chain_id,
+                tx_index: 0,
+                hash: format!("TESTEVPOSTX{suffix}").to_uppercase(),
+                timestamp_unix_seconds: block.timestamp_unix_seconds,
+                state: "Halt".to_owned(),
+                result: None,
+                debug_comment: None,
+                payload: None,
+                script_raw: None,
+                fee_raw: None,
+                gas_price_raw: None,
+                gas_limit_raw: None,
+                sender: Some(actor.clone()),
+                gas_payer: Some(actor.clone()),
+                gas_target: Some(actor.clone()),
+                carbon_tx_type: None,
+                carbon_tx_data: None,
+                expiration_unix_seconds: 0,
+                signatures: Vec::new(),
+            },
+        )
+        .await?;
+        let event_at = |event_index: i32, value: &str| EventUpsert {
+            transaction_id: seeded_tx.id,
+            chain_id,
+            event_index,
+            event_kind: "TokenSend".to_owned(),
+            event_name: None,
+            address: Some(actor.clone()),
+            target_address: None,
+            contract: Some("SOUL".to_owned()),
+            token_id: None,
+            raw_data: None,
+            payload_format: Some("live.v1".to_owned()),
+            payload_json: Some(serde_json::json!({"symbol": "SOUL", "value": value})),
+            timestamp_unix_seconds: block.timestamp_unix_seconds,
+            burned: None,
+        };
+        replace_events(
+            &mut tx,
+            seeded_tx.id,
+            &[event_at(1, "1"), event_at(2, "2"), event_at(5, "5")],
+        )
+        .await?;
+
+        let id = seeded_tx.id;
+        let rows = list_events_at_positions(&mut *tx, &[id, id, id], &[5, 1, 3]).await?;
+        let indexes = rows
+            .iter()
+            .map(|row| row.get::<i32, _>("event_index"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexes,
+            vec![1, 5],
+            "the named positions in index order; position 3 holds no event"
+        );
+        assert_eq!(rows[0].get::<i32, _>("event_transaction_id"), id);
+        assert_eq!(
+            rows[1].get::<Option<Value>, _>("payload_json"),
+            Some(serde_json::json!({"symbol": "SOUL", "value": "5"})),
+            "the event comes with its stored payload"
+        );
+
+        tx.rollback().await?;
         Ok(())
     }
 }

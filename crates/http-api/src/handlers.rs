@@ -1406,6 +1406,7 @@ pub(crate) async fn load_transactions(
     let with_script = query.with_script == Some(1);
     let with_nft = query.with_nft == Some(1);
     let with_fiat = query.with_fiat == Some(1);
+    let with_summary = query.with_summary == Some(1);
 
     let rows = if let Some(address) = address {
         match address_id_by_address(&state.pool, &address).await? {
@@ -1474,6 +1475,9 @@ pub(crate) async fn load_transactions(
             with_fiat,
         )
         .await?;
+    }
+    if with_summary {
+        attach_transaction_summaries(&state.pool, &mut transactions, true).await?;
     }
 
     Ok(TransactionListResponse {

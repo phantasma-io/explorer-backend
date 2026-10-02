@@ -441,6 +441,8 @@ pub(crate) fn transaction_from_row(row: &PgRow) -> TransactionResponse {
         carbon_tx_type: row.get::<Option<i16>, _>("carbon_tx_type").map(i32::from),
         carbon_tx_data: row.get("carbon_tx_data"),
         events: None,
+        event_count: None,
+        summary: None,
     }
 }
 

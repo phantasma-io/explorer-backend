@@ -149,6 +149,15 @@ inline only the first 50 calls without their arguments; the full list is served 
 at a time by `GET /api/v1/events/{id}/resolution-calls`, the only route that returns the
 arguments.
 
+### Transaction summary
+
+`GET /api/v1/transactions?...&with_summary=1` adds `event_count` and `summary` to every
+transaction. The summary has one row per event kind and token: the number of events, the
+number of distinct addresses (and the address when there is only one), the sum of a
+fungible token's values and the part of the transaction sender, and the first event. The
+worker writes these rows with every block, so their cost does not depend on how many events
+a transaction has, and a description built from them never needs the events.
+
 ## Parity Tooling
 
 `explorer-parity` compares two Explorer databases by semantic digest, ignoring

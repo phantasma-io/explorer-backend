@@ -14,16 +14,17 @@ use explorer_db::{
     HistoryPriceOrderBy, NftFilter, NftOrderBy, OrganizationFilter, OrganizationOrderBy,
     OrganizationRow, OverviewCounts, PlatformFilter, PlatformOrderBy, RejectedCandidateRecord,
     RejectedCandidateUpsert, SeriesFilter, SeriesOrderBy, SortDirection, TokenFilter, TokenOrderBy,
-    TransactionFilter, TransactionOrderBy, TransactionPage, address_id_by_address, block_detail,
-    block_hash_exists, canonical_transaction_exists, chain_ids_by_name, check_health,
-    circulating_soul_supply, count_chains, count_contract_method_histories, count_event_kinds,
-    count_history_prices, count_platforms, event_kind_id_by_name, event_kind_ids_by_name_like,
-    event_payload_by_id, list_addresses, list_blocks, list_chains, list_contract_method_histories,
-    list_contracts, list_event_kinds, list_event_kinds_with_events, list_event_tokens_by_symbols,
+    TransactionFilter, TransactionOrderBy, TransactionPage, TransactionSummaryRecord,
+    address_id_by_address, block_detail, block_hash_exists, canonical_transaction_exists,
+    chain_ids_by_name, check_health, circulating_soul_supply, count_chains,
+    count_contract_method_histories, count_event_kinds, count_history_prices, count_platforms,
+    event_kind_id_by_name, event_kind_ids_by_name_like, event_payload_by_id, list_addresses,
+    list_blocks, list_chains, list_contract_method_histories, list_contracts, list_event_kinds,
+    list_event_kinds_with_events, list_event_tokens_by_symbols, list_events_at_positions,
     list_events_by_address, list_events_by_transaction_ids, list_events_global,
     list_history_prices, list_nfts, list_organizations, list_platforms, list_rejected_candidates,
     list_series, list_signatures, list_soul_masters_monthlies, list_staking_dailies, list_tokens,
-    list_transaction_occurrences, list_transactions_by_block_ids,
+    list_transaction_occurrences, list_transaction_summaries, list_transactions_by_block_ids,
     list_transactions_for_address_timeline, list_transactions_for_filtered_address,
     list_transactions_global, new_address_dailies, overview_counts, search_existence,
     single_transaction_by_hash, transaction_by_hash_block_index, transaction_hash_exists,
@@ -52,10 +53,12 @@ use utoipa_swagger_ui::SwaggerUi;
 mod handlers;
 mod rate_limit;
 mod support;
+mod transaction_summary;
 
 pub(crate) use handlers::*;
 pub use rate_limit::RateLimiter;
 pub(crate) use support::*;
+pub(crate) use transaction_summary::*;
 
 /// Cache key for the overview counters: (chain name, include-legacy flag).
 type OverviewCacheKey = (String, i32);
@@ -142,6 +145,7 @@ impl ApiState {
         TransactionListResponse,
         TransactionOccurrenceResponse,
         TransactionResponse,
+        TransactionSummaryRowResponse,
         VersionResponse
     )),
     tags(
@@ -896,6 +900,10 @@ struct TransactionListQuery {
     with_script: Option<i32>,
     with_nft: Option<i32>,
     with_fiat: Option<i32>,
+    /// 1 adds `summary` (one row per event kind and token) and `event_count` to every
+    /// transaction. The rows are stored, so their cost does not depend on how many
+    /// events a transaction has.
+    with_summary: Option<i32>,
     /// Seek cursor returned by the previous page.
     cursor: Option<String>,
 }
@@ -1013,6 +1021,47 @@ struct TransactionResponse {
     carbon_tx_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     events: Option<Vec<EventResponse>>,
+    /// The number of events of the transaction, from its stored summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_count: Option<i64>,
+    /// One row per event kind and token, in the order the first events happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<Vec<TransactionSummaryRowResponse>>,
+}
+
+/// The events of one kind and one token inside a transaction, counted and summed
+/// over all of them.
+#[derive(Debug, Serialize, ToSchema)]
+struct TransactionSummaryRowResponse {
+    event_kind: String,
+    /// The token of these events, the same object an event carries in
+    /// `token_event.token`; absent for events without a token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<Value>,
+    event_count: i64,
+    /// How many distinct addresses these events belong to.
+    address_count: i64,
+    /// The address of these events when there is exactly one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<AddressRefResponse>,
+    /// How many of these events belong to the transaction sender.
+    sender_event_count: i64,
+    /// The sum of the event values, formatted with the token decimals. Fungible
+    /// tokens only: the value of an NFT event is its id, and `event_count` is the
+    /// number of NFTs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_raw: Option<String>,
+    /// The part of `amount` that belongs to the transaction sender.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_amount_raw: Option<String>,
+    /// The first of these events, with its event data: the name of a single NFT,
+    /// the created token, the series, the special resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_event: Option<EventResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
