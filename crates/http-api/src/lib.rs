@@ -346,6 +346,8 @@ struct AddressListQuery {
     address_name: Option<String>,
     address_partial: Option<String>,
     symbol: Option<String>,
+    // 1 keeps only the holders of `symbol`.
+    holders_only: Option<i32>,
     organization_name: Option<String>,
     with_stakes: Option<i32>,
     with_balance: Option<i32>,

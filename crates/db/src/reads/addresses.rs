@@ -63,6 +63,9 @@ pub struct AddressFilter<'a> {
     pub address_name: Option<&'a str>,
     pub address_partial: Option<&'a str>,
     pub symbol: &'a str,
+    /// Keeps only the holders of `symbol`. Without it a list sorted by `balance`
+    /// goes on past the holders with every other address of the chain.
+    pub holders_only: bool,
     pub organization_name: Option<&'a str>,
     pub with_balance: bool,
 }
@@ -77,9 +80,13 @@ pub struct AddressFilter<'a> {
 /// with SOUL orders directly on the denormalized `addresses.total_soul_amount`
 /// (`ix_addresses_chain_soul`); `balance` with any other symbol hash-joins the
 /// one token's holder rows and appends the no-balance addresses in id order —
-/// the same total order the old shape produced, row for row.
+/// the same total order the old shape produced, row for row. `holders_only`
+/// drops those appended addresses, and with any order it keeps the holders only.
+///
+/// The token lookup and the list run on one connection, which also lets a test
+/// run both inside its own transaction.
 pub async fn list_addresses(
-    executor: impl sqlx::PgExecutor<'_> + Copy,
+    conn: &mut PgConnection,
     filter: &AddressFilter<'_>,
     order_by: AddressOrderBy,
     direction: SortDirection,
@@ -93,20 +100,39 @@ pub async fn list_addresses(
     // are unique per chain today, so this is one token or none. None (unknown
     // symbol) leaves every address balance-less: the id-order fallback below,
     // which is what the old shape answered too.
-    let balance_token_id = match order_by {
-        AddressOrderBy::Balance if filter.symbol != "SOUL" => {
-            sqlx::query_scalar::<_, i32>(
-                "SELECT id FROM tokens WHERE chain_id = $1 AND symbol = $2 ORDER BY id LIMIT 1",
-            )
-            .bind(filter.chain_id)
-            .bind(filter.symbol)
-            .fetch_optional(executor)
-            .await?
-        }
-        _ => None,
+    // The holders filter reads the same balance rows for any symbol but SOUL.
+    let reads_token_balances = filter.symbol != "SOUL"
+        && (matches!(order_by, AddressOrderBy::Balance) || filter.holders_only);
+    let balance_token_id = if reads_token_balances {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM tokens WHERE chain_id = $1 AND symbol = $2 ORDER BY id LIMIT 1",
+        )
+        .bind(filter.chain_id)
+        .bind(filter.symbol)
+        .fetch_optional(&mut *conn)
+        .await?
+    } else {
+        None
     };
 
     let balance_by_holders = matches!(order_by, AddressOrderBy::Balance) && filter.symbol != "SOUL";
+    // A SOUL holder is read from the running total on the address row, balance plus
+    // stake, which is also the amount the holders page shows for SOUL. Any other
+    // token is held when its balance row is positive. An unknown symbol leaves $9
+    // NULL, so nobody holds it.
+    let holders_predicate = match (filter.holders_only, filter.symbol == "SOUL") {
+        (false, _) => "",
+        (true, true) => "AND address.total_soul_amount > 0",
+        (true, false) => {
+            r#"AND EXISTS (
+                  SELECT 1
+                  FROM address_balances held
+                  WHERE held.address_id = address.id
+                    AND held.token_id = $9
+                    AND held.amount_raw > 0
+              )"#
+        }
+    };
     let (holders_cte, holders_join, page_columns, page_order, outer_order) = if balance_by_holders {
         (
             r#"holders AS (
@@ -161,6 +187,7 @@ pub async fn list_addresses(
                         AND org.name = $5
                   )
               )
+              {holders_predicate}
             ORDER BY {page_order}
             LIMIT $6 OFFSET $7
         )
@@ -223,14 +250,108 @@ pub async fn list_addresses(
         .bind(limit)
         .bind(offset)
         .bind(filter.with_balance);
-    // $9 exists only in the holders shape; binding it elsewhere would over-supply
-    // the prepared statement.
-    let query = if balance_by_holders {
+    // The query has the parameter $9 only when it reads the balance rows of a token.
+    // Binding a value that the query has no place for is an error.
+    let query = if reads_token_balances {
         query.bind(balance_token_id)
     } else {
         query
     };
-    let rows = query.fetch_all(executor).await?;
+    let rows = query.fetch_all(&mut *conn).await?;
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_rows::insert_token;
+    use uuid::Uuid;
+
+    // With `holders_only` the list holds only the holders of the token, so a holders
+    // page ends at the last holder. Without it the other addresses follow the holders.
+    // A SOUL holder may hold only stake. The filter works with every sort. The test
+    // limits the lists to its own addresses with `address_partial`.
+    #[tokio::test]
+    async fn holders_only_keeps_the_holders_of_the_token() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Ok(database_url) = std::env::var("EXPLORER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        let mut tx = pool.begin().await?;
+        let chain_id = resolve_chain_id(&mut tx, &ChainName::new("main")?).await?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let address = |name: &str| format!("PTESTHOLD{name}{suffix}");
+        let rich = upsert_address_id(&mut tx, chain_id, &address("A")).await?;
+        let poor = upsert_address_id(&mut tx, chain_id, &address("B")).await?;
+        let staker = upsert_address_id(&mut tx, chain_id, &address("C")).await?;
+        upsert_address_id(&mut tx, chain_id, &address("D")).await?;
+        let symbol = format!("RSTHLD{}", &suffix[..8]).to_uppercase();
+        let token_id = insert_token(&mut tx, chain_id, &symbol, false, rich).await?;
+        sqlx::query(
+            "INSERT INTO address_balances (address_id, token_id, amount_raw) \
+             VALUES ($1, $3, 5), ($2, $3, 1)",
+        )
+        .bind(rich)
+        .bind(poor)
+        .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE addresses SET total_soul_amount = 7 WHERE id = $1")
+            .bind(staker)
+            .execute(&mut *tx)
+            .await?;
+
+        let partial = format!("%{suffix}%");
+        let holders = AddressFilter {
+            chain_id,
+            address: None,
+            address_name: None,
+            address_partial: Some(&partial),
+            symbol: &symbol,
+            holders_only: true,
+            organization_name: None,
+            with_balance: false,
+        };
+        let listed = |rows: Vec<PgRow>| {
+            rows.iter()
+                .map(|row| row.get::<String, _>("address"))
+                .collect::<Vec<_>>()
+        };
+        let by_balance = AddressOrderBy::Balance;
+        let desc = SortDirection::Desc;
+
+        let rows = list_addresses(&mut tx, &holders, by_balance, desc, 10, 0).await?;
+        assert_eq!(listed(rows), [address("A"), address("B")]);
+
+        let everyone = AddressFilter {
+            holders_only: false,
+            ..holders
+        };
+        let rows = list_addresses(&mut tx, &everyone, by_balance, desc, 10, 0).await?;
+        assert_eq!(rows.len(), 4, "the other addresses follow the holders");
+
+        let soul = AddressFilter {
+            symbol: "SOUL",
+            ..holders
+        };
+        let rows = list_addresses(&mut tx, &soul, by_balance, desc, 10, 0).await?;
+        assert_eq!(listed(rows), [address("C")]);
+
+        let rows = list_addresses(
+            &mut tx,
+            &holders,
+            AddressOrderBy::Address,
+            SortDirection::Asc,
+            10,
+            0,
+        )
+        .await?;
+        assert_eq!(listed(rows), [address("A"), address("B")]);
+        Ok(())
+    }
 }

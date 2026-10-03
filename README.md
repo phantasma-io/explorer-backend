@@ -54,7 +54,9 @@ seeded from `ci/test-schema.sql` (a `pg_dump --schema-only` of the schema) plus
 `ci/test-seed.sql` (reference rows), and sets `EXPLORER_REQUIRE_DB_TESTS=1` so a
 guard test fails if that URL is ever missing — the DB tests cannot silently skip in
 CI. One test that needs a large data fixture is gated behind
-`EXPLORER_TEST_FULL_BASELINE` and runs locally/nightly, not in CI.
+`EXPLORER_TEST_FULL_BASELINE` and runs locally/nightly, not in CI. The tests that need test
+data in the database insert it with the functions of `db::test_rows`, a module compiled only
+for tests.
 
 ## Configuration
 
@@ -161,6 +163,13 @@ a transaction has, and a description built from them never needs the events.
 A transaction response never embeds an unbounded list. `with_events=1` and the detail route
 `GET /api/v1/transactions/{hash}` carry the first 100 events of a transaction and its
 `event_count`; `GET /api/v1/events?transaction_hash=` pages through the rest.
+
+### Token holders
+
+`GET /api/v1/addresses?symbol=<SYMBOL>&order_by=balance&holders_only=1` lists the holders of
+a token, the largest balance first, and its cursor ends at the last holder. Without
+`holders_only` the symbol only chooses the balance to sort by, and every other address of the
+chain follows the holders. An address whose SOUL is all staked counts as a SOUL holder.
 
 ## Parity Tooling
 

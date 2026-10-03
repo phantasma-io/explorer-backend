@@ -413,10 +413,16 @@ pub(crate) async fn addresses(
         address_name: address_name.as_deref(),
         address_partial: address_partial.as_deref(),
         symbol: symbol.as_str(),
+        holders_only: query.holders_only == Some(1),
         organization_name: organization_name.as_deref(),
         with_balance,
     };
-    let rows = list_addresses(&state.pool, &filter, order_by, direction, limit + 1, offset).await?;
+    let mut conn = state
+        .pool
+        .acquire()
+        .await
+        .map_err(explorer_db::DbError::from)?;
+    let rows = list_addresses(&mut conn, &filter, order_by, direction, limit + 1, offset).await?;
 
     let (rows, next_cursor) = trim_offset_rows(rows, limit, offset)?;
     let addresses = rows

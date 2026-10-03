@@ -45,6 +45,10 @@ pub use rejected::*;
 mod transaction_summaries;
 pub use transaction_summaries::*;
 
+// Functions that insert test data for the tests that run against a real database.
+#[cfg(test)]
+mod test_rows;
+
 const LEGACY_TOKEN_BURN_EVENT_KIND: &str = "TokenBurn";
 
 fn is_nft_side_effect_event_kind(event_kind: &str) -> bool {

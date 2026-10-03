@@ -126,6 +126,7 @@ pub async fn list_transaction_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_rows::insert_token;
 
     fn token_event(
         transaction_id: i32,
@@ -184,39 +185,6 @@ mod tests {
             timestamp_unix_seconds: 1_800_800_000,
             burned: None,
         }
-    }
-
-    async fn insert_token(
-        conn: &mut PgConnection,
-        chain_id: i32,
-        symbol: &str,
-        fungible: bool,
-        owner_id: i32,
-    ) -> Result<(), DbError> {
-        let contract_id = upsert_contract_id(conn, chain_id, symbol).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO tokens (
-                symbol, fungible, transferable, finite, divisible, fuel, stakable, fiat,
-                swappable, burnable, decimals,
-                address_id, owner_id, price_usd, chain_id, contract_id,
-                burned_supply_raw, current_supply_raw, max_supply_raw, mintable, name
-            )
-            VALUES (
-                $1, $2, TRUE, FALSE, $2, FALSE, FALSE, FALSE, FALSE, TRUE, 8,
-                $3, $3, 0, $4, $5,
-                0, 0, 0, TRUE, $1
-            )
-            "#,
-        )
-        .bind(symbol)
-        .bind(fungible)
-        .bind(owner_id)
-        .bind(chain_id)
-        .bind(contract_id)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
     }
 
     // Checks the summary rows of one transaction against its events: one row per event
