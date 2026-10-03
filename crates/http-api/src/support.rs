@@ -658,18 +658,21 @@ pub(crate) async fn attach_fiat_to_market_events(
 pub(crate) fn collect_event_token_symbols(rows: &[PgRow]) -> HashSet<String> {
     let mut symbols = HashSet::new();
     for row in rows {
-        if let Some(symbol) = row.get::<Option<String>, _>("contract_symbol") {
+        let contract_symbol = row.get::<Option<String>, _>("contract_symbol");
+        if let Some(symbol) = &contract_symbol {
             symbols.insert(symbol.to_uppercase());
         }
         let payload = row.get::<Option<Value>, _>("payload_json");
         if let Some(Value::Object(payload)) = payload {
-            collect_token_symbol_from_payload_key(&payload, "token_event", "token", &mut symbols);
-            collect_token_symbol_from_payload_key(
+            if let Some(symbol) = created_token_symbol(
+                &row.get::<String, _>("event_kind"),
                 &payload,
-                "token_create_event",
-                "token",
-                &mut symbols,
-            );
+                row.get("payload_format"),
+                contract_symbol.as_deref(),
+            ) {
+                symbols.insert(symbol.to_uppercase());
+            }
+            collect_token_symbol_from_payload_key(&payload, "token_event", "token", &mut symbols);
             collect_token_symbol_from_payload_key(
                 &payload,
                 "token_series_event",
@@ -779,6 +782,7 @@ pub(crate) fn event_from_row(
         build_event_data_fields(
             &event_kind,
             payload_value.as_ref(),
+            row.get("payload_format"),
             contract_symbol.as_deref(),
             tokens,
         )
@@ -942,9 +946,48 @@ fn project_resolution_calls(calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// The `events.payload_format` code of `legacy.decoded.v1` (migration 202608040003).
+const LEGACY_DECODED_PAYLOAD_FORMAT: i16 = 4;
+
+/// Returns the symbol of the token that a TokenCreate event created, or None for
+/// any other event. A stored event keeps that symbol in one of three places:
+/// - an event from the node's extended event (`live.v1`): in `token_create_event.symbol`;
+/// - an event of the main chain up to block 6,422,526 (`legacy.backfill.v1`): in its
+///   string, `string_event.string_value`;
+/// - a gen1 event (`legacy.decoded.v1`): it has no payload, and its contract is the
+///   contract of the created token, so the contract names the token.
+///
+/// A `live.v1` event links the system contract `token`, so the contract is read
+/// only for `legacy.decoded.v1`.
+pub(crate) fn created_token_symbol(
+    event_kind: &str,
+    payload: &serde_json::Map<String, Value>,
+    payload_format: Option<i16>,
+    contract_symbol: Option<&str>,
+) -> Option<String> {
+    if event_kind != "TokenCreate" {
+        return None;
+    }
+    let field = |event_key: &str, symbol_key: &str| {
+        payload
+            .get(event_key)
+            .and_then(|event| event.get(symbol_key))
+            .and_then(json_scalar_to_string)
+    };
+    field("token_create_event", "symbol")
+        .or_else(|| field("string_event", "string_value"))
+        .or_else(|| {
+            contract_symbol
+                .filter(|_| payload_format == Some(LEGACY_DECODED_PAYLOAD_FORMAT))
+                .map(str::to_owned)
+        })
+        .filter(|symbol| !symbol.is_empty())
+}
+
 pub(crate) fn build_event_data_fields(
     event_kind: &str,
     payload: Option<&Value>,
+    payload_format: Option<i16>,
     contract_symbol: Option<&str>,
     tokens: &HashMap<String, Value>,
 ) -> EventDataFields {
@@ -997,8 +1040,27 @@ pub(crate) fn build_event_data_fields(
     if let Some(value) = payload.get("string_event") {
         fields.string_event = Some(value.clone());
     }
-    if let Some(value) = payload.get("token_create_event") {
-        fields.token_create_event = Some(enrich_single_token_event(value, tokens, "token"));
+    // A TokenCreate event names the token it created in `token_create_event.token`,
+    // resolved like the token of a token event. An event of the main chain up to block
+    // 6,422,526 and a gen1 event have no `token_create_event` of their own and get one
+    // that holds only the token.
+    let created_symbol = created_token_symbol(event_kind, payload, payload_format, contract_symbol);
+    if created_symbol.is_some() || payload.contains_key("token_create_event") {
+        let mut object = payload
+            .get("token_create_event")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(symbol) = created_symbol {
+            // A token created on the main chain up to block 6,422,526 can have no
+            // `tokens` row. Its symbol alone still names it.
+            let token = tokens
+                .get(&symbol.to_uppercase())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "symbol": symbol }));
+            object.insert("token".to_owned(), token);
+        }
+        fields.token_create_event = Some(Value::Object(object));
     }
     if let Some(value) = payload.get("token_event") {
         fields.token_event = Some(enrich_token_event(value, contract_symbol, tokens));
@@ -2067,5 +2129,72 @@ mod tests {
             addressless.map(|value| value.to_string()),
             Some(r#"{"chain":"main","event_kind":"Custom"}"#.to_owned())
         );
+    }
+
+    // A TokenCreate event names the token it created in `token_create_event.token`.
+    // The test covers the three stored forms: an event from the node's extended event,
+    // an event of the main chain up to block 6,422,526 with the symbol in its string,
+    // and a gen1 event linked to the token's contract. A token with a `tokens` row comes
+    // with its kind. A token without a row keeps its symbol. A `live.v1` event without a
+    // payload links the system contract `token`, so it names no token.
+    #[test]
+    fn token_create_events_name_the_created_token() -> Result<(), Box<dyn std::error::Error>> {
+        let tokens = HashMap::from([
+            (
+                "YCECRWR".to_owned(),
+                serde_json::json!({ "symbol": "YCECRWR", "fungible": true }),
+            ),
+            (
+                "GHOST".to_owned(),
+                serde_json::json!({ "symbol": "GHOST", "fungible": false }),
+            ),
+        ]);
+        let created = |payload: Value, payload_format: i16, contract: &str| {
+            build_event_data_fields(
+                "TokenCreate",
+                Some(&payload),
+                Some(payload_format),
+                Some(contract),
+                &tokens,
+            )
+            .token_create_event
+        };
+
+        let extended = created(
+            serde_json::json!({
+                "token_create_event": { "symbol": "YCECRWR", "decimals": "2" }
+            }),
+            2,
+            "token",
+        )
+        .ok_or("the extended event keeps its token_create_event")?;
+        assert_eq!(extended["token"]["fungible"], serde_json::json!(true));
+        assert_eq!(extended["decimals"], serde_json::json!("2"));
+
+        let backfilled = created(
+            serde_json::json!({ "string_event": { "string_value": "OLDTOKEN" } }),
+            1,
+            "entry",
+        );
+        assert_eq!(
+            backfilled,
+            Some(serde_json::json!({ "token": { "symbol": "OLDTOKEN" } }))
+        );
+
+        let decoded = created(
+            serde_json::json!({ "contract": "GHOST", "event_kind": "TokenCreate" }),
+            4,
+            "GHOST",
+        )
+        .ok_or("a gen1 event names the token by its contract")?;
+        assert_eq!(decoded["token"]["fungible"], serde_json::json!(false));
+
+        let without_payload = created(
+            serde_json::json!({ "contract": "token", "event_kind": "TokenCreate" }),
+            2,
+            "token",
+        );
+        assert_eq!(without_payload, None);
+        Ok(())
     }
 }

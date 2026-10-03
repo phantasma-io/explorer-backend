@@ -1520,8 +1520,13 @@ mod tests {
             }
         });
 
-        let fields =
-            build_event_data_fields("SpecialResolution", Some(&payload), None, &HashMap::new());
+        let fields = build_event_data_fields(
+            "SpecialResolution",
+            Some(&payload),
+            None,
+            None,
+            &HashMap::new(),
+        );
         assert!(fields.special_resolution_event.is_some());
         let Some(resolution) = fields.special_resolution_event else {
             return;
@@ -1561,8 +1566,13 @@ mod tests {
             "special_resolution_event": { "resolution_id": "44", "calls": calls }
         });
 
-        let fields =
-            build_event_data_fields("SpecialResolution", Some(&payload), None, &HashMap::new());
+        let fields = build_event_data_fields(
+            "SpecialResolution",
+            Some(&payload),
+            None,
+            None,
+            &HashMap::new(),
+        );
         assert!(fields.special_resolution_event.is_some());
         let Some(resolution) = fields.special_resolution_event else {
             return;

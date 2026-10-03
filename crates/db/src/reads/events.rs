@@ -142,6 +142,7 @@ fn event_list_projection(chain_name_expr: &str, payload_json_column: &str) -> St
             contract.hash AS raw_contract,
             event.token_id,
             {payload_json_column} AS payload_json,
+            event.payload_format,
             event.raw_data,
             CASE WHEN nft.id IS NOT NULL THEN jsonb_build_object(
                 'description', nft.description, 'name', nft.name,
@@ -721,6 +722,13 @@ mod tests {
         )
         .await?;
         assert_eq!(by_hash.len(), 1, "the whole hash must match in any case");
+        // The API reads the format to find the token that a gen1 TokenCreate event
+        // created (`created_token_symbol` in the http-api crate).
+        assert_eq!(
+            by_hash[0].get::<Option<i16>, _>("payload_format"),
+            Some(2),
+            "the list carries the stored payload format"
+        );
 
         let by_fragment = list_events_global(
             &mut *tx,
