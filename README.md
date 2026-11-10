@@ -49,7 +49,7 @@ just q       # fmt + check + test in one step
 --workspace`. The workspace builds fully offline (only runtime `sqlx::query(...)`, no
 compile-time `query!` macros), so no database is needed to compile or to run the
 non-DB tests. The `crates/db` integration tests self-skip unless
-`EXPLORER_TEST_DATABASE_URL` is set; CI runs them against a `postgres:17` service
+`EXPLORER_TEST_DATABASE_URL` is set; CI runs them against a `postgres:18` service
 seeded from `ci/test-schema.sql` (a `pg_dump --schema-only` of the schema) plus
 `ci/test-seed.sql` (reference rows), and sets `EXPLORER_REQUIRE_DB_TESTS=1` so a
 guard test fails if that URL is ever missing — the DB tests cannot silently skip in
