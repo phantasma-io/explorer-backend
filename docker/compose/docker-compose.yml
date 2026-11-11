@@ -8,7 +8,7 @@ services:
     env_file:
       - ../../.env
     ports:
-      - "${API_PORT:-9000}:9000"
+      - "127.0.0.1:${API_PORT:-9000}:9000"
     networks:
       - postgresql
     restart: unless-stopped

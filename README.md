@@ -208,6 +208,8 @@ it; it does not bootstrap a database or reconstruct history from genesis.
    endpoint(s), and published ports. The API must bind `0.0.0.0` inside the container
    for the published port to be reachable (`.env.example` sets
    `EXPLORER_BIND_ADDR=0.0.0.0:9000`; the code default `localhost` is container-local).
+   The compose file publishes the API port on `127.0.0.1` of the host only. Other hosts
+   reach the API through a reverse proxy on that host.
 4. Apply database migrations (idempotent):
 
    ```bash
@@ -221,9 +223,9 @@ it; it does not bootstrap a database or reconstruct history from genesis.
    docker compose -f docker/compose/docker-compose.yml up -d --build
    ```
 
-6. Verify: the API answers (`curl http://<host>:<API_PORT>/api/v1/chains`) and the
-   worker log reports `caught up to tip <height>` once it has indexed forward to the
-   chain tip.
+6. Verify: the API answers on the host (`curl http://127.0.0.1:<API_PORT>/api/v1/chains`)
+   and the worker log reports `caught up to tip <height>` once it has indexed forward to
+   the chain tip.
 
 ### Networks (mainnet / devnet / testnet)
 
