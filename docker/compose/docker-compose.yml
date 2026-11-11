@@ -10,7 +10,6 @@ services:
     ports:
       - "${API_PORT:-9000}:9000"
     networks:
-      - api
       - postgresql
     restart: unless-stopped
     logging:
@@ -28,7 +27,6 @@ services:
     env_file:
       - ../../.env
     networks:
-      - worker
       - postgresql
     restart: unless-stopped
     logging:
@@ -38,10 +36,6 @@ services:
         max-size: 20m
 
 networks:
-  api:
-    name: api-${DEPLOY_ENV:-local}-network
-  worker:
-    name: worker-${DEPLOY_ENV:-local}-network
   postgresql:
     name: postgresql-network
     external: true
