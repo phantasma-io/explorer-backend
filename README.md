@@ -220,8 +220,12 @@ it; it does not bootstrap a database or reconstruct history from genesis.
 5. Start the API and worker:
 
    ```bash
-   docker compose -f docker/compose/docker-compose.yml up -d --build
+   docker compose --env-file .env -f docker/compose/docker-compose.yml up -d --build
    ```
+
+   `--env-file .env` makes Compose read `DEPLOY_ENV` and `API_PORT` from the `.env` of
+   step 3. Both are required: the compose file has no default for the image names, the
+   container names or the published port.
 
 6. Verify: the API answers on the host (`curl http://127.0.0.1:<API_PORT>/api/v1/chains`)
    and the worker log reports `caught up to tip <height>` once it has indexed forward to
